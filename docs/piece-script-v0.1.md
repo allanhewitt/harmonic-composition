@@ -68,11 +68,12 @@ sequencers:     # one instance of each sequencer engine; each is on unless enabl
     grid: '16'              # '4', '8', '16', '32'
     length: 8               # 2-16 steps
     rows: {a: pitch, b: gate, c: time}   # each row controls pitch, gate, velocity (accent) or time (step length)
-    skip_rate: 0.08         # share of Skip steps (take no time)
+    skip_rate: 0.0          # share of Skip steps (take no time; the loop drifts against the bar)
     stop_rate: 0.0          # chance of a Stop step (halts until the next restart)
-    time_rate: 0.2          # share of double-length steps when a row controls time
+    time_rate: 0.0          # share of double-length steps when a row controls time
     reset: section          # section, phrase, never
-    mutation: 0.25
+    mutation: 0.0           # chance of one step changing at a phrase start
+    section_variants: false # true: each section type gets its own variant of the pattern
     low: 60
     high: 84
     anchor: 64              # the ladder's root is placed nearest this note

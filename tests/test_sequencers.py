@@ -185,3 +185,27 @@ def test_piece_includes_sequencer_by_default_and_can_switch_off():
 
 def test_channels_skip_drums():
     assert 9 not in S.CHANNELS and len(set(S.CHANNELS)) == 9
+
+
+def test_default_is_one_fixed_pattern_fitted_to_each_chord():
+    r = C.compose(dict(key='A minor', seed='5', tempo='112', length='64'), harmony={'rates': ['1/4', '1/2']})[1]
+    doc = PT.generate_parts(r)
+    plan = [dict(st, level=5) for st in O.plan_levels(r, 5, dict(O.DEFAULTS))]
+    p = SQ.generate(doc, r, plan, {})[0]
+    pats = {tuple(x['values']['pitch']) for x in p['patterns']}
+    assert len(pats) == 1                                           # the same pattern throughout
+    bt = H.bar_ticks(doc['meter'])
+    grid = S.GRIDS[str(seq960.DEFAULTS['grid'])]
+    L = seq960.DEFAULTS['length']
+    assert bt % (grid * L) == 0                                     # the loop lines up with the bar
+    for n in p['notes']:                                            # every note is a tone of the chord it sounds over
+        ev = chord_at(r, n['start'])
+        assert n['pitch'] % 12 in {(ev['root_pc'] + i) % 12 for i in ev['intervals']}
+
+
+def test_c_pattern_over_a_minor_uses_c_natural():
+    r, doc, plan = fixture('C Am', repeats=1)
+    p = run(r, doc, plan)
+    bt = H.bar_ticks('4/4')
+    bar2 = {n['pitch'] % 12 for n in p['notes'] if bt <= n['start'] < 2 * bt}
+    assert 1 not in bar2 and bar2 <= {9, 0, 4}

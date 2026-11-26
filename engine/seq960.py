@@ -11,9 +11,11 @@ Mechanism
     Stop (the sequence halts until its next restart: a section start, or a phrase start with reset 'phrase').
   * Density: the shared level sets how many of the playable steps Play rather than Rest (40 % at level 1,
     all at level 5), switched on in a fixed priority order so a rise adds to what you already hear.
-  * Form: each section identity gets its own variant of the pattern; repeats return to it (related repeats); a
-    phrase may change one step's value (gradual change). The pattern runs across chord changes; `reset` says
-    whether it restarts at each section, each phrase, or never.
+  * Default: one fixed pattern for the whole piece, fitted to each chord (adapted mode, chord tones: a pattern
+    heard as C G C E over C is A E A C over A minor). Options, all off by default: Skip and double-length steps
+    (the loop then drifts against the bar), gradual change at phrase starts (`mutation`), and a different variant
+    per section type (`section_variants`, with related repeats). The pattern runs across chord changes; `reset`
+    says whether it restarts at each section, each phrase, or never.
 DESIGN throughout; Experiment 32's 960 sketch (8 gated quaver steps on chord tones) is the starting point.
 """
 import copy, random
@@ -22,8 +24,11 @@ import seqcore as S
 VERSION = '0.1.0'
 ID, NAME = 'm960', 'Seq 960'
 ROW_TARGETS = ('pitch', 'gate', 'velocity', 'time')
-DEFAULTS = dict(S.COMMON_DEFAULTS, length=8, rows=dict(a='pitch', b='gate', c='time'), skip_rate=0.08,
-                stop_rate=0.0, time_rate=0.2, channel=S.CHANNELS[0], program=81, name=NAME)
+# Default: a fixed pattern, as on a real 960, fitted to each chord (adapted, chord tones). Skips, double-length
+# steps, gradual change and per-section variants are all available but off.
+DEFAULTS = dict(S.COMMON_DEFAULTS, length=8, rows=dict(a='pitch', b='gate', c='time'), skip_rate=0.0,
+                stop_rate=0.0, time_rate=0.0, mutation=0.0, section_variants=False, channel=S.CHANNELS[0],
+                program=81, name=NAME)
 DENSITY = {1: 0.4, 2: 0.55, 3: 0.7, 4: 0.85, 5: 1.0}
 PITCH_VOCAB = [(0, 30), (1, 14), (2, 18), (3, 10), (4, 12), (5, 6), (6, 4), (-1, 6)]
 GATES = [(0.3, 2), (0.5, 4), (0.75, 3), (0.95, 1)]
@@ -85,7 +90,8 @@ def generate(ctx, settings=None):
     check(cfg)
     rng = random.Random(f"seq960-{cfg['seed']}")
     L, grid = int(cfg['length']), S.GRIDS[str(cfg['grid'])]
-    pats = S.variant_bank(ctx, rng, lambda: make_pattern(rng, cfg), mutate_with(rng), float(cfg['mutation']))
+    pats = S.variant_bank(ctx, rng, lambda: make_pattern(rng, cfg), mutate_with(rng), float(cfg['mutation']),
+                          bool(cfg['section_variants']))
     steps, idx, stopped = [], 0, False
     for ph, pat in zip(ctx.phrases, pats):
         if cfg['reset'] == 'phrase' or (cfg['reset'] in ('section', 'never') and ph['first']):

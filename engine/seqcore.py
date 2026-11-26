@@ -147,15 +147,16 @@ def value_to_pitch(ctx, cfg, t, v, chord_start=False):
     return fold(p, lo, hi)
 
 
-def variant_bank(ctx, rng, make, mutate, mutation):
-    """One pattern per phrase: each section identity gets its own variant of the first pattern; a repeated
-    section returns to its pattern (one change at most, with probability `mutation`); later phrases of a section
-    may change one value (gradual development)."""
+def variant_bank(ctx, rng, make, mutate, mutation, section_variants=True):
+    """One pattern per phrase. With `section_variants`, each section identity gets its own variant of the first
+    pattern (otherwise every section uses the same pattern); a repeated section returns to its pattern (one change at
+    most, with probability `mutation`); later phrases of a section may change one value (gradual development).
+    With section_variants off and mutation 0 the pattern is the same throughout the piece."""
     bank, out, seed_pat = {}, [], make()
     for ph in ctx.phrases:
         if ph['first']:
             if ph['identity'] not in bank:
-                bank[ph['identity']] = seed_pat if not bank else mutate(seed_pat, 2)
+                bank[ph['identity']] = mutate(seed_pat, 2) if (bank and section_variants) else seed_pat
             elif rng.random() < mutation:
                 bank[ph['identity']] = mutate(bank[ph['identity']], 1)
             pat = bank[ph['identity']]

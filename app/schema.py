@@ -144,7 +144,8 @@ def schema():
                  sel('sequencers.m960.rows.c', 'Row C controls', ROW_CHOICES),
                  rng('sequencers.m960.skip_rate', 'Skip steps', 0, 0.5, help='Skipped steps take no time.'),
                  rng('sequencers.m960.stop_rate', 'Stop step', 0, 0.5, help='Chance of a Stop step: the pattern halts until its next restart.'),
-                 rng('sequencers.m960.time_rate', 'Double-length steps', 0, 0.6)])),
+                 rng('sequencers.m960.time_rate', 'Double-length steps', 0, 0.6),
+                 flag('sequencers.m960.section_variants', 'Different pattern per section type')])),
         dict(id='density', label='Density filter', help='Keep only a share of the notes in pads and lines (the constant pad is exempt).', fields=[
             num('density.keep', 'Keep (%)', 0, 100),
             sel('density.mode', 'Mode', [('even', 'Even'), ('flatten', 'Flatten (busiest thinned most)'),
