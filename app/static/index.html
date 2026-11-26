@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harmonic Composition</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Ctext y=%2213%22 font-size=%2213%22%3E%E2%99%AA%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="top">
+  <h1>Harmonic Composition <span id="version" class="muted"></span></h1>
+  <div class="actions">
+    <label class="inline">Example
+      <select id="examples"><option value="">Choose…</option></select>
+    </label>
+    <label class="inline">Saved
+      <select id="saved"><option value="">Choose…</option></select>
+    </label>
+    <input id="save-name" type="text" placeholder="Name to save as" aria-label="Name to save as">
+    <button id="save" type="button">Save script</button>
+    <label class="button">Upload script<input id="upload" type="file" accept=".yaml,.yml" hidden></label>
+    <button id="download-script" type="button">Download script</button>
+    <button id="generate" type="button" class="primary">Generate</button>
+  </div>
+</header>
+<p id="status" class="status" role="status" aria-live="polite"></p>
+<main class="layout">
+  <aside id="settings" class="settings" aria-label="Settings"></aside>
+  <section class="results" aria-label="Results">
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="score" aria-selected="true">Score</button>
+      <button role="tab" data-tab="chart">Chart</button>
+      <button role="tab" data-tab="plan">Density plan</button>
+      <button role="tab" data-tab="parts">Parts</button>
+      <button role="tab" data-tab="script">Script</button>
+    </nav>
+    <div id="files" class="files"></div>
+    <div class="tab" data-panel="score"><div id="score" class="score"><p class="muted">Generate to see the score.</p></div></div>
+    <div class="tab" data-panel="chart" hidden><pre id="chart" class="chart"></pre></div>
+    <div class="tab" data-panel="plan" hidden><div id="plan"></div></div>
+    <div class="tab" data-panel="parts" hidden><div id="parts"></div></div>
+    <div class="tab" data-panel="script" hidden>
+      <p class="muted">The piece script behind the menus. Edit it and choose Apply to update the menus; settings without a menu are kept.</p>
+      <textarea id="script" spellcheck="false" aria-label="Piece script (YAML)"></textarea>
+      <div class="row"><button id="apply-script" type="button">Apply script</button>
+        <button id="refresh-script" type="button">Show current settings</button></div>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

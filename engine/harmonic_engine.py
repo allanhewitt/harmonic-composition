@@ -1,0 +1,2508 @@
+"""Harmonic engine v0.7 for the Harmonic Composition generator.
+
+Populates a structure supplied by the structure stage with a harmonic plan.
+Successor to GCL Harmony Studio r3 (Experiment 34 r3), which is kept unchanged
+as the comparison baseline.
+
+Pipeline, in order:
+  1. section functions derived from the form (position, recurrence, contrast)
+  2. tonal plan (local key per section)
+  3. openings and destinations planned before any chords are chosen
+  4. core progression: motif grammar, candidate search, sampled among the best
+  5. inheritance for returns and variants (exact by default, phrase-level reuse)
+  6. colour: a separate step after the core chords; it never changes roots
+  7. realisation: chord symbols, audition voicing, MIDI, CSV, JSON manifest
+
+Evidence labels follow the Research Synthesis v1.0: MEASURED values come from
+the experiments named beside them; DESIGN values are compositional priors to be
+replaced by measured tables when available. In v0.2 the opening, destination,
+rate and key tables are measured per corpus (Experiment 35): Beatles and
+Billboard at section level, the Jazz Harmony Treebank at tune level. In v0.3
+the corpus mix blends these profiles, as it blends root motion. In v0.4 order-3
+chord-change models for all three corpora (Experiment 36) both generate candidate
+phrases and score every candidate; the corpus mix blends them too. In v0.5 the harmonic rhythm of each
+phrase is a chord-length pattern measured per span of 4, 2 and 1 bars (Experiment 37), restricted to the
+allowed chord lengths and tilted by the activity dial. The composer sets parameters only: every chord is
+chosen by the engine. Shaping dials leave a measured table unchanged at 0.5. All probability tables live in
+DEFAULT_TABLES (exported as harmonic_tables.json) so that a measured table can
+replace a prior without a code change.
+"""
+from __future__ import annotations
+
+import collections
+import copy
+import hashlib
+import json
+import math
+import random
+import re
+import struct
+from fractions import Fraction
+from pathlib import Path
+
+ENGINE_VERSION = "0.7.0"
+PPQ = 480
+
+PC_NAMES = ('C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B')
+LETTER_PC = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+MODES = {
+    'major': (0, 2, 4, 5, 7, 9, 11),
+    'minor': (0, 2, 3, 5, 7, 8, 10),
+    'dorian': (0, 2, 3, 5, 7, 9, 10),
+    'mixolydian': (0, 2, 4, 5, 7, 9, 10),
+    'lydian': (0, 2, 4, 6, 7, 9, 11),
+    'phrygian': (0, 1, 3, 5, 7, 8, 10),
+    'locrian': (0, 1, 3, 5, 6, 8, 10),
+}
+MODE_ALIASES = {'ionian': 'major', 'aeolian': 'minor'}
+MAJOR_LIKE = ('major', 'mixolydian', 'lydian')
+# Modes other than major and minor are generated in a reference mode and then read by scale degree in the
+# target mode (1-5-4-1 in C major is C G F C; in C lydian it is C G F#dim C). The reference is the
+# mode with the same third: major for lydian and mixolydian, minor for dorian, phrygian and locrian.
+REFERENCE_MODE = {'major': 'major', 'minor': 'minor', 'lydian': 'major', 'mixolydian': 'major',
+                  'dorian': 'minor', 'phrygian': 'minor', 'locrian': 'minor'}
+# DESIGN: where strict conversion gives a diminished triad, the mode's signature chord is used instead.
+# Each replacement shares notes with the chord it replaces: lydian #iv° -> II (keeps the #4), mixolydian
+# iii° -> v, dorian vi° -> IV, phrygian v° -> bII (the phrygian cadence). The locrian tonic is kept.
+MODAL_SUBSTITUTE = {'lydian': {'4': '2'}, 'mixolydian': {'3': '5'}, 'dorian': {'6': '4'}, 'phrygian': {'5': '2'}}
+# DESIGN: reference-mode degrees that become each mode's signature chord, for the modal-emphasis dial.
+MODAL_SIGNATURE = {'lydian': {'2', '4'}, 'mixolydian': {'5', '7', '3'}, 'dorian': {'4', '6'},
+                   'phrygian': {'2', '5'}, 'locrian': {'2'}}
+MODAL_MODES = ('lydian', 'mixolydian', 'dorian', 'phrygian', 'locrian')
+TRIADS = {'major': (0, 4, 7), 'minor': (0, 3, 7), 'diminished': (0, 3, 6), 'augmented': (0, 4, 8)}
+
+# Chord-symbol suffixes: intervals above the root. Family says which core
+# family the suffix can decorate.
+SUFFIXES = {
+    '': ('major', (0, 4, 7)), 'm': ('minor', (0, 3, 7)), 'dim': ('diminished', (0, 3, 6)),
+    'aug': ('augmented', (0, 4, 8)),
+    'add9': ('major', (0, 4, 7, 14)), 'maj7': ('major', (0, 4, 7, 11)), '6': ('major', (0, 4, 7, 9)),
+    'maj9': ('major', (0, 4, 7, 11, 14)), 'sus2': ('any', (0, 2, 7)), 'sus4': ('any', (0, 5, 7)),
+    '7': ('major', (0, 4, 7, 10)), 'm7': ('minor', (0, 3, 7, 10)), 'madd9': ('minor', (0, 3, 7, 14)),
+    'm9': ('minor', (0, 3, 7, 10, 14)), 'm6': ('minor', (0, 3, 7, 9)), 'm7b5': ('diminished', (0, 3, 6, 10)),
+}
+PLAIN_SUFFIX = {'major': '', 'minor': 'm', 'diminished': 'dim', 'augmented': 'aug'}
+
+# Mixture tokens: (semitones above local tonic, core family). Digits 1-7 are
+# diatonic degrees of the local mode; 'x<offset><M|m>' is a chromatic chord.
+MIXTURE_TOKENS = {'b2': (1, 'major'), 'b3': (3, 'major'), '4m': (5, 'minor'), '4M': (5, 'major'),
+                  '5M': (7, 'major'), 'b6': (8, 'major'), 'b7': (10, 'major')}
+FUNCTION_OF = {'1': 'T', '3': 'T', '6': 'T', 'b3': 'T', '2': 'P', '4': 'P', '4m': 'P', '4M': 'P', 'b6': 'P',
+               '5': 'D', '5M': 'D', '7': 'D', 'b7': 'D', 'b2': 'D'}
+FUNCTION_TRANSITIONS = {('T', 'T'): .25, ('T', 'P'): 1, ('T', 'D'): .65, ('P', 'T'): .35, ('P', 'P'): .15,
+                        ('P', 'D'): 1.5, ('D', 'T'): 1.8, ('D', 'P'): -.75, ('D', 'D'): -.25}
+
+DEFAULT_TABLES = {'schema': 'harmonic-engine-tables',
+ 'version': 4,
+ 'root_motion': {'evidence': 'MEASURED',
+                 'source': 'Experiment 20, root-changing intervals 1..11 (event-weighted)',
+                 'licence_note': 'jazz column derived from the Jazz Harmony Treebank, CC BY-NC-SA 4.0',
+                 'billboard': [0.020245,
+                               0.156094,
+                               0.04402,
+                               0.024242,
+                               0.291788,
+                               0.003218,
+                               0.222228,
+                               0.041321,
+                               0.057724,
+                               0.114306,
+                               0.024813],
+                 'beatles': [0.020374,
+                             0.125105,
+                             0.04462,
+                             0.034265,
+                             0.337431,
+                             0.006483,
+                             0.226217,
+                             0.037717,
+                             0.054386,
+                             0.080148,
+                             0.033255],
+                 'jazz': [0.045862,
+                          0.0594,
+                          0.020833,
+                          0.02383,
+                          0.535053,
+                          0.036458,
+                          0.066282,
+                          0.016307,
+                          0.063327,
+                          0.031622,
+                          0.101025]},
+ 'colour_profiles': {'evidence': 'MEASURED',
+                     'source': 'Experiment 27, optional-colour proxy: P(next coloured | previous plain), P(next '
+                               'coloured | previous coloured)',
+                     'licence_note': 'jazz profile derived from the Jazz Harmony Treebank, CC BY-NC-SA 4.0',
+                     'anchors': [{'dial': 0.0, 'name': 'plain', 'onset': 0.0, 'persistence': 0.0},
+                                 {'dial': 0.5, 'name': 'beatles', 'onset': 0.0572, 'persistence': 0.3281},
+                                 {'dial': 1.0, 'name': 'jazz', 'onset': 0.6057, 'persistence': 0.5021}]},
+ 'colour_vocabulary': {'evidence': 'DESIGN',
+                       'note': 'which colour, given that a chord is coloured; validity is checked against the local '
+                               'key',
+                       'tonic_major': {'add9': 3, 'maj7': 2, '6': 1.5, 'sus2': 1.5, 'maj9': 0.4},
+                       'dominant_major': {'sus4': 3, 'add9': 1, 'sus2': 0.5},
+                       'other_major': {'add9': 2, 'sus2': 1.5, 'sus4': 1, '6': 1, 'maj7': 0.5},
+                       'minor': {'m7': 3, 'madd9': 2, 'sus4': 0.7, 'sus2': 0.5, 'm9': 0.4},
+                       'diminished': {'m7b5': 1}},
+ 'opening': {'evidence': 'MEASURED',
+             'source': 'Experiment 35: one method across corpora; profiles are blended by the corpus mix',
+             'note': 'P(opening token | section class). Stability dial reweights; 0.5 leaves it as measured. Each '
+                     'profile is smoothed towards the v0.1 design prior with 10 pseudo-observations.',
+             'profiles': {'beatles': {'opening_statement': {'1': 0.5981,
+                                                            '5': 0.0975,
+                                                            '6': 0.0671,
+                                                            '4': 0.0642,
+                                                            '2': 0.0348,
+                                                            'b7': 0.0213,
+                                                            '3': 0.016,
+                                                            'x0M': 0.016,
+                                                            'x2M': 0.016,
+                                                            'x0m': 0.016,
+                                                            'x11M': 0.0106,
+                                                            'x6M': 0.0106,
+                                                            'x9M': 0.0053,
+                                                            'b6': 0.0053,
+                                                            'x1m': 0.0053,
+                                                            'x7M': 0.0053,
+                                                            '7': 0.0053,
+                                                            '4M': 0.0053},
+                                      'statement': {'1': 0.5652,
+                                                    '4': 0.11,
+                                                    '6': 0.0525,
+                                                    '5': 0.0433,
+                                                    '2': 0.0428,
+                                                    'b7': 0.0393,
+                                                    '3': 0.0336,
+                                                    'x9M': 0.0199,
+                                                    'x0M': 0.0159,
+                                                    'x11M': 0.0159,
+                                                    'x2M': 0.012,
+                                                    'x0m': 0.012,
+                                                    'b2': 0.008,
+                                                    '7': 0.008,
+                                                    'b6': 0.0057,
+                                                    '4m': 0.004,
+                                                    'x7m': 0.004,
+                                                    'x4M': 0.004,
+                                                    'b3': 0.004},
+                                      'contrast_statement': {'1': 0.3517,
+                                                             '4': 0.1706,
+                                                             '6': 0.1037,
+                                                             '5': 0.0633,
+                                                             '2': 0.0624,
+                                                             'b7': 0.0376,
+                                                             '3': 0.0348,
+                                                             '7': 0.0256,
+                                                             'x11M': 0.0192,
+                                                             'x4M': 0.0192,
+                                                             'b6': 0.0156,
+                                                             'x11m': 0.0128,
+                                                             'x9M': 0.0128,
+                                                             'x7m': 0.0128,
+                                                             'b3': 0.0128,
+                                                             '4M': 0.0128,
+                                                             'b2': 0.0064,
+                                                             'x1m': 0.0064,
+                                                             'x0M': 0.0064,
+                                                             'x6M': 0.0064,
+                                                             'x9m': 0.0064},
+                                      'final_statement': {'1': 0.5282,
+                                                          '4': 0.1573,
+                                                          '6': 0.0822,
+                                                          '5': 0.0423,
+                                                          '2': 0.0352,
+                                                          '3': 0.0282,
+                                                          'b7': 0.0282,
+                                                          'x0M': 0.0282,
+                                                          'x2M': 0.0141,
+                                                          'x6M': 0.0141,
+                                                          '4m': 0.0141,
+                                                          'x11M': 0.007,
+                                                          'x9M': 0.007,
+                                                          'b3': 0.007,
+                                                          'b2': 0.007}},
+                          'billboard': {'opening_statement': {'1': 0.7282,
+                                                              '5': 0.0859,
+                                                              '4': 0.0562,
+                                                              '6': 0.0262,
+                                                              '2': 0.0194,
+                                                              'b7': 0.0107,
+                                                              '3': 0.008,
+                                                              'x0M': 0.008,
+                                                              'x0m': 0.008,
+                                                              'x7m': 0.0053,
+                                                              'x2M': 0.0053,
+                                                              '4m': 0.004,
+                                                              'x4M': 0.004,
+                                                              'x7M': 0.004,
+                                                              '7': 0.004,
+                                                              'x9M': 0.0027,
+                                                              'b2': 0.0027,
+                                                              'x10m': 0.0027,
+                                                              '5M': 0.0027,
+                                                              'b3': 0.0027,
+                                                              'x9m': 0.0027},
+                                        'statement': {'1': 0.6603,
+                                                      '4': 0.0947,
+                                                      '6': 0.0689,
+                                                      '5': 0.0389,
+                                                      '2': 0.0312,
+                                                      '3': 0.0182,
+                                                      'b7': 0.0126,
+                                                      '7': 0.011,
+                                                      'b3': 0.0093,
+                                                      'x0m': 0.0076,
+                                                      'x2M': 0.0076,
+                                                      '4m': 0.0051,
+                                                      'x0M': 0.0051,
+                                                      'b6': 0.0046,
+                                                      'b2': 0.0042,
+                                                      '4M': 0.0042,
+                                                      'x9M': 0.0034,
+                                                      'x11M': 0.0034,
+                                                      'x4M': 0.0034},
+                                        'final_statement': {'1': 0.5565,
+                                                            '4': 0.1594,
+                                                            '5': 0.087,
+                                                            '6': 0.0493,
+                                                            '2': 0.0348,
+                                                            'x9M': 0.0174,
+                                                            'x2M': 0.0174,
+                                                            '3': 0.0087,
+                                                            'x3m': 0.0087,
+                                                            'b6': 0.0087,
+                                                            'b2': 0.0087,
+                                                            'x7m': 0.0087,
+                                                            'x11M': 0.0087,
+                                                            'x4M': 0.0087,
+                                                            'b3': 0.0087,
+                                                            'b7': 0.0087},
+                                        'contrast_statement': {'1': 0.3803,
+                                                               '4': 0.222,
+                                                               '6': 0.0845,
+                                                               '5': 0.066,
+                                                               '3': 0.0322,
+                                                               '2': 0.0297,
+                                                               'b6': 0.0292,
+                                                               'b7': 0.0269,
+                                                               'b3': 0.0241,
+                                                               'x7m': 0.0165,
+                                                               'x2M': 0.0165,
+                                                               'x0M': 0.0135,
+                                                               '4m': 0.009,
+                                                               '7': 0.009,
+                                                               'x0m': 0.0075,
+                                                               '4M': 0.0075,
+                                                               'x9M': 0.006,
+                                                               'x4M': 0.0045,
+                                                               'x9m': 0.0045,
+                                                               'b2': 0.003,
+                                                               'x10m': 0.003}},
+                          'jazz': {'opening_statement': {'1': 0.7216,
+                                                         '2': 0.0827,
+                                                         '6': 0.0319,
+                                                         '4': 0.0306,
+                                                         'x2M': 0.0169,
+                                                         '5': 0.0121,
+                                                         'x7m': 0.0093,
+                                                         'x0m': 0.0085,
+                                                         '7': 0.0085,
+                                                         '3': 0.0076,
+                                                         'x9M': 0.0076,
+                                                         'x6m': 0.0076,
+                                                         'x4M': 0.0068,
+                                                         'x2m': 0.0059,
+                                                         'b2': 0.0051,
+                                                         'x1m': 0.0042,
+                                                         'x11M': 0.0042,
+                                                         'x3m': 0.0034,
+                                                         '4m': 0.0034,
+                                                         'b6': 0.0034,
+                                                         'b7': 0.0034,
+                                                         'x11m': 0.0025,
+                                                         'x10m': 0.0025}}},
+             'support': {'beatles': {'opening_statement': 178,
+                                     'statement': 241,
+                                     'contrast_statement': 146,
+                                     'final_statement': 132},
+                         'billboard': {'opening_statement': 739,
+                                       'statement': 1168,
+                                       'final_statement': 105,
+                                       'contrast_statement': 655},
+                         'jazz': {'opening_statement': 1170}}},
+ 'destination': {'evidence': 'MEASURED',
+                 'source': 'Experiment 35: one method across corpora; profiles are blended by the corpus mix',
+                 'note': 'P(destination | section class); final sections that fade out are excluded. '
+                         'Cadence-strength dial reweights. Each profile is smoothed towards the v0.1 design prior '
+                         'with 10 pseudo-observations.',
+                 'profiles': {'beatles': {'opening_statement': {'half': 0.2677,
+                                                                'tonic': 0.2394,
+                                                                'authentic': 0.1123,
+                                                                'free': 0.091,
+                                                                'open': 0.0863,
+                                                                'plagal': 0.0851,
+                                                                'lead_dominant': 0.0544,
+                                                                'mixture': 0.0319,
+                                                                'lead_step': 0.0319},
+                                          'statement': {'half': 0.3154,
+                                                        'authentic': 0.1713,
+                                                        'plagal': 0.1474,
+                                                        'free': 0.0958,
+                                                        'open': 0.074,
+                                                        'lead_dominant': 0.0583,
+                                                        'lead_step': 0.056,
+                                                        'tonic': 0.0478,
+                                                        'mixture': 0.0319,
+                                                        'deceptive': 0.0021},
+                                          'return': {'half': 0.2559,
+                                                     'authentic': 0.18,
+                                                     'plagal': 0.1694,
+                                                     'free': 0.0954,
+                                                     'open': 0.0795,
+                                                     'lead_dominant': 0.063,
+                                                     'tonic': 0.0545,
+                                                     'mixture': 0.0514,
+                                                     'lead_step': 0.047,
+                                                     'deceptive': 0.0038},
+                                          'contrast_statement': {'half': 0.3792,
+                                                                 'authentic': 0.1538,
+                                                                 'lead_dominant': 0.1002,
+                                                                 'plagal': 0.0833,
+                                                                 'open': 0.0742,
+                                                                 'free': 0.0644,
+                                                                 'lead_step': 0.058,
+                                                                 'tonic': 0.0513,
+                                                                 'mixture': 0.0256,
+                                                                 'deceptive': 0.0098},
+                                          'final': {'authentic': 0.2364,
+                                                    'tonic': 0.2249,
+                                                    'plagal': 0.2069,
+                                                    'free': 0.1598,
+                                                    'open': 0.0668,
+                                                    'half': 0.0668,
+                                                    'mixture': 0.0384},
+                                          'variant': {'half': 0.2765,
+                                                      'plagal': 0.1758,
+                                                      'authentic': 0.1209,
+                                                      'free': 0.0995,
+                                                      'open': 0.0943,
+                                                      'lead_step': 0.0775,
+                                                      'lead_dominant': 0.0509,
+                                                      'mixture': 0.044,
+                                                      'tonic': 0.044,
+                                                      'deceptive': 0.0168}},
+                              'billboard': {'opening_statement': {'half': 0.2822,
+                                                                  'tonic': 0.2417,
+                                                                  'open': 0.1084,
+                                                                  'plagal': 0.0935,
+                                                                  'authentic': 0.0843,
+                                                                  'lead_step': 0.0748,
+                                                                  'free': 0.0589,
+                                                                  'mixture': 0.0294,
+                                                                  'lead_dominant': 0.0243,
+                                                                  'deceptive': 0.0027},
+                                            'statement': {'half': 0.3541,
+                                                          'authentic': 0.1282,
+                                                          'plagal': 0.1044,
+                                                          'open': 0.0939,
+                                                          'lead_step': 0.0934,
+                                                          'tonic': 0.0857,
+                                                          'free': 0.0705,
+                                                          'lead_dominant': 0.0379,
+                                                          'mixture': 0.0246,
+                                                          'deceptive': 0.0072},
+                                            'return': {'half': 0.2988,
+                                                       'open': 0.1284,
+                                                       'plagal': 0.1142,
+                                                       'authentic': 0.1089,
+                                                       'tonic': 0.1008,
+                                                       'lead_step': 0.0923,
+                                                       'free': 0.0736,
+                                                       'lead_dominant': 0.0411,
+                                                       'mixture': 0.0359,
+                                                       'deceptive': 0.006},
+                                            'final': {'authentic': 0.286,
+                                                      'plagal': 0.2663,
+                                                      'tonic': 0.1743,
+                                                      'free': 0.1086,
+                                                      'mixture': 0.0575,
+                                                      'half': 0.0569,
+                                                      'open': 0.0437,
+                                                      'deceptive': 0.0066},
+                                            'contrast_statement': {'half': 0.3461,
+                                                                   'open': 0.1452,
+                                                                   'lead_step': 0.1099,
+                                                                   'tonic': 0.0947,
+                                                                   'free': 0.0813,
+                                                                   'plagal': 0.0692,
+                                                                   'authentic': 0.0677,
+                                                                   'lead_dominant': 0.0536,
+                                                                   'mixture': 0.0301,
+                                                                   'deceptive': 0.0023},
+                                            'variant': {'half': 0.3024,
+                                                        'authentic': 0.1164,
+                                                        'lead_step': 0.1134,
+                                                        'tonic': 0.1132,
+                                                        'open': 0.1087,
+                                                        'plagal': 0.0975,
+                                                        'free': 0.0882,
+                                                        'lead_dominant': 0.0492,
+                                                        'mixture': 0.0063,
+                                                        'deceptive': 0.0048}},
+                              'jazz': {}},
+                 'support': {'beatles': {'opening_statement': 178,
+                                         'statement': 241,
+                                         'return': 651,
+                                         'contrast_statement': 146,
+                                         'final': 159,
+                                         'variant': 81},
+                             'billboard': {'opening_statement': 739,
+                                           'statement': 1168,
+                                           'return': 3414,
+                                           'final': 294,
+                                           'contrast_statement': 655,
+                                           'variant': 308},
+                             'jazz': {}}},
+ 'rate': {'evidence': 'MEASURED',
+          'source': 'Experiment 35: one method across corpora; profiles are blended by the corpus mix',
+          'note': 'P(chords per bar | section class). Harmonic-activity dial tilts it. Each profile is smoothed '
+                  'towards the v0.1 design prior with 10 pseudo-observations.',
+          'profiles': {'beatles': {'opening_statement': {'1': 0.4199, '0.5': 0.2408, '2': 0.1774, '0.25': 0.1618},
+                                   'statement': {'1': 0.5259, '0.5': 0.262, '2': 0.1643, '0.25': 0.0478},
+                                   'return': {'1': 0.4611, '0.5': 0.3065, '2': 0.1854, '0.25': 0.047},
+                                   'contrast_statement': {'1': 0.4872, '0.5': 0.3061, '2': 0.1426, '0.25': 0.0641},
+                                   'final_statement': {'1': 0.4286, '0.5': 0.2479, '0.25': 0.1765, '2': 0.1471},
+                                   'variant': {'1': 0.4828, '0.5': 0.3082, '2': 0.1659, '0.25': 0.0431}},
+                       'billboard': {'opening_statement': {'1': 0.3785, '0.25': 0.2244, '0.5': 0.2184, '2': 0.1788},
+                                     'statement': {'1': 0.4583, '0.5': 0.2494, '2': 0.2055, '0.25': 0.0869},
+                                     'return': {'1': 0.4289, '0.5': 0.2461, '2': 0.2311, '0.25': 0.0939},
+                                     'final_statement': {'1': 0.3654, '0.25': 0.2655, '2': 0.1858, '0.5': 0.1833},
+                                     'contrast_statement': {'1': 0.4766, '0.5': 0.2259, '2': 0.1784, '0.25': 0.1192},
+                                     'variant': {'1': 0.4161, '0.5': 0.2761, '2': 0.2162, '0.25': 0.0915}},
+                       'jazz': {'opening_statement': {'1': 0.5548, '2': 0.3404, '0.5': 0.0878, '0.25': 0.0169}}},
+          'support': {'beatles': {'opening_statement': 163,
+                                  'statement': 241,
+                                  'return': 671,
+                                  'contrast_statement': 146,
+                                  'final_statement': 126,
+                                  'variant': 106},
+                      'billboard': {'opening_statement': 721,
+                                    'statement': 1164,
+                                    'return': 3886,
+                                    'final_statement': 103,
+                                    'contrast_statement': 653,
+                                    'variant': 449},
+                      'jazz': {'opening_statement': 1170}}},
+ 'key_relation': {'evidence': 'MEASURED',
+                  'source': 'Experiment 35: key at section start relative to the home key',
+                  'note': 'p_depart: share of new interior material not in the home key, per corpus and class. The '
+                          'tonal-departure dial maps 0 to never, 0.5 to measured, 1 to always. The departure shape '
+                          'is pooled across corpora (departures are rare).',
+                  'p_depart': {'beatles': {'statement': 0.0581, 'contrast_statement': 0.0342},
+                               'billboard': {'statement': 0.0094, 'contrast_statement': 0.0366}},
+                  'support': {'beatles': {'statement': 241, 'contrast_statement': 146},
+                              'billboard': {'statement': 1168, 'contrast_statement': 655}},
+                  'statement': {'relative': 0.4783, 'parallel': 0.2319, 'subdominant': 0.2029, 'dominant': 0.087}},
+ 'scoring': {'evidence': 'DESIGN',
+             'note': 'weights for the candidate search; transition = mean log probability under the blended '
+                     'chord-change models (replaces root motion when models are present)',
+             'motion': 1.0,
+             'function': 0.6,
+             'diversity': 1.2,
+             'contrast': 2.0,
+             'ending_reuse': 1.5,
+             'mixture_use': 0.3,
+             'transition': 1.0},
+ 'motifs': {'evidence': 'DESIGN',
+            'source': 'authored Roman-numeral motifs, from Experiment 33 model D; mixture set added in v0.1',
+            'major': [[1, 4, 1, 5],
+                      [1, 5, 4, 1],
+                      [1, 4, 5, 1],
+                      [1, 6, 4, 5],
+                      [1, 5, 6, 4],
+                      [1, 3, 4, 5],
+                      [1, 4, 6, 5],
+                      [6, 4, 1, 5],
+                      [1, 5, 4, 6],
+                      [6, 2, 4, 1],
+                      [1, 6, 3, 4],
+                      [3, 6, 4, 1],
+                      [1, 3, 6, 4],
+                      [1, 2, 3, 4],
+                      [2, 3, 4, 5],
+                      [6, 7, 1, 4],
+                      [1, 2, 4, 5],
+                      [1, 6, 2, 5],
+                      [2, 5, 1, 6],
+                      [4, 2, 5, 1],
+                      [6, 4, 5, 1],
+                      [4, 1, 5, 6],
+                      [4, 5, 6, 1],
+                      [2, 4, 1, 5]],
+            'minor': [[1, 6, 1, 7],
+                      [1, 4, 7, 1],
+                      [1, 6, 7, 1],
+                      [1, 3, 6, 7],
+                      [1, 6, 3, 7],
+                      [1, 7, 6, 4],
+                      [1, 4, 6, 7],
+                      [6, 3, 7, 1],
+                      [1, 3, 7, 6],
+                      [6, 3, 1, 7],
+                      [1, 6, 4, 3],
+                      [3, 7, 1, 6],
+                      [1, 3, 4, 5],
+                      [3, 4, 6, 7],
+                      [6, 7, 1, 4],
+                      [1, 3, 4, 6],
+                      [1, 6, 4, 5],
+                      [4, 7, 3, 1],
+                      [6, 4, 7, 1],
+                      [1, 4, 5, 1],
+                      [3, 6, 7, 1]],
+            'major_mixture': [[1, 'b7', 4, 1],
+                              [1, 'b7', 1, 'b7'],
+                              ['b6', 'b7', 1, 1],
+                              [1, 4, '4m', 1],
+                              [4, '4m', 1, 1],
+                              [1, 'b3', 4, 1],
+                              [1, 'b7', 4, 4],
+                              ['b7', 4, 1, 1],
+                              [6, 'b6', 'b7', 1]],
+            'minor_mixture': [[1, '4M', 1, '4M'],
+                              [1, '5M', 1, 1],
+                              [6, 7, 1, '5M'],
+                              [1, 4, '5M', 1],
+                              [1, 'b2', 1, 1]]},
+ 'sources': {'beatles': 'Isophonics Beatles annotations, section level',
+             'billboard': 'McGill Billboard via ChoCo (CC BY 4.0), section level',
+             'jazz': 'Jazz Harmony Treebank (CC BY-NC-SA 4.0), tune level: tune openings and tune chord rate only'}}
+
+# Experiment 36 chord-change models, kept as compact JSON (about 300 KB).
+_TRANSITIONS_JSON = '{"evidence":"MEASURED","source":"Experiment 36: order-3 back-off chord-change models, one method for three corpora","method":"Experiment 35: measure section-function harmony in three corpora with one method.\\n\\n  Beatles  : Isophonics annotations (seglab, keylab, chordlab, beat)   section level\\n  Billboard: McGill Billboard salami_chords.txt via ChoCo (CC BY 4.0)   section level\\n  Jazz     : Jazz Harmony Treebank (CC BY-NC-SA 4.0)                    tune level only\\n\\nUsage: python measure_corpora.py <beatles root> <billboard original dir> <jht.json> <out dir>","alpha":50.0,"qualities":["major","minor","dominant","diminished_family","suspended","other"],"licence_note":"jazz model derived from the Jazz Harmony Treebank (CC BY-NC-SA 4.0); Billboard model from McGill Billboard via ChoCo (CC BY 4.0)","corpora":{"billboard":{"model":{"base":[0.016606,0.006991,0.012533,0.000713,0.007123,0.002492,0.015092,0.001257,0.000698,0.00136,0.000213,0.002007,0.071224,0.049171,0.011137,0.000301,0.009667,0.010372,0.034116,0.001139,0.002301,0.000684,0.001022,0.002904,0.00208,0.015386,0.001919,0.000272,0.000316,0.000537,0.189766,0.039923,0.031381,0.000154,0.008535,0.007755,0.001801,0.000434,0.000463,0.000331,2.2e-05,9.6e-05,0.141984,0.034983,0.023913,8.1e-05,0.005021,0.007976,0.032161,0.000537,0.001051,6.6e-05,0.000478,0.001169,0.005697,0.036365,0.00455,0.000978,0.000772,0.002242,0.089851,0.009402,0.004433,9.6e-05,0.002977,0.006315,0.005124,0.011622,0.003653,0.00036,0.00161,0.002242],"orders":{"1":{"minor":{"0":60,"2":33,"3":36,"4":24,"5":36,"6":728,"7":21,"8":3,"9":3,"11":5,"12":70,"13":551,"14":89,"15":12,"16":47,"17":20,"18":1483,"19":56,"20":98,"22":64,"23":18,"24":5,"25":13,"26":2,"27":7,"28":2,"30":1293,"31":1499,"32":1160,"33":5,"34":309,"35":44,"36":26,"37":16,"38":10,"42":374,"43":871,"44":117,"45":4,"46":29,"47":65,"48":1767,"49":22,"50":41,"52":16,"53":6,"54":2,"55":28,"56":5,"57":43,"60":1993,"61":571,"62":69,"64":107,"65":24,"66":48,"67":56,"68":5,"69":6,"71":6},"major":{"1":323,"2":575,"3":5,"4":388,"5":86,"6":149,"7":15,"8":5,"9":68,"10":6,"11":9,"12":4687,"13":2484,"14":555,"15":2,"16":516,"17":104,"18":629,"19":13,"20":18,"21":33,"22":4,"23":14,"24":124,"25":998,"26":114,"27":7,"28":18,"29":15,"30":8768,"31":458,"32":179,"34":168,"35":103,"36":35,"37":9,"38":13,"39":13,"40":1,"42":8968,"43":954,"44":897,"46":281,"47":95,"48":271,"50":17,"51":3,"52":2,"53":2,"54":337,"55":2322,"56":237,"57":17,"58":49,"59":49,"60":3539,"61":13,"62":39,"63":4,"64":18,"65":29,"66":274,"67":674,"68":160,"69":10,"70":101,"71":38},"diminished_family":{"0":1,"1":4,"2":2,"4":4,"6":17,"7":42,"8":7,"10":7,"11":1,"12":2,"13":4,"19":5,"20":3,"21":13,"25":3,"26":6,"31":3,"32":69,"34":3,"36":33,"37":2,"38":7,"42":10,"43":3,"44":3,"49":7,"50":1,"52":11,"54":1,"60":31,"61":6,"62":6,"64":1,"65":5,"66":7,"67":24,"68":1,"69":7,"71":3},"dominant":{"0":187,"1":52,"3":4,"4":34,"5":33,"6":81,"7":6,"8":22,"9":10,"11":6,"12":28,"13":124,"14":91,"16":5,"17":3,"18":105,"19":2,"20":36,"22":1,"23":4,"24":10,"25":19,"26":7,"27":4,"28":1,"29":2,"30":2079,"31":635,"32":688,"33":4,"34":68,"35":14,"36":5,"37":2,"38":1,"39":9,"41":4,"42":188,"43":483,"44":583,"45":1,"46":7,"47":4,"48":85,"49":6,"50":7,"51":1,"52":2,"54":14,"55":89,"56":55,"58":3,"60":384,"61":38,"62":181,"63":2,"64":27,"65":1,"66":8,"67":20,"68":77,"69":1,"70":3,"71":1},"suspended":{"0":778,"1":63,"2":222,"3":3,"5":14,"6":22,"8":8,"9":7,"11":5,"12":19,"13":148,"14":20,"16":85,"17":50,"18":22,"23":1,"24":1,"25":11,"29":1,"30":671,"31":33,"32":24,"33":1,"34":32,"35":7,"36":19,"42":28,"43":30,"44":20,"46":1,"47":23,"48":13,"49":1,"54":8,"55":18,"56":12,"57":6,"60":91,"61":3,"62":5,"64":29,"65":1,"66":2,"67":7,"68":3,"70":4,"71":1},"other":{"0":103,"1":33,"2":20,"4":34,"6":29,"7":1,"8":2,"9":4,"10":1,"11":110,"12":38,"13":33,"14":2,"15":6,"16":4,"17":528,"18":81,"19":1,"20":1,"23":160,"24":1,"25":2,"26":1,"29":18,"30":96,"31":87,"32":14,"35":359,"36":4,"41":2,"42":89,"43":38,"44":6,"46":23,"47":355,"48":51,"50":5,"52":1,"53":71,"54":25,"55":16,"59":103,"60":73,"61":8,"62":1,"64":20,"65":369,"66":9,"67":9,"68":2,"70":1,"71":103}},"2":{"major|9|minor":{"0":6,"2":5,"4":2,"5":1,"6":97,"12":11,"13":18,"14":11,"16":5,"17":13,"18":435,"19":4,"22":4,"27":3,"30":151,"31":352,"32":109,"34":52,"36":3,"38":1,"42":22,"43":81,"44":5,"47":5,"48":603,"49":15,"50":2,"52":10,"57":13,"60":219,"61":14,"62":7,"64":23,"65":15,"66":7,"69":1,"71":1},"minor|3|major":{"1":2,"2":8,"4":4,"9":2,"12":277,"13":59,"14":36,"16":38,"18":5,"24":2,"25":24,"26":1,"30":186,"31":2,"39":2,"42":346,"43":7,"44":21,"46":1,"54":1,"55":335,"59":29,"60":36,"63":1,"66":16,"67":24,"68":20,"71":3},"major|5|major":{"1":29,"2":121,"4":57,"5":10,"6":5,"8":1,"9":5,"12":1114,"13":261,"14":174,"16":208,"17":2,"18":21,"19":2,"20":1,"21":4,"24":15,"25":216,"26":26,"30":1547,"31":19,"32":9,"34":5,"35":19,"36":3,"37":2,"38":1,"42":3615,"43":19,"44":60,"46":17,"47":8,"48":19,"50":1,"51":1,"53":1,"54":54,"55":673,"56":47,"57":1,"58":7,"59":4,"60":173,"64":1,"65":3,"66":31,"67":114,"68":11,"70":5},"major|9|major":{"1":3,"12":10,"13":3,"14":2,"17":6,"18":44,"27":2,"30":128,"31":41,"32":9,"34":1,"42":12,"43":3,"44":1,"48":31,"54":11,"55":1,"60":29,"68":1},"major|3|major":{"9":9,"10":2,"12":184,"13":6,"14":16,"16":17,"17":12,"18":1,"24":12,"25":25,"28":1,"29":1,"30":13,"31":1,"38":1,"42":162,"54":51,"55":14,"56":5,"58":1,"60":17,"66":20,"67":32,"68":5,"70":23},"major|7|major":{"1":48,"2":100,"4":24,"5":10,"6":11,"8":3,"9":5,"11":3,"12":203,"13":589,"14":53,"15":1,"16":2,"17":15,"18":207,"21":10,"24":18,"25":125,"26":15,"28":3,"29":1,"30":3140,"31":18,"32":26,"34":15,"35":15,"36":7,"42":1764,"43":214,"44":357,"46":91,"47":13,"48":31,"50":2,"51":1,"54":13,"55":361,"56":17,"57":5,"58":8,"59":4,"60":1339,"61":3,"62":21,"65":3,"66":8,"67":22,"69":1,"71":1},"major|11|diminished_family":{"6":1,"32":8,"34":1},"diminished_family|5|dominant":{"1":2,"6":8,"30":5,"31":34,"32":3,"34":12,"45":1,"61":3,"63":1,"64":1},"dominant|5|minor":{"0":1,"4":4,"7":3,"13":33,"14":1,"18":35,"19":10,"20":24,"30":56,"31":83,"32":97,"34":9,"36":4,"42":1,"43":13,"44":67,"46":3,"48":65,"49":2,"50":13,"56":3,"57":13,"60":55,"61":17,"62":4,"64":9,"66":4,"69":2},"minor|7|dominant":{"6":12,"18":5,"30":4,"31":74,"44":1,"61":10,"62":11},"minor|5|minor":{"0":10,"2":2,"4":1,"5":1,"6":6,"7":1,"9":1,"11":5,"12":7,"13":114,"14":32,"15":4,"16":18,"18":105,"20":3,"22":1,"30":184,"31":173,"32":111,"34":85,"35":1,"36":3,"42":3,"43":297,"44":4,"46":1,"47":2,"48":143,"52":1,"53":2,"57":1,"60":161,"61":1,"62":4,"64":6,"66":6},"minor|5|dominant":{"0":9,"1":12,"4":3,"5":5,"12":10,"13":20,"14":4,"18":11,"19":2,"22":1,"27":3,"30":442,"31":69,"32":36,"34":21,"37":1,"43":410,"46":1,"48":9,"49":1,"55":37,"56":2,"60":29,"61":2,"62":8,"68":3},"dominant|5|major":{"1":74,"2":137,"3":2,"4":14,"5":11,"6":5,"9":17,"10":3,"12":59,"13":107,"14":57,"16":20,"18":9,"20":1,"21":9,"24":4,"25":64,"26":25,"27":3,"28":3,"29":1,"30":457,"31":35,"32":38,"34":3,"35":2,"38":1,"39":5,"42":217,"43":22,"44":244,"46":13,"47":1,"48":8,"50":5,"51":1,"54":18,"55":172,"56":78,"57":8,"58":5,"60":32,"62":2,"66":11,"67":26,"68":11,"69":3,"70":2,"71":2},"minor|2|minor":{"2":5,"4":1,"5":3,"6":129,"7":1,"8":1,"12":2,"13":14,"18":17,"20":13,"22":9,"30":6,"31":144,"32":27,"34":2,"36":2,"43":4,"48":17,"52":3,"55":3,"60":20,"61":123,"64":1},"minor|3|dominant":{"0":2,"5":1,"13":21,"14":9,"30":33,"32":1,"39":4,"42":1,"43":3,"48":8,"55":12,"56":3,"64":2,"70":1},"dominant|0|major":{"2":47,"12":1,"13":7,"14":6,"18":34,"23":1,"25":3,"26":1,"30":33,"32":1,"35":1,"42":10,"43":1,"44":6,"46":2,"48":14,"54":1,"55":10,"56":2,"60":7},"major|0|dominant":{"0":86,"6":2,"12":2,"13":6,"14":2,"18":4,"23":1,"24":1,"26":2,"30":341,"31":15,"32":26,"42":15,"43":1,"44":8,"46":1,"48":1,"54":4,"55":12,"56":4,"60":33,"61":5,"62":1,"64":3,"68":1},"major|7|dominant":{"0":39,"4":1,"5":2,"13":29,"14":4,"18":43,"24":1,"30":489,"31":3,"32":22,"35":3,"42":10,"43":7,"44":12,"46":1,"48":3,"51":1,"54":4,"55":3,"60":192,"61":1,"62":24},"major|11|minor":{"0":1,"5":10,"6":56,"18":78,"19":3,"20":3,"24":1,"30":11,"31":108,"32":16,"34":5,"36":3,"38":4,"43":2,"44":1,"48":42,"50":1,"53":2,"60":24,"61":260,"62":15,"64":18,"66":9,"69":1,"71":2},"minor|10|minor":{"0":9,"7":3,"13":99,"14":16,"16":8,"18":117,"19":13,"30":43,"31":1,"32":60,"34":41,"42":2,"43":52,"46":1,"48":6,"57":1,"60":100,"62":1,"64":4,"68":1},"minor|10|major":{"1":40,"2":13,"4":13,"5":4,"6":1,"7":1,"9":2,"12":16,"13":553,"14":1,"16":1,"17":2,"18":12,"23":2,"24":6,"25":36,"26":15,"28":4,"30":350,"31":9,"32":1,"34":3,"35":11,"40":1,"42":141,"43":87,"44":14,"46":16,"47":6,"48":26,"54":10,"55":116,"58":1,"60":453,"62":5,"65":7,"66":1,"67":11,"69":2,"71":2},"major|10|major":{"1":16,"2":4,"7":2,"12":1326,"14":16,"16":25,"17":3,"18":2,"24":15,"25":186,"26":9,"27":1,"29":4,"30":42,"32":3,"36":2,"37":5,"42":1420,"43":2,"46":30,"47":6,"48":7,"54":68,"55":88,"56":4,"58":1,"60":40,"62":1,"65":1,"66":40,"67":150,"68":14,"70":17,"71":6},"major|5|dominant":{"0":4,"4":1,"8":5,"9":6,"11":3,"12":6,"14":11,"18":4,"25":1,"26":3,"28":1,"30":30,"31":2,"32":3,"39":3,"42":81,"50":1,"55":3,"60":3,"67":1,"68":7},"dominant|11|minor":{"14":1,"18":2,"31":4,"32":10,"48":2,"60":1},"major|2|major":{"1":15,"2":41,"4":25,"5":16,"6":19,"9":5,"12":145,"13":659,"14":18,"16":5,"17":20,"18":133,"20":4,"23":5,"25":6,"30":1777,"31":16,"32":5,"34":27,"35":11,"42":128,"43":107,"44":91,"46":15,"47":5,"48":66,"50":6,"54":15,"55":109,"56":13,"58":6,"60":1117,"61":2,"63":3,"64":3,"65":14,"66":4,"67":2,"70":1},"major|5|suspended":{"0":88,"1":2,"2":1,"11":2,"12":2,"13":1,"16":46,"25":3,"30":10,"31":1,"34":1,"42":8,"54":2,"60":2},"suspended|0|major":{"1":5,"2":11,"4":227,"5":1,"6":12,"10":1,"12":22,"13":17,"14":2,"16":4,"18":15,"20":1,"25":8,"26":3,"28":1,"30":163,"31":41,"34":30,"42":66,"43":7,"44":2,"46":5,"48":7,"55":46,"58":1,"60":68,"62":4,"64":8,"70":3},"major|2|dominant":{"0":10,"1":7,"6":4,"8":1,"13":21,"14":5,"18":1,"20":3,"27":1,"30":280,"31":19,"32":62,"33":1,"34":3,"35":2,"36":3,"42":15,"43":11,"44":2,"48":21,"55":6,"56":17,"60":55,"62":2,"63":1},"major|4|minor":{"2":2,"4":3,"6":160,"13":15,"18":69,"19":3,"20":9,"22":6,"30":16,"31":145,"32":9,"34":7,"42":11,"43":74,"44":4,"48":156,"50":8,"55":2,"60":199,"61":65,"62":2,"64":11,"66":2,"67":21,"69":1},"minor|0|major":{"1":14,"12":3,"13":2,"14":1,"18":6,"29":1,"30":10,"31":2,"34":1,"35":2,"37":1,"42":7,"48":7,"55":1,"60":4},"major|8|major":{"7":1,"9":1,"12":96,"13":1,"14":1,"16":3,"24":34,"25":5,"30":19,"31":3,"42":40,"44":2,"52":1,"54":11,"55":11,"56":3,"58":1,"66":8,"67":11,"68":12,"70":3,"71":2},"minor|8|major":{"1":4,"2":1,"4":5,"9":2,"12":786,"13":15,"14":83,"16":77,"17":1,"18":22,"24":2,"25":149,"30":21,"42":267,"46":10,"47":2,"54":32,"55":107,"56":11,"59":2,"60":1,"66":2,"67":116,"68":57,"69":2,"70":13},"major|2|minor":{"0":4,"2":7,"3":29,"4":1,"5":1,"6":36,"7":4,"12":14,"13":77,"15":2,"16":2,"17":2,"18":322,"19":3,"22":5,"27":4,"30":184,"31":87,"32":122,"34":49,"35":14,"36":2,"38":2,"42":5,"43":138,"44":9,"46":1,"48":495,"49":2,"57":3,"60":848,"62":12,"64":3,"65":2,"66":2},"major|7|minor":{"0":8,"2":1,"5":2,"6":2,"7":1,"12":3,"13":79,"14":5,"16":1,"18":128,"19":2,"20":1,"22":1,"30":484,"31":10,"32":23,"34":24,"35":9,"42":6,"43":37,"45":3,"47":1,"48":11,"55":4,"60":95,"61":10,"62":2,"64":1,"67":6,"68":1},"minor|5|major":{"1":24,"2":11,"4":7,"5":2,"6":5,"9":4,"12":9,"13":62,"14":18,"16":8,"18":50,"20":1,"25":4,"30":461,"32":2,"34":10,"35":3,"42":29,"43":450,"48":6,"53":1,"54":8,"55":18,"56":13,"60":77,"62":1,"64":5,"69":1},"minor|1|major":{"1":6,"6":1,"7":1,"9":1,"12":189,"13":4,"14":16,"16":25,"18":2,"20":3,"21":6,"24":5,"25":91,"26":3,"28":4,"30":8,"34":4,"39":3,"42":149,"46":7,"54":3,"55":39,"56":6,"58":9,"60":13,"66":5,"67":111,"68":8,"70":6,"71":2},"minor|2|major":{"2":9,"6":7,"18":1,"30":18,"31":24,"36":1,"48":3,"60":3,"66":4},"major|1|major":{"2":2,"6":24,"9":1,"12":24,"13":7,"14":3,"18":2,"25":3,"30":9,"31":1,"32":3,"42":23,"54":18,"55":3,"60":3,"66":20,"67":1,"68":1,"70":2,"71":1},"major|9|dominant":{"3":4,"4":2,"18":16,"30":37,"31":69,"32":55,"33":3,"34":7,"44":1,"47":1,"48":5,"49":3,"60":33,"62":2},"dominant|5|dominant":{"0":18,"1":13,"4":5,"5":2,"8":1,"9":3,"12":1,"13":1,"14":26,"18":6,"20":3,"25":1,"30":140,"31":2,"32":132,"34":1,"35":3,"42":7,"44":293,"47":1,"48":6,"56":9,"60":8,"67":1,"68":2},"dominant|7|dominant":{"0":7,"1":7,"8":1,"13":4,"14":8,"16":2,"18":1,"26":2,"30":11,"31":3,"32":280,"42":3,"44":135,"54":1,"55":1,"60":6,"62":102,"64":8},"dominant|10|major":{"2":2,"9":2,"12":15,"13":5,"14":26,"17":1,"24":3,"30":10,"42":278,"44":7,"48":5,"55":10,"56":13,"60":1,"66":2,"67":4,"68":1,"70":1},"major|5|minor":{"0":11,"4":1,"6":5,"7":1,"9":1,"12":3,"13":16,"14":7,"16":2,"17":1,"18":69,"24":2,"25":3,"30":32,"31":34,"32":16,"35":1,"37":4,"42":148,"43":10,"46":3,"47":2,"48":41,"55":5,"60":37,"62":1,"67":2},"major|0|minor":{"0":5,"2":2,"3":5,"12":7,"13":37,"14":3,"18":6,"25":9,"26":2,"30":21,"31":15,"32":9,"34":2,"42":128,"43":44,"50":2,"54":2,"56":2,"60":16,"62":2,"67":1},"suspended|0|minor":{"2":3,"4":5,"13":2,"14":1,"31":8,"36":6,"42":3,"43":15,"46":13,"52":1,"60":6},"major|4|diminished_family":{"31":1,"32":5,"61":2},"diminished_family|5|minor":{"32":3},"major|8|diminished_family":{"7":1,"26":2},"diminished_family|1|minor":{"2":1,"9":1,"18":8,"19":2,"20":1,"30":3,"31":1,"32":3,"34":1,"43":8,"48":2,"60":10,"69":1},"major|4|suspended":{"0":3,"2":11,"3":1,"5":1,"32":3},"suspended|0|dominant":{"1":2,"4":13,"5":3,"6":4,"8":1,"11":1,"13":6,"14":2,"18":5,"30":71,"31":50,"32":5,"34":14,"38":1,"43":11,"44":1,"47":1,"48":9,"49":1,"52":2,"54":1,"55":6,"58":1,"60":5,"61":1,"64":2,"70":1},"minor|5|suspended":{"0":32,"1":1,"2":40,"6":1,"8":6,"12":3,"13":32,"18":3,"23":1,"30":153,"31":3,"34":3,"35":3,"36":1,"43":15,"47":1,"49":1,"54":1,"55":4,"60":8},"minor|11|major":{"7":7,"12":4,"16":5,"24":2,"30":2,"42":6,"55":3,"66":13,"70":6},"major|6|major":{"12":1,"14":1,"16":20,"25":3,"30":2,"31":3,"42":3,"55":1,"66":1},"major|4|major":{"1":4,"2":12,"5":1,"6":10,"11":6,"12":1,"13":1,"18":6,"25":3,"30":25,"31":17,"35":3,"42":7,"43":2,"46":3,"48":15,"55":1,"60":5,"66":1},"minor|7|minor":{"0":1,"5":1,"6":204,"8":2,"12":4,"13":5,"18":20,"19":2,"20":21,"22":31,"30":14,"31":264,"32":7,"35":3,"36":1,"38":2,"43":22,"44":9,"48":63,"50":4,"53":1,"55":1,"57":2,"60":111,"61":73,"62":5,"64":4,"65":3,"66":1,"71":3},"major|11|major":{"1":2,"2":14,"5":1,"6":26,"13":7,"14":1,"18":17,"21":1,"30":30,"31":49,"32":1,"34":2,"36":20,"42":4,"43":1,"48":1,"52":1,"55":1,"60":14,"61":2,"66":70,"67":7,"68":4},"major|7|suspended":{"0":52,"1":2,"2":13,"5":7,"6":7,"12":2,"13":37,"16":5,"17":1,"30":85,"32":7,"42":8,"47":2,"55":4,"60":45,"62":4},"suspended|5|major":{"1":13,"2":2,"4":8,"5":3,"12":23,"13":62,"14":3,"15":1,"18":4,"19":11,"25":11,"30":164,"31":2,"32":4,"34":56,"36":1,"38":4,"42":59,"43":5,"44":17,"46":57,"47":10,"48":2,"50":1,"55":92,"57":3,"58":7,"60":27,"62":4,"67":1,"69":1,"70":4},"major|9|diminished_family":{"6":5,"21":3,"60":2,"62":6,"64":1},"diminished_family|1|major":{"1":5,"2":2,"30":3,"42":1,"48":1,"50":2,"56":1,"60":1},"minor|7|major":{"1":5,"2":10,"3":1,"5":3,"9":3,"12":1,"13":4,"14":10,"18":3,"24":1,"25":1,"26":7,"27":1,"28":1,"30":21,"31":161,"38":3,"39":3,"42":22,"43":11,"44":16,"46":7,"48":8,"54":14,"55":17,"56":10,"60":13,"61":5},"dominant|8|major":{"1":2,"12":14,"14":1,"20":5,"26":1,"30":6,"32":8,"42":23,"44":6,"54":3,"55":7,"56":1,"60":3,"67":3,"68":1,"71":1},"major|6|dominant":{"6":3,"30":2,"31":1,"66":4,"67":3},"major|0|suspended":{"0":330,"2":4,"5":1,"6":1,"25":6,"30":38,"31":1,"34":1,"42":3,"54":1,"55":1,"56":1,"60":1},"diminished_family|10|major":{"2":5,"6":1,"12":3,"13":16,"30":1,"31":1,"42":1,"61":1,"68":1},"major|10|minor":{"2":3,"12":1,"30":7,"60":2},"minor|9|minor":{"13":2,"18":2,"19":9,"30":6,"32":5,"48":2,"66":2},"suspended|2|minor":{"5":4,"6":5,"18":9,"30":10,"31":8,"32":1,"35":1,"43":20,"44":1,"48":59,"52":1,"60":15,"61":1,"64":10,"66":1},"other|9|other":{"0":1,"2":1,"11":4,"12":4,"14":1,"17":3,"23":20,"47":36,"48":24,"52":1,"60":1,"62":1,"64":2,"65":5},"other|3|other":{"11":2,"17":91,"20":1,"23":2,"35":28,"42":1,"47":9,"59":25,"71":5},"other|0|dominant":{"0":1,"5":15,"23":1,"30":1,"44":2,"60":1},"dominant|3|other":{"17":3,"59":1},"other|2|other":{"0":14,"1":2,"2":1,"6":1,"11":7,"13":3,"17":25,"23":15,"30":8,"31":4,"35":74,"36":2,"41":1,"42":1,"43":17,"44":3,"46":1,"47":77,"48":1,"53":47,"55":2,"59":3,"60":7,"65":215},"dominant|5|other":{"0":1,"1":1,"4":1,"11":1,"23":3,"32":1,"35":2,"55":1,"71":2},"other|11|other":{"6":6,"11":30,"13":1,"17":1,"23":3,"29":3,"30":1,"35":2,"36":1,"43":5,"48":3,"53":1,"65":21,"66":2,"67":3,"68":1,"71":20},"other|10|other":{"1":3,"10":1,"11":3,"13":6,"17":220,"29":1,"35":10,"42":8,"43":2,"44":1,"46":12,"47":40,"48":2,"53":1,"55":3,"59":7,"60":4,"61":2,"65":27,"71":17},"other|7|dominant":{"0":1,"23":2,"30":1,"35":2},"other|1|other":{"2":1,"6":6,"8":2,"9":1,"11":35,"17":2,"19":1,"29":1,"30":1,"35":1,"36":1,"43":4,"47":3,"55":1,"59":3,"65":3,"66":3,"71":43},"other|4|other":{"1":2,"6":1,"11":1,"13":1,"35":4,"53":4,"65":3,"71":3},"dominant|1|other":{"11":1,"29":1,"32":3,"70":1},"dominant|0|other":{"0":1,"2":12,"30":5,"31":5,"32":3,"35":1,"60":4},"other|5|other":{"0":5,"11":1,"12":4,"17":52,"23":1,"29":3,"31":4,"32":1,"35":42,"41":1,"42":7,"43":2,"47":129,"48":7,"53":3,"54":11,"55":4,"59":51,"60":29,"65":6},"minor|7|other":{"1":1,"11":2,"23":2,"30":1,"31":51,"32":3,"35":1,"44":1,"48":1,"61":1},"other|5|minor":{"0":1,"13":1,"18":4,"23":4,"30":1,"31":5,"32":2,"43":4,"47":50,"48":14,"57":1,"60":1},"suspended|7|minor":{"13":5,"16":5,"30":1,"32":1,"33":1,"34":13,"43":2,"60":2},"suspended|10|major":{"12":12,"14":3,"16":48,"30":4,"32":1,"42":10,"46":2,"55":6,"67":5},"minor|0|suspended":{"0":5,"1":4,"2":1,"6":1,"18":3,"43":2,"48":7,"60":1},"suspended|1|major":{"4":1,"12":15,"55":1,"70":5},"minor|1|minor":{"2":1,"6":3,"7":3,"13":3,"18":1,"30":2,"34":1,"44":2,"60":1,"67":4},"major|2|suspended":{"0":102,"1":4,"2":17,"5":2,"9":7,"12":5,"13":46,"16":10,"18":1,"30":260,"31":3,"34":4,"35":2,"36":17,"42":3,"43":3,"48":4,"56":4,"60":19,"64":5},"diminished_family|5|suspended":{"2":3},"minor|11|other":{"24":1,"66":2,"67":4},"major|3|diminished_family":{"6":1,"7":10,"12":2,"26":3,"67":18},"diminished_family|11|minor":{"4":1,"13":1,"32":15,"34":4,"60":2,"62":2},"dominant|0|minor":{"2":1,"13":4,"18":1,"30":13,"32":26,"34":3,"38":1,"44":1,"45":1},"minor|8|dominant":{"25":11,"30":7,"39":2,"42":1,"43":3,"44":1,"56":1,"68":15},"minor|6|major":{"12":4,"24":2,"30":1,"37":1,"42":5,"55":1,"60":8,"67":3},"other|10|suspended":{"0":4,"17":17},"suspended|2|other":{"4":12,"6":3,"18":17,"31":2,"64":14,"65":1},"other|3|major":{"12":7,"17":12,"29":6,"42":32,"47":19,"59":5},"major|2|other":{"0":2,"1":3,"2":1,"4":3,"13":7,"17":2,"18":16,"23":3,"25":1,"31":3,"35":27,"42":1,"46":9,"47":2,"48":1,"53":3,"60":13,"65":5},"other|10|major":{"12":19,"13":3,"17":7,"25":5,"30":1,"42":3,"55":29,"60":4,"67":3},"other|2|minor":{"5":1,"18":11,"30":3,"35":7,"43":1,"48":3,"60":4,"64":2,"65":1},"suspended|2|suspended":{"0":2,"1":8,"2":3,"6":1,"8":2,"13":1,"30":44,"31":6,"60":1,"64":16,"68":1},"suspended|1|dominant":{"7":6,"58":2},"dominant|9|suspended":{"0":1,"17":2},"major|3|other":{"11":4,"12":2,"35":1,"42":1,"54":6},"other|7|other":{"0":3,"1":5,"2":1,"7":1,"11":4,"12":3,"13":13,"17":55,"18":4,"23":101,"25":1,"30":1,"31":1,"35":98,"42":3,"47":23,"48":4,"53":7,"59":1,"60":10,"65":21},"other|0|major":{"2":3,"4":1,"5":20,"12":11,"13":7,"18":10,"25":2,"29":1,"30":9,"31":3,"35":8,"42":4,"43":1,"44":1,"46":1,"48":3,"55":12,"60":4,"68":3},"minor|1|other":{"71":5},"other|7|minor":{"5":1,"17":2,"23":14,"31":4,"32":1,"34":1,"35":3,"43":4,"48":1,"60":5,"64":1},"major|1|diminished_family":{"6":5,"7":16,"8":2,"10":2,"20":3,"32":6,"36":22,"38":2,"49":2,"60":1,"61":3,"66":1,"71":3},"dominant|0|suspended":{"2":20,"3":2,"16":3,"30":8,"68":2},"dominant|0|diminished_family":{"4":4},"diminished_family|0|suspended":{"2":4},"dominant|7|minor":{"4":1,"5":1,"13":4,"16":2,"18":10,"19":3,"20":6,"30":13,"31":1,"32":407,"34":3,"35":1,"43":3,"44":9,"47":1,"48":1,"55":1,"60":8,"64":13},"minor|3|minor":{"6":2,"12":3,"13":3,"30":2,"32":2,"42":27,"43":1,"55":10,"57":2,"67":1,"68":3},"major|0|other":{"0":14,"11":1,"15":3,"17":3,"18":14,"30":35,"35":5,"42":2,"44":1,"47":1,"65":4,"71":3},"major|11|dominant":{"5":3,"6":7,"18":2,"30":13,"31":111,"32":4,"34":3,"36":1,"48":3,"50":3,"60":4,"61":7},"other|5|dominant":{"30":4,"31":7,"42":1,"43":1,"61":2},"dominant|10|minor":{"4":2,"6":1,"13":8,"14":6,"19":2,"30":2,"34":3,"42":2,"43":6,"46":1,"60":4,"61":1},"minor|2|dominant":{"6":7,"13":2,"30":17,"31":44,"32":6,"34":1,"35":1,"46":2,"48":4,"61":6},"dominant|1|major":{"1":3,"4":1,"9":6,"12":20,"13":2,"14":3,"18":2,"24":1,"25":2,"30":3,"32":3,"42":21,"54":3,"55":5,"56":1,"67":1,"68":1,"71":3},"dominant|3|major":{"2":3,"9":1,"12":53,"13":1,"14":1,"16":8,"24":2,"25":3,"26":4,"30":3,"42":18,"44":4,"56":1,"60":1,"67":1,"68":1},"major|9|suspended":{"0":7,"1":8,"2":14,"13":3,"17":5,"18":1,"30":7,"46":1,"61":1,"71":1},"minor|2|suspended":{"0":29,"2":7,"6":1,"18":2,"29":1,"30":4,"31":2,"61":2},"major|4|dominant":{"1":4,"6":29,"30":9,"31":57,"32":10,"35":1,"44":4,"48":1},"major|7|other":{"0":32,"2":1,"4":12,"6":1,"11":4,"13":1,"17":2,"18":9,"30":13,"35":6,"43":3,"47":2,"53":1,"60":3,"65":6},"other|5|major":{"1":5,"6":1,"12":2,"13":4,"20":2,"25":5,"26":4,"30":12,"31":1,"32":2,"42":30,"44":1,"47":18,"48":3,"55":2,"64":1,"67":2,"68":2},"major|5|other":{"0":1,"11":1,"12":13,"30":1,"31":1,"35":7,"42":48,"47":10,"48":2,"53":2,"60":2,"65":16},"minor|7|diminished_family":{"19":1,"36":3},"diminished_family|6|major":{"2":3,"18":1,"30":3,"44":7,"55":13,"56":2,"58":1,"67":3},"minor|0|dominant":{"1":3,"6":1,"30":6,"31":16,"34":6,"48":1,"49":1,"64":1},"other|2|major":{"5":3,"12":1,"18":4,"30":2,"35":3,"43":1,"47":2,"60":22,"65":1},"dominant|11|dominant":{"5":1,"6":3,"8":9,"30":9,"31":30,"32":1,"48":6,"54":2,"67":4,"68":9,"69":1},"major|3|dominant":{"16":1,"24":5,"30":1,"32":2,"54":1,"67":4,"68":5},"dominant|4|major":{"6":1,"30":5,"31":1,"48":1,"60":1},"other|8|other":{"6":1,"16":1,"17":43,"23":1,"29":5,"42":3,"47":4,"54":3,"59":9,"71":3},"other|0|minor":{"4":2,"5":9,"17":1,"18":1,"20":2,"30":3,"31":3,"34":1,"43":1,"48":4,"53":1,"60":3},"minor|5|other":{"1":1,"2":1,"4":1,"9":3,"18":10,"30":8,"43":3,"47":4,"65":13},"other|1|diminished_family":{"32":1,"66":3},"diminished_family|11|major":{"43":3,"47":1,"67":3},"major|11|suspended":{"0":35,"2":27,"6":8,"30":18,"31":1,"32":5,"34":1,"42":2,"60":3,"66":1},"dominant|2|dominant":{"0":2,"1":2,"4":3,"13":3,"16":2,"18":7,"20":8,"30":21,"31":7,"32":10,"35":2,"42":1,"43":7,"60":1,"62":15},"dominant|7|major":{"1":3,"2":12,"3":2,"13":3,"14":3,"18":13,"30":20,"32":60,"34":7,"42":18,"43":1,"44":37,"46":2,"47":1,"56":5,"60":1,"68":1},"minor|10|dominant":{"0":6,"13":11,"30":19,"32":5,"36":1,"43":5,"48":1,"55":4,"60":10,"62":7,"64":2},"suspended|0|other":{"0":2,"4":4,"30":5,"48":1,"65":1},"minor|4|minor":{"6":3,"32":3,"48":3,"57":4},"other|0|suspended":{"0":1,"1":18,"5":3,"13":1,"17":11},"major|10|dominant":{"0":1,"17":3,"30":2,"42":19,"44":1,"54":1,"55":1,"60":1,"68":11},"other|8|major":{"12":7,"13":3,"17":23,"32":1,"42":6,"59":5,"67":1,"71":5},"major|4|other":{"1":3,"6":1,"11":1,"23":1,"31":2,"48":1,"50":5},"major|9|other":{"1":3,"16":3,"18":9,"30":2,"35":29,"47":1,"64":4,"65":1},"minor|0|other":{"1":6,"2":1,"6":1,"18":1,"23":6,"30":4,"31":1,"42":11,"65":4,"71":1},"minor|10|other":{"0":2,"4":1,"13":1,"17":1,"29":3,"43":1,"47":13,"65":3},"minor|10|suspended":{"0":24,"1":1,"2":4,"13":20,"18":12,"30":2,"34":9,"44":14,"57":6,"60":11,"64":4},"minor|11|diminished_family":{"7":1,"37":2,"54":1,"67":3},"suspended|10|minor":{"14":2,"47":1},"suspended|8|major":{"12":3,"28":1,"46":2,"54":1,"55":1,"70":7},"major|10|suspended":{"0":10,"12":4,"17":1,"24":1,"42":2},"minor|3|suspended":{"0":13,"2":10,"12":1,"16":3,"17":12,"30":9,"35":2,"43":7,"47":2,"55":4,"56":1,"62":1},"suspended|10|dominant":{"32":2,"42":3},"dominant|7|suspended":{"13":1,"30":1,"31":1,"32":4},"suspended|5|dominant":{"30":15,"31":5,"42":1,"44":2,"46":2},"other|7|major":{"6":19,"13":11,"18":2,"30":26,"35":23,"36":1,"42":5,"48":1},"dominant|2|minor":{"0":1,"6":3,"18":24,"20":1,"30":3,"31":7,"32":11,"42":6,"43":17,"44":1,"48":21,"49":3,"57":1,"60":11,"62":12},"dominant|10|dominant":{"14":16,"25":1,"30":4,"32":3,"42":30,"43":7,"44":104,"55":4,"56":2,"68":12},"suspended|5|minor":{"13":7,"16":2,"30":4,"31":1,"32":1,"37":1,"46":6,"48":4,"60":7,"64":1},"suspended|5|suspended":{"0":16,"1":12,"13":1,"25":1,"30":2},"dominant|6|other":{"48":3,"66":1},"other|11|major":{"2":1,"5":1,"6":1,"35":2,"42":1,"67":1},"other|6|major":{"42":2,"68":2},"minor|11|minor":{"6":2,"7":4,"15":2,"18":2,"24":2,"32":16,"36":2,"42":1,"44":1,"66":3,"67":21},"minor|8|minor":{"12":15,"32":1,"42":5,"55":2},"suspended|10|suspended":{"12":2,"16":17,"17":1,"32":1,"34":1,"36":1,"47":2,"70":4},"suspended|11|suspended":{"11":3,"31":1},"suspended|1|other":{"32":2,"59":3},"minor|11|dominant":{"48":3,"50":1,"66":1,"68":1},"dominant|8|dominant":{"24":1,"29":1,"30":1,"44":3},"dominant|1|dominant":{"6":1,"24":1,"25":2,"30":5,"32":3,"44":1,"50":2,"68":6,"70":1},"major|11|other":{"6":5,"11":6,"23":1,"30":3,"35":12,"42":1,"61":5,"65":3,"71":1},"minor|9|dominant":{"32":2,"66":3},"other|1|major":{"7":2,"8":1,"12":1,"21":2,"25":1,"30":6,"42":1,"60":1,"67":1,"68":2,"70":3,"71":9},"suspended|0|diminished_family":{"2":2,"32":1},"dominant|5|suspended":{"0":11,"2":27,"6":2,"13":5,"30":11,"31":6,"32":2,"43":1,"56":3},"major|10|other":{"0":10,"12":11,"17":4,"47":1,"54":4},"other|9|major":{"23":6,"30":15,"42":3,"47":1},"minor|9|diminished_family":{"6":1,"7":3,"19":2,"32":18,"36":3,"49":1,"52":11,"60":2,"67":2},"diminished_family|8|suspended":{"14":11},"suspended|2|dominant":{"5":1,"30":11,"64":8},"suspended|9|minor":{"6":3,"18":1,"22":5,"31":2,"32":4,"35":1,"65":3},"dominant|1|diminished_family":{"6":1,"8":1,"11":1,"36":5,"38":1,"50":1},"diminished_family|6|dominant":{"24":1,"30":5,"44":1},"major|1|minor":{"0":1,"6":3,"18":2,"30":1,"31":1,"32":1,"66":6},"major|8|dominant":{"12":6,"30":9,"37":1,"44":1},"dominant|11|major":{"38":3,"67":5},"minor|6|dominant":{"30":1,"67":6,"68":3},"minor|8|other":{"12":1,"17":2,"35":1,"67":2},"diminished_family|10|other":{"30":6},"other|2|diminished_family":{"31":2,"65":4},"suspended|5|other":{"0":1,"15":3,"35":1,"42":2},"dominant|9|minor":{"6":2,"18":4,"20":12,"22":2,"30":2,"31":25,"32":24,"33":4,"34":1,"37":1,"43":1,"60":2,"61":6},"minor|4|diminished_family":{"7":3,"8":4},"diminished_family|1|dominant":{"30":2,"32":1,"43":4},"dominant|6|major":{"55":3,"56":1,"66":1},"dominant|2|major":{"1":1,"9":1,"25":3,"30":4,"31":1,"43":9,"48":2,"55":5,"60":4},"dominant|9|major":{"12":1,"25":1,"31":4,"42":2,"47":2,"48":4},"diminished_family|8|minor":{"3":2,"30":2,"32":1,"44":2},"dominant|6|diminished_family":{"10":4,"32":5},"dominant|8|minor":{"0":1,"30":1,"32":1,"42":3},"suspended|9|major":{"22":4,"30":2,"34":2,"54":1},"major|3|suspended":{"54":4},"major|3|minor":{"25":1,"32":1,"34":1,"37":10},"other|11|minor":{"31":2,"43":5,"48":2},"suspended|2|major":{"2":1,"13":3,"25":2,"30":1,"42":2,"55":2,"56":1,"60":6},"suspended|7|major":{"4":1,"30":4,"31":1,"34":2,"42":1,"43":1,"44":3,"55":5,"60":11},"dominant|4|diminished_family":{"6":3,"68":1},"diminished_family|7|dominant":{"30":2,"32":1},"major|0|diminished_family":{"13":1,"44":2,"61":1,"69":1},"dominant|9|dominant":{"20":17,"30":20,"32":7,"60":2,"61":1,"62":6},"major|1|dominant":{"0":1,"11":1,"12":3},"other|10|minor":{"30":4,"31":1,"32":1,"60":2},"diminished_family|10|minor":{"15":4,"30":1,"31":2},"minor|1|diminished_family":{"7":1,"10":1,"38":1},"dominant|4|dominant":{"30":1,"31":6},"major|6|diminished_family":{"32":8,"49":2,"66":3},"minor|0|diminished_family":{"1":4,"21":10,"32":1,"43":2,"60":20},"minor|8|suspended":{"0":3,"2":3,"30":1,"42":2,"47":8},"major|6|minor":{"5":1,"30":2,"32":5,"48":1},"dominant|10|suspended":{"2":2,"14":8,"43":1,"44":6,"56":3,"67":7},"suspended|11|minor":{"20":2,"66":5},"dominant|4|minor":{"31":3,"32":4,"43":2,"50":11},"suspended|9|dominant":{"30":1,"31":8,"62":3},"suspended|3|major":{"7":1,"12":2,"16":2,"42":4,"54":1,"58":1,"67":9,"68":1},"suspended|7|other":{"0":10,"31":1,"46":1,"53":1,"65":10},"other|7|suspended":{"30":10,"47":7,"55":5,"64":1},"diminished_family|3|minor":{"14":1,"28":2,"57":2},"dominant|11|suspended":{"2":3},"dominant|2|suspended":{"0":1,"1":2,"32":2},"dominant|7|other":{"1":1,"18":1,"54":1,"65":1},"suspended|4|minor":{"6":6,"13":3,"48":2},"diminished_family|1|suspended":{"0":1,"2":2,"30":4},"suspended|7|dominant":{"43":12,"44":6,"47":1},"diminished_family|3|diminished_family":{"13":3,"42":10},"diminished_family|2|minor":{"30":3,"32":1,"60":1},"diminished_family|4|dominant":{"30":7},"suspended|11|dominant":{"8":2,"67":1},"diminished_family|7|major":{"25":10},"diminished_family|3|dominant":{"20":3},"dominant|3|dominant":{"8":2,"14":3,"20":2,"25":3,"32":4,"44":4,"56":17,"68":1},"major|1|other":{"0":2,"11":2,"55":5},"minor|2|diminished_family":{"32":4,"34":2,"38":3,"49":2,"60":1},"dominant|2|other":{"6":3},"minor|4|major":{"12":2,"31":2,"67":1},"major|10|diminished_family":{"25":3,"67":1},"minor|7|suspended":{"0":3,"1":1,"2":5,"31":6,"34":12,"48":2},"diminished_family|7|minor":{"30":2,"44":1},"minor|2|other":{"0":2,"31":12,"35":5},"other|9|minor":{"31":2,"35":3,"43":1,"47":2,"48":2,"60":6},"dominant|5|diminished_family":{"0":1,"32":3},"minor|6|minor":{"31":1,"32":3,"42":1,"60":10},"diminished_family|10|dominant":{"4":6},"dominant|1|minor":{"43":6},"diminished_family|4|minor":{"31":1,"48":2},"minor|1|dominant":{"9":1,"14":1,"31":1},"suspended|6|major":{"18":1,"55":1,"66":16,"71":1},"major|1|suspended":{"0":1,"25":1,"30":3,"64":1},"diminished_family|0|minor":{"34":1,"60":3},"other|2|suspended":{"31":2,"64":1,"65":1},"suspended|9|diminished_family":{"32":6},"minor|3|other":{"17":18},"diminished_family|11|diminished_family":{"44":1,"69":6},"minor|5|diminished_family":{"43":1,"60":4},"other|8|dominant":{"29":1,"41":3},"diminished_family|11|other":{"1":2,"48":1},"suspended|1|diminished_family":{"7":7}},"3":{"minor|3|major|9|minor":{"18":200,"19":2,"30":3,"31":5,"32":6,"34":1,"36":3,"42":2,"43":2,"48":80,"60":17,"61":2,"64":4,"65":1,"66":2},"major|9|minor|3|major":{"1":1,"2":7,"12":9,"13":7,"14":1,"18":3,"25":4,"30":52,"39":2,"42":27,"44":16,"46":1,"54":1,"55":283,"59":29},"minor|3|major|5|major":{"4":1,"12":6,"13":1,"16":11,"21":1,"25":25,"30":4,"32":1,"42":87,"43":2,"54":2,"55":20,"58":5,"59":3,"66":3,"67":14},"major|5|major|9|major":{"12":2,"13":1,"18":3,"27":2,"30":28,"32":4,"48":11,"60":4},"major|9|major|5|major":{"2":2,"6":2,"12":6,"13":1,"24":4,"25":8,"30":31,"31":4,"35":6,"42":13,"44":1,"55":12,"56":1,"60":37},"major|5|major|5|major":{"1":2,"2":1,"4":7,"5":3,"6":2,"12":686,"13":3,"14":14,"16":44,"24":4,"25":20,"30":51,"31":4,"36":3,"38":1,"42":524,"43":1,"44":3,"47":1,"48":1,"54":16,"55":76,"56":29,"60":6,"66":9,"67":28,"70":4},"major|9|major|3|major":{"10":1,"12":4,"24":1,"25":1,"28":1,"30":2,"42":1,"54":31,"55":2},"major|3|major|9|major":{"12":1,"18":30,"30":5,"31":1,"42":2,"43":3,"48":2,"54":1,"60":7},"major|3|major|5|major":{"2":3,"12":2,"24":2,"30":1,"42":2,"54":2,"55":1,"66":1},"major|5|major|9|minor":{"0":3,"6":1,"12":3,"13":4,"14":5,"18":57,"27":3,"30":65,"31":122,"32":48,"34":13,"38":1,"42":12,"43":15,"44":4,"48":232,"49":8,"50":1,"60":66,"62":1,"65":12},"major|5|major|7|major":{"1":4,"2":19,"4":4,"5":2,"6":3,"8":3,"9":3,"11":2,"12":37,"13":244,"14":14,"17":1,"18":19,"24":4,"25":16,"26":10,"28":3,"30":2020,"31":13,"32":14,"36":7,"42":518,"43":35,"44":128,"46":45,"47":5,"48":14,"50":2,"55":115,"56":3,"58":4,"60":305,"62":3,"65":3,"66":3,"67":5,"69":1,"71":1},"major|11|diminished_family|5|dominant":{"6":3,"30":2,"31":4},"diminished_family|5|dominant|5|minor":{"31":2,"32":6,"44":2,"56":3,"60":12,"61":3,"64":6},"dominant|5|minor|7|dominant":{"6":3,"18":2,"30":1,"31":59,"61":2},"minor|7|dominant|5|minor":{"7":2,"13":1,"18":2,"31":9,"32":2,"43":4,"44":42,"46":1,"50":11},"dominant|5|minor|5|minor":{"13":5,"14":9,"15":3,"18":5,"32":15,"34":6,"43":20,"57":1,"60":18},"minor|5|minor|5|dominant":{"0":7,"13":1,"18":2,"19":2,"30":62,"31":2,"32":3,"34":4,"43":9,"55":5,"60":10,"61":2},"minor|5|dominant|5|major":{"1":8,"2":30,"4":4,"5":2,"6":2,"9":1,"13":63,"14":3,"21":3,"25":24,"26":3,"29":1,"30":89,"31":2,"32":6,"34":3,"39":5,"42":23,"43":13,"44":26,"46":3,"50":2,"54":3,"55":50,"56":25,"57":1,"58":1,"60":15,"66":7,"67":6,"68":4,"69":3,"70":1,"71":1},"dominant|5|major|11|diminished_family":{"32":3},"minor|5|minor|2|minor":{"6":30,"20":2,"22":2,"31":72,"61":6,"64":1},"minor|2|minor|3|dominant":{"0":1,"13":4,"30":5,"43":3},"dominant|0|major|5|major":{"1":2,"2":2,"13":1,"14":3,"25":2,"30":6,"42":12,"44":4,"55":1},"major|5|major|0|dominant":{"0":17,"6":1,"18":1,"24":1,"26":1,"30":85,"32":3,"42":4,"44":5},"major|0|dominant|5|major":{"1":35,"2":11,"4":1,"5":1,"9":13,"12":41,"13":3,"14":20,"16":10,"18":1,"21":2,"25":8,"26":1,"30":21,"32":1,"42":116,"44":8,"46":1,"47":1,"50":1,"54":5,"55":14,"56":12,"57":3,"67":12,"68":3},"dominant|5|major|7|major":{"2":34,"4":1,"12":1,"13":28,"14":8,"18":4,"21":7,"30":36,"34":4,"42":19,"43":2,"44":47,"46":4,"51":1,"55":8,"57":4,"60":8,"66":1},"major|7|major|7|dominant":{"13":8,"30":149,"32":6,"42":9,"43":2,"44":4,"48":2,"60":170,"62":6},"major|7|dominant|5|major":{"2":64,"4":5,"6":3,"12":7,"13":7,"14":10,"16":6,"18":3,"24":1,"25":7,"26":4,"28":3,"30":104,"31":5,"32":15,"38":1,"42":19,"44":150,"46":6,"48":1,"54":9,"55":24,"56":14,"57":1,"60":5,"66":2},"dominant|5|major|5|major":{"1":4,"2":2,"9":2,"12":34,"13":2,"14":124,"16":1,"25":4,"30":23,"32":1,"42":186,"44":3,"54":3,"55":50,"56":8,"58":1,"65":2,"66":5,"67":4,"68":1},"major|7|major|11|minor":{"6":1,"31":8,"32":3,"43":1,"48":2,"61":6,"64":1},"major|11|minor|10|minor":{"0":7,"7":2,"13":47,"14":16,"16":8,"18":42,"30":20,"32":21,"34":9,"43":19,"48":6,"57":1,"60":64},"minor|10|minor|10|major":{"2":2,"5":3,"12":3,"13":16,"24":1,"25":4,"26":4,"30":30,"42":7,"44":8,"54":1,"55":5,"60":7,"67":6,"69":2},"minor|10|major|10|major":{"1":10,"12":122,"14":3,"16":6,"25":118,"29":3,"30":2,"42":109,"43":2,"46":2,"54":6,"55":21,"56":1,"58":1,"66":15,"67":30,"68":3,"70":2},"major|10|major|7|major":{"1":10,"2":8,"4":6,"5":2,"6":1,"9":1,"12":44,"13":31,"14":16,"16":2,"18":7,"24":10,"25":10,"26":2,"30":329,"34":2,"35":12,"42":815,"43":4,"44":7,"46":14,"47":1,"48":1,"55":46,"56":8,"60":17,"67":6},"major|7|major|7|major":{"1":5,"2":20,"4":5,"5":3,"6":6,"12":18,"13":95,"14":7,"17":1,"18":61,"21":3,"25":6,"30":413,"31":3,"32":1,"34":2,"35":2,"42":69,"43":86,"44":2,"47":1,"48":4,"54":2,"55":25,"56":4,"60":889,"62":10,"66":3,"67":1},"major|7|major|5|major":{"1":11,"2":41,"4":19,"5":3,"9":2,"12":261,"13":11,"14":26,"16":13,"18":5,"20":1,"24":2,"25":70,"30":376,"31":1,"32":4,"34":1,"42":2116,"43":1,"44":7,"46":8,"47":4,"48":5,"53":1,"54":9,"55":75,"56":5,"59":1,"60":24,"66":6,"67":23,"68":5},"major|5|major|5|dominant":{"25":1,"30":1,"31":1,"55":1,"67":1,"68":4},"dominant|11|minor|5|minor":{"32":1,"43":3},"minor|5|dominant|0|major":{"30":1,"55":8},"minor|10|major|5|major":{"1":1,"2":2,"4":7,"12":40,"13":10,"14":4,"16":14,"25":11,"30":55,"42":116,"44":3,"48":2,"54":3,"55":37,"56":2,"60":13,"67":24,"68":3,"70":1},"other|0|major|7|major":{"30":2,"55":1,"60":2},"major|7|major|10|major":{"1":2,"2":4,"12":319,"14":2,"16":15,"24":1,"25":39,"26":8,"27":1,"30":16,"32":2,"42":845,"47":1,"54":14,"55":15,"56":1,"60":9,"62":1,"65":1,"67":51},"major|10|major|2|major":{"1":4,"2":11,"4":4,"6":7,"12":14,"13":123,"14":1,"16":2,"17":6,"18":19,"25":1,"30":385,"31":4,"34":4,"35":4,"42":10,"43":13,"44":4,"48":6,"55":37,"56":2,"58":1,"60":645,"65":10},"major|2|major|5|major":{"2":41,"4":16,"5":3,"8":1,"12":13,"13":117,"14":2,"18":12,"24":1,"25":57,"26":16,"30":798,"31":3,"34":1,"35":2,"42":338,"43":5,"44":30,"46":8,"48":7,"51":1,"54":10,"55":217,"57":1,"58":1,"60":46,"64":1,"66":3,"67":4},"major|5|major|5|suspended":{"0":2,"2":1,"16":1,"42":1},"major|5|suspended|0|major":{"1":1,"4":25,"12":10,"13":4,"14":1,"30":29,"31":2,"42":8,"46":2,"55":5,"60":1},"major|2|dominant|5|major":{"2":10,"4":2,"5":5,"12":5,"13":11,"18":1,"25":15,"30":147,"42":14,"44":18,"50":1,"55":36,"60":6,"66":2,"68":2},"major|5|major|4|minor":{"6":55,"13":2,"18":25,"31":51,"32":1,"43":5,"48":22,"60":39,"61":12,"67":3},"major|4|minor|5|minor":{"0":8,"6":2,"7":1,"12":1,"13":3,"16":1,"18":27,"30":2,"31":9,"43":22,"44":4,"48":37,"52":1,"53":2,"60":20,"62":1,"66":4},"minor|5|minor|0|major":{"18":4,"30":1,"35":2,"48":1,"55":1,"60":1},"minor|0|major|8|major":{"12":7},"major|8|major|2|major":{"12":50,"14":1,"17":2,"30":16,"42":4,"55":3,"60":21},"minor|5|minor|8|major":{"12":24,"14":5,"16":1,"25":2,"30":7,"42":8,"54":15,"55":15,"67":65},"minor|8|major|2|major":{"2":1,"5":3,"6":1,"9":4,"12":2,"13":348,"16":3,"17":3,"18":6,"20":2,"30":299,"42":2,"43":14,"46":3,"48":1,"54":7,"55":21,"58":1,"60":50,"61":2,"63":2},"major|2|minor|3|major":{"12":99,"13":3,"14":6,"16":37,"25":8,"30":17,"42":107,"43":1,"44":1,"55":16,"66":8,"67":2,"68":19},"minor|3|major|2|major":{"1":4,"12":13,"13":38,"17":1,"18":19,"30":116,"31":2,"43":31,"48":4,"55":4,"60":39,"63":1},"major|5|major|2|minor":{"3":2,"7":3,"12":3,"13":6,"16":2,"18":77,"30":105,"31":1,"32":7,"43":19,"48":3,"57":3,"60":26},"major|5|major|7|minor":{"0":4,"6":2,"14":2,"18":2,"30":6,"60":4},"major|7|minor|5|major":{"1":4,"4":1,"12":2,"13":12,"16":3,"18":16,"25":3,"30":77,"32":1,"34":6,"42":8,"43":315,"48":1,"54":5,"55":1,"60":26},"minor|5|major|10|major":{"12":37,"25":1,"42":15,"46":3,"54":1,"55":15,"60":2,"67":4},"major|7|major|2|major":{"1":1,"2":1,"13":16,"14":3,"18":52,"23":5,"30":64,"31":1,"42":3,"43":10,"44":6,"48":12,"55":2,"60":23},"major|5|major|2|major":{"2":13,"4":6,"9":1,"12":12,"13":32,"17":1,"18":14,"25":3,"30":724,"32":5,"34":16,"35":2,"42":9,"43":18,"46":2,"48":5,"54":3,"55":3,"56":7,"58":4,"60":235,"64":2,"66":4},"major|7|major|2|minor":{"6":8,"13":17,"18":133,"22":2,"30":27,"31":18,"32":24,"34":36,"36":1,"42":1,"43":46,"44":7,"48":88,"49":2,"60":176,"62":7,"64":2,"65":2},"major|2|minor|10|major":{"2":4,"5":1,"6":1,"9":1,"12":12,"13":441,"16":1,"18":3,"25":8,"26":4,"30":121,"31":8,"42":22,"43":17,"44":1,"47":6,"48":18,"54":3,"55":10,"58":1,"60":170},"minor|10|major|7|minor":{"12":1,"13":41,"18":5,"22":1,"30":17,"43":17,"55":4},"minor|10|major|7|major":{"1":23,"2":3,"4":1,"12":4,"13":6,"18":2,"25":1,"30":28,"42":4,"43":44,"44":1,"48":4,"55":11,"60":8},"minor|2|minor|1|major":{"9":1,"12":43,"13":1,"14":9,"16":16,"25":3,"42":1,"56":4,"67":52},"minor|1|major|2|major":{"2":1,"4":2,"12":14,"13":60,"18":2,"30":57,"34":3,"35":3,"42":2,"43":6,"48":2,"55":8,"60":27},"major|2|major|7|minor":{"5":1,"13":16,"18":26,"30":15,"31":5,"32":3,"34":4,"43":6,"48":5,"60":16,"61":6,"67":4},"major|7|minor|2|minor":{"4":1,"5":2,"6":18,"18":2,"22":1,"31":27,"34":1,"48":6,"61":20},"major|2|major|10|major":{"1":4,"7":2,"12":732,"14":4,"16":4,"17":2,"24":9,"25":16,"30":2,"42":266,"46":13,"47":3,"54":6,"55":11,"60":10,"66":1,"67":12,"68":5,"70":6,"71":5},"major|4|minor|1|major":{"1":6,"6":1,"12":31,"14":1,"16":2,"18":2,"20":3,"21":6,"24":2,"25":5,"26":3,"34":4,"39":3,"42":58,"46":1,"54":1,"55":15,"60":7,"66":1,"67":8},"minor|1|major|9|minor":{"12":4,"13":2,"14":2,"30":16,"32":5,"43":2,"60":8},"major|9|minor|2|major":{"6":4,"30":2,"31":5},"minor|2|major|1|major":{"12":7},"major|1|major|2|major":{"6":6,"13":2,"30":11,"42":1,"54":2,"56":2},"major|9|minor|5|major":{"12":2,"13":2,"18":14,"30":84,"35":1,"42":2,"43":13,"48":4,"54":3,"55":6,"56":6,"60":13,"69":1},"minor|5|major|5|major":{"1":4,"2":19,"4":5,"5":1,"12":6,"13":108,"14":1,"16":2,"17":1,"25":4,"26":5,"30":97,"31":2,"32":2,"34":2,"42":53,"43":6,"44":1,"50":1,"55":101,"60":26,"66":2,"67":10,"68":2},"major|9|minor|2|minor":{"6":1,"18":2,"31":15},"minor|5|major|9|dominant":{"18":2,"31":9,"32":3},"major|9|dominant|5|dominant":{"1":8,"4":1,"5":2,"30":7,"32":35,"44":2},"dominant|5|dominant|7|dominant":{"0":2,"14":4,"16":2,"26":2,"30":4,"32":151,"42":1,"44":117,"54":1,"60":4,"62":12},"dominant|7|dominant|10|major":{"12":2,"14":1,"42":2,"60":1},"dominant|10|major|7|major":{"2":8,"12":1,"13":11,"14":5,"25":4,"30":28,"42":31,"43":1,"44":162,"46":1,"48":1,"55":12,"60":5},"major|7|dominant|5|dominant":{"0":2,"30":8,"32":6,"44":6},"major|7|dominant|10|major":{"14":7,"24":2,"42":181,"66":2},"major|2|major|2|minor":{"0":3,"2":1,"4":1,"6":17,"13":4,"15":1,"18":18,"22":3,"30":12,"31":28,"32":6,"35":2,"43":59,"44":2,"46":1,"48":364,"60":132},"major|2|minor|8|major":{"12":367,"14":4,"16":9,"25":18,"30":5,"42":60,"47":2,"54":4,"55":10,"67":15},"major|2|minor|5|minor":{"0":1,"2":1,"12":2,"13":5,"15":1,"18":13,"30":31,"32":8,"34":11,"43":12,"60":2},"minor|5|minor|10|major":{"1":10,"7":1,"13":5,"25":2,"26":7,"28":2,"30":10,"34":3,"40":1,"42":12,"43":21,"44":3,"46":1,"54":1,"55":58,"60":21,"62":1,"67":2},"major|2|major|9|dominant":{"31":13},"major|9|dominant|5|minor":{"18":1,"19":1,"30":7,"31":10,"32":32,"34":1,"36":1,"43":5,"48":7,"49":2,"60":2},"dominant|5|minor|8|major":{"12":8,"25":2,"42":2,"54":2,"56":2,"68":45,"70":4},"minor|10|major|5|minor":{"30":8,"42":1},"major|5|minor|5|major":{"1":1,"9":3,"14":2,"30":11,"34":2,"42":7,"43":2,"56":3},"minor|5|major|7|major":{"1":5,"13":4,"18":3,"25":3,"30":2,"42":5,"60":7},"major|7|major|0|minor":{"13":5,"30":7,"31":3,"42":6,"43":27},"major|0|minor|5|minor":{"13":3,"14":6,"18":4,"30":1,"43":1},"minor|5|minor|3|major":{"1":1,"12":43,"13":2,"14":5,"25":6,"30":15,"42":24,"55":4,"67":4},"major|2|major|2|major":{"1":2,"5":3,"6":5,"13":15,"18":6,"25":2,"30":29,"31":5,"34":2,"35":2,"42":4,"43":6,"46":5,"47":1,"48":30,"50":6,"55":8,"60":4,"67":2},"major|2|major|0|minor":{"3":4,"13":2,"18":4,"31":2,"34":2,"43":1},"major|2|major|5|suspended":{"0":20,"1":2,"13":1,"16":1,"42":3},"minor|2|minor|10|minor":{"0":2,"13":48,"30":5,"31":1,"32":7,"34":6,"42":2,"43":29,"46":1,"60":19,"64":4},"minor|10|minor|2|minor":{"6":24,"12":2,"13":2,"18":9,"22":3,"31":14,"36":2,"43":1,"52":3,"61":38},"minor|10|minor|0|major":{"1":7,"12":2},"minor|0|major|2|major":{"13":1,"30":2},"diminished_family|5|minor|5|dominant":{"0":1,"30":2},"major|9|minor|8|major":{"1":4,"2":1,"4":3,"9":1,"12":280,"14":56,"16":32,"18":22,"24":2,"25":37,"30":2,"42":102,"46":10,"54":3,"55":36,"56":8,"67":24,"68":1},"major|7|major|9|minor":{"6":32,"18":67,"22":2,"30":21,"31":29,"32":18,"42":4,"43":13,"48":112,"49":2,"60":49,"61":5,"62":2,"64":4,"66":1},"major|9|minor|5|minor":{"0":1,"5":1,"6":2,"14":6,"18":22,"30":118,"31":29,"32":56,"34":27,"43":8,"46":1,"48":19,"60":65,"61":1},"major|10|major|4|minor":{"4":3,"6":5,"13":10,"18":11,"31":2,"32":3,"34":2,"43":8,"48":28,"55":2,"60":109,"62":1},"major|4|minor|10|major":{"12":1,"13":7,"18":5,"30":40,"48":1,"54":1,"55":25,"60":119},"major|4|minor|3|major":{"12":6,"13":6,"25":3,"30":31,"31":1,"42":9,"55":8,"60":4},"minor|3|major|7|major":{"11":1,"12":4,"13":86,"18":21,"25":26,"29":1,"30":73,"32":4,"42":81,"43":1,"44":2,"46":1,"54":1,"55":31,"60":7,"67":1},"minor|2|minor|5|minor":{"2":1,"6":2,"30":4,"31":70,"34":1,"42":1,"43":6,"48":36,"60":20,"64":2},"minor|5|minor|5|minor":{"13":57,"18":7,"30":7,"32":12,"34":34,"43":30,"60":25,"66":2},"diminished_family|1|minor|10|major":{"9":1,"13":1,"30":4,"60":4},"minor|10|major|2|minor":{"0":1,"2":6,"3":8,"5":1,"6":4,"12":5,"13":31,"17":2,"18":6,"30":11,"31":2,"32":5,"34":3,"35":2,"42":4,"43":3,"48":16,"60":445,"64":1},"major|7|major|7|minor":{"0":2,"12":2,"13":4,"18":77,"30":37,"32":3,"34":14,"35":6,"42":3,"43":11,"60":56,"62":2},"major|7|major|3|major":{"12":87,"13":2,"24":5,"29":1,"30":1,"42":75,"54":8,"56":1,"66":3,"67":23},"major|3|major|7|major":{"12":57,"18":4,"25":2,"30":17,"31":2,"42":50,"54":7,"55":17,"59":4,"60":1},"major|7|major|4|suspended":{"0":1,"2":2},"major|4|suspended|0|dominant":{"8":1,"18":2,"30":1,"31":5,"48":2},"suspended|0|dominant|5|minor":{"4":4,"7":1,"13":1,"19":1,"30":8,"31":16,"32":7,"34":2,"42":1,"43":1,"44":3,"46":2,"48":2},"dominant|5|minor|5|suspended":{"2":2,"30":6,"43":1},"minor|5|suspended|0|dominant":{"5":3,"18":3,"30":17,"31":1,"34":6,"48":4,"55":6},"suspended|0|dominant|5|major":{"1":3,"2":8,"4":1,"10":3,"12":1,"13":6,"18":1,"25":4,"26":2,"27":2,"30":11,"42":6,"55":16,"56":1,"57":3,"60":1,"68":1},"major|5|major|11|minor":{"6":11,"18":6,"31":16,"32":3,"43":1,"48":3,"60":2,"61":68,"62":1,"64":4},"major|11|minor|3|major":{"2":1,"12":8,"30":10,"42":18,"43":2,"55":7,"60":27,"63":1,"68":1},"major|11|minor|1|major":{"12":5,"16":4,"25":2,"28":2,"42":8,"55":3,"56":2,"66":4,"67":27},"minor|1|major|7|major":{"2":1,"12":15,"13":13,"25":37,"26":1,"30":31,"42":22,"55":17,"60":2,"67":9},"major|9|minor|11|major":{"12":4,"30":2,"70":1},"minor|11|major|2|major":{"12":4},"major|2|major|9|minor":{"0":2,"2":3,"6":12,"18":13,"22":2,"30":8,"31":37,"32":1,"34":2,"43":6,"48":4,"60":12,"61":2,"64":2,"66":3},"major|7|major|6|major":{"25":3,"42":3,"66":1},"major|6|major|7|major":{"42":3},"major|5|major|4|major":{"1":1,"6":3,"18":1,"25":1,"30":8,"31":1},"major|4|major|5|major":{"13":1,"30":9,"42":7,"43":2,"60":5},"minor|8|major|4|minor":{"6":1,"13":3,"18":23,"20":9,"30":4,"31":12,"32":1,"42":4,"48":82,"60":11,"64":3},"major|4|minor|8|major":{"12":35,"13":8,"16":4,"17":1,"25":55,"42":39,"54":1,"55":1,"56":1,"67":2,"68":8,"70":2},"minor|8|major|9|major":{"14":2,"30":23,"32":4,"34":1,"60":3},"minor|5|minor|7|minor":{"6":15,"8":1,"18":9,"20":8,"30":2,"31":207,"43":8,"44":3,"48":25,"50":4,"55":1,"60":16,"61":2,"62":4,"65":1},"minor|7|minor|5|minor":{"9":1,"11":5,"13":36,"14":6,"16":4,"18":18,"30":13,"31":7,"32":1,"34":1,"36":3,"42":1,"43":153,"47":2,"48":4,"60":5,"64":2},"minor|5|minor|5|major":{"6":1,"12":1,"13":28,"16":1,"18":3,"30":120,"34":2,"43":17,"55":3,"56":2,"60":4,"62":1,"64":1},"minor|7|minor|10|major":{"13":7,"18":4,"30":12,"42":31,"43":36,"55":1,"60":18,"62":1},"major|10|major|11|minor":{"5":10,"6":4,"18":29,"30":4,"31":4,"48":7,"53":2,"60":11,"61":76,"64":2},"minor|3|major|10|major":{"12":4,"25":1,"29":1,"30":1,"42":1,"47":2,"67":25,"71":1},"major|11|minor|10|major":{"4":2,"13":2,"30":11,"42":1,"60":7,"66":1},"major|5|major|7|dominant":{"0":6,"13":2,"30":42,"42":1,"54":4,"55":1,"60":1},"dominant|5|major|2|minor":{"3":1,"7":1,"13":7,"18":8,"30":6,"31":3,"32":56,"34":2,"43":1,"60":18,"62":5},"dominant|5|major|10|major":{"12":8,"30":1,"42":16,"66":1,"67":3,"68":3},"major|10|major|11|major":{"2":8,"6":2,"18":10,"30":3,"31":12,"55":1,"66":4},"major|11|major|3|major":{"30":1,"60":10,"66":6},"major|3|major|10|major":{"30":1,"42":6,"66":10},"major|0|suspended|0|major":{"1":1,"2":7,"4":162,"5":1,"6":4,"10":1,"12":10,"13":3,"14":1,"18":4,"26":1,"30":38,"31":2,"34":11,"42":48,"43":3,"44":2,"46":3,"55":15,"60":17,"64":1},"suspended|0|major|7|suspended":{"0":2,"30":2,"60":1},"major|7|suspended|5|major":{"4":2,"12":8,"13":3,"15":1,"30":24,"34":1,"42":6,"44":7,"46":20,"55":1,"60":12,"69":1},"suspended|5|major|7|major":{"2":3,"4":3,"13":13,"30":3,"43":18,"57":1,"60":18},"major|7|major|9|diminished_family":{"6":5},"major|9|diminished_family|1|major":{"1":5},"diminished_family|1|major|0|minor":{"42":5},"major|0|minor|7|major":{"1":4,"2":6,"3":1,"13":1,"14":6,"24":1,"26":7,"30":14,"31":7,"42":14,"43":11,"44":14,"46":7,"48":2,"54":1,"55":12,"56":4,"60":8},"minor|7|major|7|dominant":{"30":12,"48":1,"60":3},"major|7|dominant|8|major":{"12":1,"30":1,"54":1},"dominant|8|major|5|major":{"30":1,"42":3,"67":2},"dominant|8|major|2|major":{"14":9,"30":1,"43":2,"55":3},"major|2|major|2|dominant":{"6":3,"30":1,"31":1,"34":3,"48":10},"major|2|dominant|8|major":{"12":9,"26":1,"42":8,"54":2,"68":1},"dominant|8|major|9|major":{"60":3},"major|9|major|10|major":{"12":3,"24":3,"30":2,"42":11,"46":1,"55":6,"56":1,"60":3},"major|2|major|0|suspended":{"0":22,"5":1,"30":2},"major|0|suspended|5|major":{"4":4,"12":6,"19":11,"30":3,"34":1,"42":7,"55":7},"suspended|5|major|5|major":{"12":7,"16":94,"17":1,"21":3,"25":3,"26":1,"30":3,"42":39,"55":10,"56":2,"60":1,"67":1},"major|9|minor|0|major":{"18":2,"30":3,"34":1,"37":1},"minor|0|major|5|major":{"25":1,"42":4,"43":2,"60":3},"major|5|major|10|major":{"12":39,"14":7,"24":2,"30":9,"32":1,"42":56,"46":2,"54":35,"60":11,"66":2,"67":11,"68":1},"major|10|major|5|major":{"12":18,"24":1,"25":1,"30":4,"34":1,"37":2,"42":9,"54":3,"55":3},"major|2|major|3|major":{"12":19,"16":12,"25":9,"30":2,"42":67,"54":6,"55":8,"56":1,"66":8,"67":2},"minor|2|major|5|minor":{"13":2,"18":5,"30":3,"31":4,"32":2,"42":3,"48":4,"60":1},"major|5|minor|8|major":{"12":27,"14":3,"25":2,"42":2,"54":2,"55":3,"70":2},"minor|3|major|2|minor":{"12":6,"18":30,"30":5,"32":8,"48":5,"60":6},"major|2|minor|2|major":{"6":3,"30":2,"31":8,"60":1},"major|5|minor|3|major":{"12":14,"13":14,"14":17,"42":17,"55":4,"67":3},"minor|5|major|7|minor":{"2":1,"5":1,"13":5,"18":18,"19":2,"20":1,"30":382,"31":4,"32":2,"34":3,"35":3,"42":3,"43":1,"45":1,"47":1,"48":6,"60":12,"61":4,"64":1,"67":2},"minor|5|major|0|minor":{"13":5,"30":1,"42":6,"43":8,"60":3},"major|0|minor|2|minor":{"6":1,"18":1,"20":2,"43":3,"48":8,"60":20,"61":2},"minor|2|minor|8|major":{"12":5,"13":1,"30":2,"42":8,"70":1},"minor|8|major|5|major":{"4":1,"12":7,"16":1,"18":1,"42":7,"54":2,"55":2},"minor|8|major|11|minor":{"6":6,"18":3,"31":45,"34":4,"38":4,"48":16,"61":26,"62":7,"64":3,"66":3},"minor|1|major|11|minor":{"6":22,"18":11,"19":3,"31":25,"36":2,"48":7,"60":1,"61":36,"64":1,"66":2,"69":1},"major|7|major|0|dominant":{"0":9,"12":2,"14":2,"30":56,"31":2,"32":1,"44":1,"54":4,"60":25,"64":1},"major|0|dominant|5|minor":{"18":3,"30":3,"32":1,"36":1,"48":2,"60":5},"major|2|minor|1|major":{"13":3,"42":24,"54":1,"67":6},"major|7|major|5|minor":{"0":1,"17":1,"18":1,"32":1,"35":1,"42":11,"67":2},"major|5|minor|7|major":{"2":3,"14":4,"25":1,"30":5,"31":118,"38":3,"42":3,"55":5,"56":3},"minor|7|major|7|major":{"2":1,"13":5,"30":9,"43":2,"60":5},"major|10|major|0|minor":{"0":1,"12":2,"42":13},"minor|7|major|5|minor":{"0":2,"4":1,"6":2,"7":1,"12":3,"13":5,"14":5,"18":18,"24":2,"25":2,"32":1,"37":4,"42":103,"43":1,"46":1,"47":1,"48":4,"55":5,"60":3},"major|10|major|9|minor":{"4":2,"16":5,"18":15,"30":17,"32":9,"43":6,"48":7,"57":12,"60":11,"64":4},"major|9|minor|5|suspended":{"0":6,"2":6,"13":3,"18":1,"30":36},"minor|5|suspended|2|minor":{"30":2,"31":4,"43":15,"48":2,"60":5,"64":1,"66":1},"suspended|2|minor|10|major":{"4":1,"13":1,"30":6,"46":2,"55":2,"60":3},"minor|10|major|9|minor":{"2":1,"6":32,"14":1,"18":2,"31":61,"43":3,"48":14,"60":4},"minor|7|major|5|major":{"1":5,"12":1,"16":1,"42":11,"55":1,"66":1,"67":1},"major|3|major|9|minor":{"0":1,"5":1,"18":1,"34":1,"60":10},"major|7|major|4|minor":{"6":50,"18":4,"19":2,"30":1,"31":21,"34":5,"42":6,"50":3,"60":1,"61":32},"other|9|other|3|other":{"11":1,"17":2,"35":2,"47":1,"59":15},"other|3|other|9|other":{"2":1,"11":1,"23":17,"60":1,"64":2,"65":3},"other|3|other|2|other":{"2":1,"11":1,"17":5,"23":4,"41":1,"43":3,"47":69,"65":7},"other|2|other|2|other":{"6":1,"11":1,"23":1,"31":1,"35":1,"53":17,"55":1,"65":3},"other|2|other|3|other":{"17":3,"47":6,"59":2,"71":4},"dominant|5|dominant|5|other":{"11":1,"55":1,"71":1},"other|11|other|10|other":{"1":2,"10":1,"17":2,"47":1,"48":2,"53":1,"60":3,"61":2,"65":7},"other|10|other|10|other":{"17":6,"44":1,"47":3,"59":6,"65":3,"71":9},"other|10|other|11|other":{"53":1,"65":13,"71":3},"other|10|other|2|other":{"0":2,"11":1,"13":1,"17":2,"23":6,"30":1,"31":3,"35":11,"47":7,"55":1,"60":4,"65":182},"other|2|other|1|other":{"8":2,"9":1,"29":1,"59":1,"71":2},"other|1|other|9|other":{"14":1,"17":1,"62":1},"other|1|other|1|other":{"2":1,"6":1,"11":23,"19":1,"30":1,"35":1,"43":4,"65":3,"71":2},"other|0|dominant|0|other":{"2":11,"35":1,"60":1},"dominant|0|other|0|dominant":{"5":12},"other|5|other|5|other":{"0":1,"17":24,"35":3,"41":1,"47":13},"minor|3|major|7|dominant":{"13":1,"30":18,"60":2},"dominant|5|major|9|minor":{"2":1,"6":8,"14":1,"18":30,"19":1,"30":3,"31":47,"32":17,"34":2,"42":2,"43":4,"47":1,"48":44,"49":2,"60":5,"61":3,"62":2,"66":1,"71":1},"major|10|major|9|major":{"12":2,"13":1,"17":2,"18":5,"30":53,"48":1,"60":3,"68":1},"other|5|minor|7|minor":{"31":4,"65":1},"minor|7|other|5|minor":{"32":1,"43":2,"47":49,"57":1},"major|5|major|11|major":{"6":6,"13":4,"30":11,"31":5,"32":1,"60":1,"66":3},"minor|10|major|9|major":{"12":1,"30":1,"31":1,"48":6},"major|11|major|5|major":{"16":3,"30":11,"31":3,"42":5,"47":1,"48":2,"55":3},"minor|10|minor|5|suspended":{"0":1,"8":6,"13":16,"30":8,"34":3,"43":3,"55":1,"60":3},"minor|5|suspended|7|minor":{"13":2,"30":1,"34":12},"suspended|7|minor|2|minor":{"6":3,"61":2},"minor|5|suspended|10|major":{"12":5,"16":1,"42":2},"suspended|10|major|2|major":{"30":7,"43":1,"48":2,"55":1,"60":1},"major|5|major|8|major":{"12":2,"24":2,"30":6,"42":5,"66":2,"68":2},"major|8|major|5|major":{"4":1,"12":2,"30":4,"42":6,"54":1,"55":5},"major|5|major|1|major":{"6":1,"12":2,"30":1,"55":1},"major|1|major|9|minor":{"13":1,"42":1,"48":2},"minor|2|minor|3|major":{"13":2,"30":10,"43":4,"66":1},"minor|3|major|7|minor":{"7":1,"13":3,"30":2,"31":1},"other|2|minor|8|major":{"12":1,"16":2,"25":2},"minor|8|major|2|suspended":{"0":10,"2":2,"13":36,"30":23,"34":1,"56":4,"64":1},"major|2|suspended|2|minor":{"5":1,"18":7,"31":3,"43":3,"48":28,"60":3},"suspended|2|minor|8|major":{"4":2,"12":2,"16":24,"25":2,"42":23,"55":5,"66":1},"major|5|major|2|suspended":{"0":65,"2":2,"9":7,"13":3,"16":7,"30":122,"35":2,"60":2,"64":1},"major|2|suspended|5|major":{"4":2,"12":9,"13":34,"25":3,"30":110,"34":2,"36":1,"42":23,"43":1,"44":6,"46":35,"48":1,"55":20,"60":6,"70":1},"minor|5|suspended|5|major":{"1":3,"2":2,"13":23,"14":3,"18":2,"25":4,"30":22,"31":2,"34":6,"38":4,"42":18,"43":4,"44":3,"46":1,"48":1,"50":1,"55":39,"58":6,"60":1,"62":4,"70":1},"suspended|5|major|7|suspended":{"2":1,"13":1,"30":19,"55":1,"60":36},"diminished_family|5|suspended|0|dominant":{"30":2,"31":1},"dominant|5|minor|5|dominant":{"1":5,"4":1,"18":1,"30":48,"31":4,"32":7,"34":6,"37":1,"43":14,"55":6,"60":3},"major|3|diminished_family|11|minor":{"32":12,"34":4,"60":1,"62":2},"diminished_family|11|minor|5|dominant":{"1":1,"12":2,"30":6,"55":6},"minor|5|dominant|0|minor":{"13":4,"32":4,"34":3,"45":1},"dominant|0|minor|5|dominant":{"30":22,"43":1,"49":1,"68":1},"dominant|5|major|7|suspended":{"0":1,"30":7,"32":3,"42":1,"55":1},"suspended|5|major|2|minor":{"3":1,"13":8,"18":33,"32":10,"34":6,"60":4},"minor|3|major|11|minor":{"6":2,"18":4,"20":3,"48":1,"61":13,"66":1},"major|11|minor|8|major":{"13":1,"25":8,"30":3,"42":11,"55":18},"major|7|major|2|dominant":{"1":3,"14":4,"20":3,"30":12,"32":17,"43":5,"48":4,"60":5},"major|2|dominant|10|major":{"13":1,"14":15,"30":4,"42":32,"55":2,"56":1},"dominant|10|major|9|minor":{"18":1,"30":1,"31":1,"48":7},"dominant|5|major|0|dominant":{"0":7,"13":6,"30":106,"31":1,"32":11,"42":2,"44":2,"48":1,"56":1},"dominant|5|major|9|diminished_family":{"21":3,"60":2,"62":3},"diminished_family|10|major|2|minor":{"3":13,"34":1,"36":1,"38":1},"major|2|minor|5|suspended":{"0":1,"2":8,"13":8,"30":33,"60":2},"dominant|5|major|11|minor":{"6":6,"31":2,"32":3,"34":1,"50":1,"61":8,"62":2,"64":3},"minor|8|dominant|5|major":{"20":1,"26":5,"42":1},"minor|3|major|0|dominant":{"0":1,"30":7},"suspended|2|other|10|suspended":{"17":15},"other|10|suspended|2|other":{"18":4,"64":12},"suspended|2|other|3|major":{"42":4,"47":13},"other|3|major|7|major":{"12":3,"13":10,"17":13,"47":4,"55":2},"major|7|major|2|other":{"2":1,"18":5,"48":1,"60":8},"major|2|other|10|major":{"12":5,"17":6,"60":2},"other|10|major|2|other":{"18":2,"23":3,"60":2,"65":1},"major|2|other|3|other":{"59":3},"major|2|other|10|other":{"13":1,"17":1,"47":1,"65":2},"other|10|other|2|minor":{"5":1,"60":3,"64":1,"65":1},"other|2|minor|10|major":{"13":1,"30":2,"60":1},"major|3|major|2|major":{"2":1,"4":1,"12":20,"14":2,"18":1,"30":14,"34":1,"42":88,"43":3,"44":32,"46":4,"47":3,"60":15},"major|2|major|7|suspended":{"0":2,"2":1,"6":4,"16":5,"47":2},"major|7|suspended|2|suspended":{"1":2,"6":1,"8":2},"suspended|2|suspended|0|minor":{"46":6,"60":2},"suspended|0|minor|10|major":{"13":2,"60":1,"65":3},"other|10|major|10|major":{"12":3,"25":1},"major|5|suspended|2|suspended":{"0":2,"13":1,"30":43},"suspended|1|major|2|major":{"12":10,"46":1,"55":1,"60":4},"major|2|major|7|major":{"1":1,"2":1,"9":1,"13":2,"14":3,"18":83,"25":1,"30":14,"42":6,"48":3,"55":5,"60":9},"other|5|other|7|other":{"1":1,"2":1,"11":4,"17":24,"23":14,"30":1,"31":1,"35":76,"42":3,"47":1,"53":1,"60":3,"65":6},"other|7|other|5|other":{"0":1,"11":1,"17":12,"35":1,"42":4,"43":2,"47":66,"54":11,"65":1},"other|5|other|0|major":{"13":1,"30":3,"42":1},"minor|5|minor|1|other":{"71":5},"minor|1|other|11|other":{"43":5},"other|11|other|7|minor":{"31":4},"other|7|minor|5|minor":{"43":4},"dominant|5|major|4|diminished_family":{"32":4},"major|4|diminished_family|5|dominant":{"31":4,"32":1},"dominant|5|major|1|diminished_family":{"6":1,"7":1,"36":12,"61":3},"major|1|diminished_family|1|minor":{"9":1,"20":1,"31":1,"32":2,"34":1,"43":1,"60":9},"major|5|major|9|dominant":{"18":2,"30":28,"31":5,"32":4,"34":2,"44":1,"60":3,"62":2},"dominant|5|dominant|5|major":{"1":2,"2":5,"3":1,"13":5,"14":6,"21":4,"26":8,"27":1,"30":33,"32":4,"42":14,"43":3,"44":14,"46":1,"50":1,"54":1,"55":7,"56":21,"60":4,"70":1},"dominant|5|dominant|0|suspended":{"2":4,"30":1},"dominant|0|suspended|0|dominant":{"4":8,"30":4,"32":4,"47":1,"58":1,"64":1},"major|5|major|0|minor":{"26":2,"30":4,"42":22,"43":1},"dominant|5|major|7|dominant":{"0":2,"13":11,"24":1,"30":204,"31":2,"32":7,"43":1,"44":8,"51":1,"55":2,"60":7,"62":1},"major|3|major|9|dominant":{"3":1,"32":1,"60":3},"major|9|dominant|0|diminished_family":{"4":4},"dominant|0|diminished_family|0|suspended":{"2":4},"diminished_family|0|suspended|0|dominant":{"31":4},"minor|5|dominant|7|minor":{"4":1,"13":1,"16":2,"19":3,"30":5,"32":391,"44":7,"55":1,"60":2,"64":2},"dominant|7|minor|3|minor":{"42":3},"minor|3|minor|7|major":{"5":3,"13":3,"27":1,"28":1,"31":1,"54":13,"56":3,"60":2},"minor|7|major|0|other":{"0":3},"major|0|other|0|major":{"2":3,"5":2,"13":1,"25":2,"30":1,"42":2,"44":1,"55":1,"68":3},"other|0|major|11|dominant":{"5":3},"major|11|dominant|0|other":{"32":3},"dominant|0|other|5|dominant":{"31":1,"61":2},"minor|3|minor|9|minor":{"18":2,"19":8},"major|9|minor|3|minor":{"42":2,"43":1,"67":1},"minor|7|major|2|minor":{"19":3,"34":1},"major|2|minor|3|minor":{"55":3},"minor|7|major|9|dominant":{"3":3,"32":4,"49":3},"minor|9|minor|3|minor":{"42":5,"55":4},"dominant|5|minor|3|minor":{"42":4,"55":1,"57":2,"68":3},"minor|5|minor|2|dominant":{"6":3,"31":23,"35":1,"61":6},"minor|2|dominant|5|minor":{"13":1,"20":5,"31":15,"32":1,"57":11,"60":7,"61":4},"minor|3|major|4|minor":{"6":2,"31":4,"43":3,"44":4,"48":7,"60":4},"major|4|minor|7|dominant":{"31":4},"minor|2|dominant|1|major":{"12":4,"30":3},"dominant|1|major|5|major":{"54":3},"major|7|minor|5|minor":{"30":4,"43":5,"60":1},"minor|10|major|2|major":{"5":9,"42":1,"48":3,"60":3},"major|2|major|8|major":{"7":1,"12":32,"16":3,"24":4,"25":2,"30":1,"42":12,"55":1,"67":9,"70":2},"major|10|major|11|dominant":{"6":3,"18":1,"31":8,"34":2},"major|11|dominant|5|minor":{"18":27,"20":1,"30":2,"31":12,"32":6,"43":3,"44":7,"48":43,"60":6,"61":1,"69":2},"dominant|5|minor|10|major":{"2":1,"17":2,"23":2,"25":2,"28":2,"30":10,"43":6,"44":1,"46":11,"60":16,"62":1},"major|10|major|2|suspended":{"0":11,"13":1,"30":10,"60":3},"major|2|suspended|0|major":{"2":1,"4":10,"6":1,"13":5,"20":1,"28":1,"30":51,"34":14,"55":1,"58":1,"60":14},"major|9|suspended|0|minor":{"31":8,"52":1},"suspended|0|minor|5|minor":{"32":7,"60":1},"major|9|minor|2|suspended":{"0":4,"6":1},"major|11|dominant|1|major":{"12":3,"42":3,"68":1},"dominant|1|major|2|major":{"13":7,"30":8,"54":2,"56":2,"60":1},"major|2|minor|5|major":{"4":2,"5":2,"13":12,"16":4,"18":9,"25":1,"30":95,"42":1,"43":51,"56":2,"60":8},"major|9|dominant|5|major":{"13":4,"24":3,"25":2,"30":20,"31":2,"42":1,"43":2,"44":2},"dominant|5|major|7|minor":{"16":1,"30":11,"32":4,"45":2,"60":3,"68":1},"major|2|major|4|minor":{"6":1,"30":1,"31":4},"major|7|major|4|dominant":{"6":9,"30":1,"31":3,"48":1},"major|4|dominant|1|major":{"1":3,"9":6,"12":11,"14":3,"42":2,"54":3,"55":1},"major|0|minor|2|major":{"2":2,"31":1,"66":4},"minor|2|major|0|dominant":{"30":5,"31":3,"60":1},"major|2|major|0|dominant":{"0":4,"30":30,"32":1,"43":1,"60":5},"major|2|major|11|major":{"6":1,"66":3},"major|11|major|1|major":{"2":2,"12":6,"13":5,"30":4,"42":3,"54":2,"66":3,"71":1},"major|1|major|5|major":{"6":1,"25":1,"30":3,"55":2,"60":2},"other|5|major|7|other":{"0":16,"30":3},"major|7|other|5|major":{"20":2,"30":4,"42":4,"47":1,"68":2},"other|5|major|7|major":{"5":3,"13":6,"15":1,"30":7,"32":4,"42":2,"43":8,"55":2},"major|5|major|0|suspended":{"0":54,"30":1,"34":1,"54":1,"56":1},"suspended|0|major|7|major":{"12":3,"18":2,"30":24,"34":7,"42":12,"46":1,"60":15,"62":2},"major|5|major|3|major":{"12":12,"30":3,"54":1,"60":1,"66":3,"67":1,"68":1},"major|2|major|7|dominant":{"0":31,"5":1,"13":2,"14":4,"18":41,"32":2,"35":3,"43":1,"60":5},"dominant|10|major|4|major":{"30":2,"35":1},"suspended|0|major|10|major":{"12":17,"18":2,"25":4,"42":39,"46":3,"55":1,"60":1,"67":1},"major|9|minor|1|major":{"12":40,"25":25,"28":2,"30":2,"42":15,"54":1,"55":8,"67":4},"minor|1|major|5|major":{"26":3,"42":3,"55":1,"67":1},"suspended|0|major|2|major":{"4":1,"13":2,"18":1,"30":5,"55":10,"60":2,"64":1},"suspended|0|major|0|dominant":{"30":10,"55":1,"60":1},"major|0|dominant|10|major":{"2":2,"12":3,"14":1,"24":1,"42":27},"major|4|major|5|other":{"30":1,"48":2},"suspended|0|major|3|major":{"9":9,"12":3,"58":1,"67":2},"major|7|minor|7|diminished_family":{"36":3},"minor|7|diminished_family|6|major":{"67":3},"diminished_family|6|major|11|minor":{"61":3},"minor|10|major|11|minor":{"24":1,"32":6,"48":1,"61":3},"major|11|minor|5|dominant":{"30":4,"31":8,"32":1,"43":3},"dominant|7|minor|5|dominant":{"13":3,"14":3,"22":1,"27":2,"30":31,"43":351,"46":1,"55":6,"62":4},"dominant|7|minor|5|major":{"4":3,"13":4,"43":6},"major|8|major|7|major":{"4":2,"12":1,"13":3,"30":3,"42":22,"43":3,"54":3,"60":3},"major|7|major|7|suspended":{"0":23,"2":2,"13":27,"30":31,"32":4,"42":1,"60":3},"major|10|major|4|major":{"6":3,"12":1,"30":9,"60":2},"major|4|major|10|major":{"12":5},"minor|8|major|9|minor":{"13":9,"14":2,"17":13,"18":4,"30":9,"32":3,"34":22,"42":1,"43":2,"44":1,"47":4,"48":17,"50":1,"57":1,"60":16,"62":1},"major|9|minor|10|major":{"2":1,"13":27,"25":7,"30":66,"35":11,"42":18,"43":1,"48":7,"54":3,"55":12,"60":59,"62":2,"65":4},"major|1|major|9|major":{"30":1,"32":1,"54":10,"60":6},"dominant|1|major|9|minor":{"30":4,"60":1},"major|9|minor|0|dominant":{"6":1,"31":4},"dominant|1|major|7|major":{"12":4,"30":3,"42":10,"44":1,"56":2},"minor|0|dominant|0|minor":{"2":1,"18":1,"30":1},"dominant|0|minor|5|major":{"30":2,"43":3,"55":4,"60":3},"major|7|major|0|other":{"15":3,"35":1,"47":1,"65":2,"71":2},"major|0|other|10|other":{"17":1,"47":3,"71":1},"other|10|other|7|other":{"0":1,"12":1,"13":1,"17":15,"23":1,"35":4,"47":15,"60":1,"65":1},"other|7|other|10|other":{"1":1,"17":6,"35":1,"42":1,"47":12},"other|7|other|2|major":{"47":2,"60":1},"other|2|major|10|major":{"12":7,"42":15},"major|7|major|1|major":{"6":1,"30":1,"55":1,"66":6,"70":2},"major|1|major|1|major":{"6":11,"30":2,"42":4,"60":3,"66":4},"major|1|major|7|major":{"30":3,"32":1,"42":5,"55":2,"60":12},"other|0|major|10|major":{"42":7},"major|7|major|7|other":{"0":2,"11":1,"18":1,"30":4,"35":3,"60":2},"major|7|other|0|major":{"5":18,"18":10,"48":1,"60":3},"major|7|major|9|dominant":{"18":4,"31":8,"32":5},"other|7|other|0|major":{"35":1,"48":1,"60":1},"major|7|minor|3|major":{"12":43,"16":1,"25":3,"42":81},"major|5|minor|5|dominant":{"14":1,"18":2,"30":8,"31":1,"43":4},"minor|5|dominant|5|minor":{"0":1,"13":26,"14":1,"20":3,"30":6,"32":17,"34":2,"36":2,"60":7,"66":4},"major|5|dominant|11|dominant":{"48":6},"dominant|11|dominant|8|major":{"20":3,"32":3},"dominant|8|major|5|dominant":{"8":5,"68":3},"dominant|8|major|3|dominant":{"24":5},"major|3|dominant|4|major":{"30":5},"dominant|4|major|5|major":{"42":5},"other|5|other|2|other":{"30":4,"35":38,"53":1,"59":1,"65":8},"other|2|other|5|other":{"0":3,"17":5,"32":1,"35":33,"42":3,"47":25,"53":3},"other|5|other|8|other":{"71":3},"other|8|other|11|other":{"65":3,"71":1},"other|10|other|0|minor":{"30":2,"31":1},"other|0|minor|5|major":{"43":3,"60":1},"major|7|minor|5|other":{"9":3,"30":6},"minor|5|other|1|diminished_family":{"66":3},"other|1|diminished_family|11|major":{"43":3},"diminished_family|11|major|7|minor":{"30":3},"major|7|minor|7|minor":{"5":1,"6":3,"30":1,"31":6,"48":1,"60":23,"61":1,"66":1},"minor|11|major|11|suspended":{"0":1,"2":2,"6":1,"60":2},"major|11|suspended|0|major":{"6":7,"13":1,"30":9,"31":9,"34":1,"43":1,"48":4,"62":3},"suspended|0|major|2|minor":{"13":1,"30":4,"35":1,"43":3,"48":8},"major|2|minor|5|other":{"18":3,"30":2,"65":9},"minor|5|other|3|major":{"12":2,"17":6,"42":2},"other|3|major|2|major":{"12":1,"13":1,"17":5},"major|2|major|2|other":{"1":3,"4":3,"18":5,"35":1,"53":2,"60":2,"65":2},"major|2|other|5|other":{"17":1,"35":1,"55":2,"59":24},"minor|10|dominant|5|dominant":{"8":1,"30":2,"44":3},"dominant|7|dominant|5|dominant":{"0":4,"9":1,"14":6,"20":1,"25":1,"30":5,"32":46,"44":211,"47":1,"56":1},"dominant|5|dominant|2|dominant":{"18":4,"20":1,"30":12,"32":2,"42":1,"43":1,"60":1,"62":4},"dominant|7|major|0|minor":{"31":2,"62":1},"major|5|major|7|suspended":{"0":1,"2":8,"30":2,"60":5,"62":1},"major|7|suspended|10|major":{"12":1,"16":40,"42":4},"suspended|10|major|2|suspended":{"2":2,"13":3,"30":41,"60":2},"suspended|0|major|5|major":{"12":16,"13":2,"16":17,"18":2,"25":9,"26":1,"30":57,"42":17,"44":5,"48":2,"55":27,"60":6},"other|0|suspended|0|other":{"0":1,"4":1,"48":1,"65":1},"major|7|minor|10|major":{"1":9,"13":7,"14":1,"25":2,"30":12,"42":49,"43":6,"46":2,"60":3,"67":3,"71":1},"minor|10|major|0|minor":{"12":1,"13":20,"25":3,"42":6,"60":10},"major|0|minor|4|minor":{"6":3,"32":3,"48":3},"minor|4|minor|1|major":{"30":3},"major|5|major|4|dominant":{"1":2,"6":12,"30":1,"31":11},"major|4|dominant|5|major":{"30":1,"32":1,"43":1,"44":2,"55":3,"62":1},"major|4|dominant|0|minor":{"30":4},"major|7|minor|10|minor":{"18":6,"60":4},"minor|10|major|4|dominant":{"1":2,"30":1,"31":10,"35":1},"suspended|0|major|7|minor":{"13":1,"14":1,"30":4,"60":1},"dominant|5|major|5|dominant":{"4":1,"9":5,"11":3,"12":1,"14":4,"30":4,"42":22},"major|5|dominant|5|major":{"1":7,"9":3,"12":4,"13":1,"25":1,"30":8,"42":1,"44":2,"55":3},"dominant|5|major|4|minor":{"6":12,"30":2,"31":24,"32":1,"48":2,"60":3,"61":2,"67":18},"major|4|minor|5|major":{"18":4,"32":1,"35":2,"43":2,"48":1,"53":1,"60":5},"dominant|1|major|0|minor":{"42":3},"minor|6|major|11|minor":{"60":2,"61":1},"major|8|major|11|minor":{"18":8,"30":2,"36":1},"major|11|minor|5|major":{"6":4,"18":2,"30":1,"42":1,"43":2},"minor|5|major|3|major":{"12":16,"16":2,"25":4,"42":12,"54":3,"55":2,"56":3,"67":1,"70":8},"dominant|5|minor|5|major":{"1":2,"2":6,"14":16,"30":17,"42":2,"43":9,"60":4},"suspended|10|major|7|major":{"13":2,"30":1,"42":2,"44":1,"46":2,"55":3},"other|8|major|7|major":{"13":3,"24":4},"major|7|major|4|major":{"6":3,"30":1,"31":10,"35":2,"48":2},"major|4|major|1|major":{"9":1,"18":2,"25":2,"54":6},"major|1|major|4|minor":{"30":1,"48":2},"major|2|major|9|suspended":{"0":1,"2":4,"61":1},"major|9|suspended|0|dominant":{"11":1,"30":7,"31":5,"48":1},"suspended|0|dominant|1|major":{"12":1,"13":2,"67":1},"minor|10|minor|8|major":{"59":2,"60":1,"67":3},"other|5|major|4|minor":{"6":5},"major|3|major|4|major":{"6":1,"25":2,"30":1,"42":4,"46":3,"48":1,"66":1},"major|4|major|4|minor":{"6":2,"31":1},"minor|1|major|4|minor":{"2":2,"30":1,"31":1,"43":58,"48":2,"60":26},"minor|8|major|7|major":{"2":2,"4":2,"6":1,"12":10,"13":13,"25":18,"26":2,"30":60,"42":57,"43":5,"44":6,"46":23,"55":59,"60":6},"minor|10|minor|7|minor":{"31":7,"32":1,"43":3,"48":10,"60":27,"61":4},"minor|0|other|10|other":{"13":2,"47":1,"65":1},"minor|10|major|0|suspended":{"30":11,"60":1},"suspended|2|minor|0|other":{"2":1,"30":2,"65":1},"minor|10|suspended|2|minor":{"6":1,"30":5,"32":1,"35":1,"43":1,"48":3,"60":2,"61":1,"64":5},"minor|10|major|4|minor":{"6":4,"31":7,"48":4,"50":2,"61":9,"64":8,"66":2},"minor|8|major|2|minor":{"13":1,"18":7,"30":1,"43":4,"60":2},"minor|10|minor|3|major":{"12":47,"30":3,"42":54,"67":14},"minor|8|major|11|dominant":{"6":3,"31":50,"48":2,"61":4},"major|7|minor|8|major":{"12":1,"42":5,"54":4,"55":1},"major|3|major|11|minor":{"18":13,"30":5,"48":3,"60":5,"61":1,"66":3,"71":2},"minor|7|minor|10|minor":{"18":25,"30":11,"32":7,"34":26,"43":4,"60":1},"major|2|minor|7|minor":{"6":68,"12":4,"18":1,"19":2,"31":9,"43":8,"48":16,"60":2,"61":28},"major|2|major|5|minor":{"18":1,"30":6,"31":1,"43":3,"48":2,"60":3},"major|5|minor|10|major":{"2":5,"13":7,"25":3,"30":8,"60":14},"other|3|major|7|other":{"4":12,"13":1,"18":6},"major|7|other|0|suspended":{"17":11},"other|0|suspended|2|other":{"18":11},"other|2|minor|5|major":{"30":1,"43":1,"60":1},"minor|10|minor|10|suspended":{"13":4},"suspended|2|minor|5|major":{"30":2,"43":5,"60":3},"minor|5|major|5|suspended":{"0":8,"60":2},"minor|7|minor|1|major":{"7":1,"12":61,"14":3,"16":3,"25":56,"30":3,"42":40,"55":13,"58":3,"67":9,"68":8,"70":6},"minor|1|major|2|suspended":{"0":1,"13":1,"30":12,"34":3,"43":3,"60":5},"suspended|5|major|9|minor":{"18":1,"31":14,"43":21,"48":54,"60":1},"major|9|minor|7|minor":{"6":27,"18":5,"22":16,"30":1,"31":13,"36":1,"38":2,"43":2,"48":4,"57":2,"60":5,"61":6},"major|2|suspended|2|suspended":{"1":6,"31":3,"60":1},"suspended|10|dominant|7|major":{"13":1,"46":2},"dominant|7|major|2|minor":{"32":2,"38":1},"major|2|minor|5|dominant":{"12":3,"30":98,"32":1,"43":8,"55":6,"60":8},"major|5|major|2|dominant":{"6":1,"30":139,"32":6,"35":2,"43":1,"44":2,"48":4,"60":15,"62":2},"major|9|minor|5|dominant":{"4":2,"13":12,"18":2,"30":58,"31":1,"32":16,"34":2,"43":6,"48":2,"55":4,"56":2},"minor|5|dominant|0|suspended":{"30":2,"68":1},"dominant|0|suspended|5|major":{"13":1,"42":2,"44":1,"46":1,"57":3},"major|2|minor|10|dominant":{"30":6,"43":2,"62":4},"minor|10|dominant|5|major":{"1":2,"4":1,"14":3,"30":1,"42":3,"44":1,"55":2,"60":1,"67":4},"dominant|5|major|0|minor":{"0":2,"14":3,"30":2,"31":6,"32":5,"42":50,"50":1,"54":2,"56":2},"major|0|minor|2|dominant":{"30":1,"46":2},"dominant|7|suspended|5|dominant":{"30":4},"suspended|5|dominant|5|major":{"16":4,"32":2,"42":4,"46":2,"58":3},"major|5|minor|2|major":{"31":3},"major|5|minor|2|minor":{"6":7,"31":2,"61":7},"major|5|minor|0|major":{"13":1,"31":2,"42":6,"48":3},"minor|0|suspended|0|major":{"2":2,"26":2,"42":1},"major|7|major|5|suspended":{"0":9,"30":5,"42":2},"major|7|major|5|other":{"11":1,"12":12,"31":1,"47":1},"other|5|minor|7|other":{"31":48,"48":1},"other|8|major|2|other":{"25":1,"35":22},"major|5|minor|9|minor":{"19":1,"30":3,"32":1},"other|5|other|7|major":{"30":6,"42":1},"other|7|major|7|major":{"13":2,"43":1,"55":1,"60":1},"major|2|major|5|other":{"0":1,"35":2,"42":2,"47":3,"60":1,"65":2},"other|10|major|2|major":{"17":1,"18":3,"30":1,"48":1,"60":9,"65":4},"major|10|major|2|other":{"35":2,"60":1},"major|5|other|5|other":{"17":1,"47":6},"other|7|major|5|major":{"12":2,"18":1,"42":5,"47":2,"55":16},"major|5|major|7|other":{"0":3,"11":1,"17":2,"30":1,"35":1},"major|7|other|5|other":{"12":4,"47":2},"major|5|suspended|5|major":{"1":7,"34":3},"suspended|5|major|0|minor":{"12":3,"13":5,"42":5},"major|5|minor|2|dominant":{"13":2,"30":5},"minor|2|dominant|5|major":{"13":1,"18":2,"26":2,"31":1,"42":3,"55":7},"dominant|2|minor|8|major":{"12":2,"14":15,"25":1,"55":1,"69":2},"major|5|other|2|major":{"30":1,"60":12},"minor|3|major|2|suspended":{"0":3,"2":2,"30":29,"60":3},"major|4|minor|10|minor":{"7":1,"18":41,"19":13,"30":2,"32":4,"60":6,"62":1},"minor|10|minor|5|major":{"4":1,"13":2,"30":25,"43":2,"60":7,"64":4},"minor|7|major|4|dominant":{"30":2,"31":1,"32":4},"major|4|minor|2|minor":{"5":1,"6":7,"30":2,"31":1,"61":4},"dominant|1|major|1|diminished_family":{"6":1,"36":5},"major|1|diminished_family|6|major":{"2":2,"18":1,"30":3,"44":3,"55":13},"diminished_family|6|major|9|minor":{"18":3,"31":7,"49":3},"minor|5|dominant|5|dominant":{"0":1,"4":3,"13":1,"30":24,"32":3,"35":2,"60":1},"dominant|7|dominant|10|dominant":{"14":11,"25":1,"42":2,"44":87,"56":2},"dominant|10|dominant|7|dominant":{"0":2,"8":1,"18":1,"32":70,"44":18,"64":2},"dominant|7|dominant|7|dominant":{"30":3,"32":42,"55":1,"62":88},"suspended|5|minor|5|major":{"43":5},"dominant|5|dominant|5|dominant":{"0":5,"1":5,"14":3,"18":6,"30":43,"31":2,"32":7,"44":56,"56":3},"minor|8|major|2|dominant":{"8":1,"13":11,"30":47,"31":2,"36":3,"43":3,"60":13},"suspended|0|minor|7|minor":{"22":15,"61":1},"major|7|minor|5|suspended":{"2":3,"13":3,"30":18},"suspended|5|major|7|minor":{"30":2,"34":3,"60":1},"suspended|2|minor|7|minor":{"6":12,"60":1,"61":7},"minor|5|suspended|5|minor":{"13":1,"32":1,"37":1},"suspended|5|minor|2|minor":{"22":3,"30":3,"34":1},"minor|8|major|11|suspended":{"0":6,"2":6,"34":1},"suspended|2|minor|5|minor":{"13":2,"30":2,"32":1,"34":2,"60":1},"major|2|suspended|10|major":{"12":5,"16":6,"30":2,"42":4,"67":2},"major|7|suspended|0|major":{"4":5,"25":1,"30":6,"42":2,"55":16,"60":21,"64":1},"major|0|dominant|7|major":{"2":5,"30":3,"42":4,"43":1,"44":1,"60":1},"dominant|7|major|0|dominant":{"0":4,"30":1,"32":4,"42":2,"62":1},"dominant|7|major|7|dominant":{"30":20,"62":17},"dominant|5|major|2|major":{"1":1,"2":6,"13":2,"18":1,"30":24,"44":1,"54":1,"55":3,"60":20},"major|9|minor|10|dominant":{"30":3,"55":4,"60":1},"minor|5|minor|5|suspended":{"0":15,"1":1,"2":8,"6":1,"12":3,"13":2,"18":1,"30":43,"31":1,"35":3,"36":1,"55":3,"60":2},"minor|5|major|9|major":{"30":2,"31":5,"48":1},"major|9|major|5|minor":{"18":2,"30":4,"31":6,"32":4,"42":1,"48":13,"60":9},"major|5|minor|5|minor":{"12":2,"13":1,"14":4,"16":12,"18":3,"30":1,"34":1,"42":1,"43":9},"other|1|other|11|other":{"6":6,"11":30,"13":1,"23":1,"36":1,"65":2,"66":1},"major|0|other|11|other":{"66":1,"71":3},"other|0|minor|10|major":{"13":1,"60":3},"minor|7|minor|5|major":{"1":11,"30":1,"43":2},"major|7|minor|11|minor":{"7":4,"36":2},"minor|6|major|10|major":{"60":2,"66":6},"major|10|major|10|major":{"12":7,"25":2,"26":1,"42":7,"54":3,"55":7,"60":1,"67":3,"70":9},"major|7|minor|7|major":{"31":6},"other|8|other|4|other":{"1":1,"13":1,"53":4},"other|4|other|8|other":{"29":1,"54":3},"major|0|dominant|0|major":{"2":43,"13":1,"18":1,"25":1,"30":11,"32":1,"35":1,"42":7,"44":3,"46":2,"48":14,"54":1,"60":2},"dominant|0|major|0|dominant":{"0":29,"6":1,"18":3,"30":7,"32":2,"42":1,"55":2,"60":1,"68":1},"major|4|minor|7|minor":{"6":53,"18":1,"32":5,"53":1,"60":2,"61":12},"minor|1|major|0|minor":{"25":3,"42":3},"minor|1|major|2|dominant":{"0":1,"13":1,"30":11,"55":2,"60":1},"minor|7|major|9|major":{"30":1,"31":13},"suspended|8|major|2|major":{"13":4},"major|2|major|2|suspended":{"5":1,"48":3,"60":1},"major|2|suspended|8|major":{"12":3,"54":1},"major|9|minor|8|minor":{"12":15,"32":1},"minor|8|minor|2|major":{"2":4,"30":10,"36":1},"minor|2|major|5|major":{"2":2,"13":2,"30":3,"31":2,"55":9},"minor|7|major|0|dominant":{"30":7,"31":1,"64":2},"minor|10|major|8|major":{"12":16,"42":7,"44":1,"55":1},"minor|5|major|9|minor":{"6":7,"31":7,"48":3,"61":1},"minor|5|major|2|minor":{"15":1,"18":4,"30":4,"31":35,"32":1,"48":5,"60":13},"major|1|major|11|major":{"6":1,"13":1,"18":1,"30":6,"31":5,"61":2,"66":4},"major|7|dominant|2|minor":{"18":5,"30":1,"31":5,"42":6,"60":4,"62":8},"dominant|2|minor|3|major":{"30":12,"44":4,"66":7},"minor|7|minor|8|major":{"9":1,"12":28,"13":5,"25":7,"30":1,"42":6,"55":3,"67":5,"68":3,"70":4},"minor|10|major|3|major":{"12":3,"30":3,"42":4,"60":2},"dominant|5|major|11|dominant":{"31":8,"36":1,"48":1,"50":1},"major|11|dominant|8|major":{"30":2,"55":1},"dominant|8|major|9|minor":{"34":6,"48":1},"other|7|other|7|other":{"17":4,"18":3,"23":2,"47":1,"65":13},"other|0|minor|5|minor":{"13":2,"14":1},"minor|5|minor|10|suspended":{"0":3,"2":1,"64":2},"minor|10|suspended|10|suspended":{"70":4},"suspended|10|suspended|11|suspended":{"11":3,"31":1},"suspended|11|suspended|1|other":{"59":3},"suspended|1|other|9|other":{"47":3},"other|9|other|7|other":{"1":4,"23":23,"35":1,"53":6,"65":1},"other|7|other|8|other":{"42":1,"59":6},"other|8|other|9|other":{"0":1,"17":2,"47":6},"other|7|other|0|minor":{"5":3,"17":1,"31":1},"major|11|dominant|10|minor":{"13":3,"34":3,"61":1},"major|4|suspended|0|major":{"1":1,"4":2},"suspended|0|major|0|suspended":{"0":206,"6":1,"25":6,"30":15},"other|10|other|10|major":{"12":1,"25":3},"other|10|major|4|minor":{"6":4,"30":1},"minor|1|major|3|dominant":{"68":3},"major|3|dominant|11|dominant":{"8":3,"31":1,"32":1},"dominant|11|dominant|1|dominant":{"24":1,"30":2,"68":6},"dominant|1|dominant|11|dominant":{"6":3,"8":3},"dominant|11|dominant|1|major":{"71":3},"dominant|1|major|11|other":{"65":3},"major|11|other|10|other":{"71":3},"suspended|0|major|2|suspended":{"0":1,"1":1,"30":2},"major|8|major|4|major":{"1":3,"2":11,"18":4,"30":1,"48":11,"60":3},"major|4|major|8|major":{"24":8,"30":2,"42":1,"54":1,"55":2},"major|4|major|0|minor":{"30":3,"31":1},"major|0|minor|5|major":{"1":6,"2":2,"42":8,"43":5},"minor|7|major|0|minor":{"30":4,"60":1},"minor|7|major|8|major":{"24":2,"42":6},"other|11|other|11|other":{"29":3,"48":3,"65":1,"67":3,"71":10},"other|11|other|4|other":{"71":3},"other|4|other|11|other":{"71":3},"other|11|other|8|major":{"42":3},"major|5|major|0|other":{"0":6,"30":1,"35":1,"44":1,"71":1},"suspended|5|major|2|major":{"4":7,"13":4,"18":9,"42":1,"60":2},"major|0|dominant|7|dominant":{"13":3,"30":4,"32":2},"dominant|7|dominant|5|major":{"2":1,"14":3,"30":4,"32":2,"44":1},"major|7|major|11|major":{"6":4,"30":1,"42":3},"major|11|major|7|major":{"30":3},"major|7|major|9|major":{"12":4,"18":3,"31":1,"42":5},"major|9|major|7|major":{"25":1,"30":2,"35":1,"48":4,"60":4},"minor|7|minor|7|minor":{"6":6,"20":3,"31":2,"35":3,"48":4,"61":2,"71":2},"minor|5|dominant|8|major":{"12":2,"55":6,"71":1},"minor|5|major|8|major":{"12":2,"30":1,"52":1,"67":2},"major|2|suspended|0|dominant":{"1":2,"30":11,"31":1,"43":2,"60":1},"major|0|minor|0|major":{"1":4,"12":1},"minor|0|major|0|minor":{"0":2,"2":2,"18":2,"43":5,"60":2,"62":1},"minor|0|dominant|5|major":{"13":1,"30":3,"55":2},"minor|2|major|11|major":{"66":4},"major|11|major|11|major":{"1":2,"6":7,"14":1,"18":6,"30":3,"34":2,"36":20,"60":3,"66":17,"67":7,"68":4},"major|11|major|10|major":{"42":5,"54":3,"67":6},"dominant|5|major|9|dominant":{"18":5,"30":1,"31":28,"32":26,"34":2,"48":3,"60":12},"major|11|other|1|major":{"21":2,"71":3},"minor|7|major|7|minor":{"14":2,"32":9},"major|7|minor|2|dominant":{"32":4,"48":1},"minor|2|dominant|5|dominant":{"30":2,"32":2,"34":1,"68":1},"dominant|1|dominant|5|major":{"5":1,"13":1,"51":1,"68":1,"71":1},"dominant|5|suspended|0|dominant":{"13":6,"30":7,"31":3,"32":1,"34":2,"43":3,"48":2,"60":3},"major|5|major|10|other":{"54":4},"major|10|other|9|major":{"30":4},"other|9|major|5|major":{"35":11,"42":3,"65":1},"major|2|major|1|major":{"6":10,"12":2,"25":1,"66":5,"67":1},"major|9|major|8|major":{"12":20,"25":2,"42":1,"55":6,"56":3},"dominant|5|major|4|major":{"13":1,"42":3},"major|9|minor|10|other":{"0":1,"13":1,"47":13},"minor|10|dominant|10|major":{"12":1,"42":8,"68":1,"70":1},"dominant|10|major|2|major":{"2":2,"13":3,"20":2,"30":3,"55":3,"60":2},"major|9|major|5|dominant":{"0":2,"30":2,"32":1,"55":1,"60":3},"major|5|dominant|5|dominant":{"14":1,"30":2},"major|3|major|2|suspended":{"0":2,"16":3,"30":9,"48":1,"60":2},"other|7|other|10|major":{"12":10,"60":1},"major|2|major|10|other":{"0":10,"17":4},"major|10|other|2|other":{"1":1,"35":3},"dominant|5|minor|9|diminished_family":{"52":11,"67":2},"minor|9|diminished_family|8|suspended":{"14":11},"diminished_family|8|suspended|2|dominant":{"30":11},"suspended|2|dominant|5|major":{"1":7,"30":2,"35":2},"major|5|other|7|other":{"17":2,"35":2,"60":6},"minor|5|major|1|diminished_family":{"7":4},"major|2|dominant|2|dominant":{"30":1,"31":4},"dominant|2|dominant|5|minor":{"32":3,"60":4},"minor|2|suspended|0|major":{"2":1,"4":2,"30":1,"31":23,"34":3},"suspended|0|major|5|minor":{"0":3,"13":4,"16":2,"30":2,"31":18,"42":2,"43":2,"46":2,"48":5,"62":1},"minor|5|major|1|major":{"30":1,"42":4},"major|9|major|2|major":{"2":4,"30":3,"31":2},"suspended|5|major|7|dominant":{"4":1,"13":3,"30":11,"32":1},"suspended|5|major|0|suspended":{"0":8},"major|7|suspended|9|minor":{"32":4},"suspended|9|minor|5|dominant":{"31":4},"minor|10|major|7|suspended":{"30":14,"55":2},"dominant|5|minor|6|major":{"30":1,"37":1,"42":2},"minor|6|major|7|major":{"30":3,"42":2},"major|10|major|0|dominant":{"42":4},"dominant|7|major|7|major":{"30":3,"32":2,"42":2,"60":4,"62":6},"minor|11|major|7|major":{"12":1,"30":4,"60":1},"minor|10|dominant|2|minor":{"18":7,"48":1,"49":3},"minor|3|major|11|major":{"31":8,"66":8},"major|11|major|11|minor":{"0":1,"62":5},"major|11|minor|10|dominant":{"0":6,"13":5,"30":3,"32":1},"dominant|5|dominant|1|diminished_family":{"6":1,"11":1,"38":1},"major|2|other|3|major":{"12":5,"17":3,"42":8},"major|2|major|7|other":{"18":2,"35":1,"60":1,"65":1},"major|7|other|10|major":{"17":1,"42":2},"major|7|other|3|major":{"17":2,"29":6,"42":1},"major|1|minor|1|major":{"12":1,"67":1,"71":1},"major|7|other|10|other":{"17":3,"55":3},"other|2|other|10|other":{"11":1,"13":2,"17":169,"29":1,"35":9,"43":2,"46":12,"47":5,"59":1,"60":1,"65":7,"71":4},"other|10|other|1|other":{"11":3},"other|1|other|10|other":{"11":2,"17":1},"other|2|other|10|major":{"12":2,"13":3,"30":1,"42":1},"major|4|dominant|5|minor":{"18":1,"19":3,"20":12,"30":10,"31":10,"32":10,"48":7,"60":3},"dominant|5|minor|3|major":{"9":2,"12":2,"13":23,"14":2,"26":1,"30":2,"42":1,"55":2},"other|7|other|2|other":{"0":7,"11":1,"23":4,"35":1,"48":1,"53":26,"60":3,"65":13},"other|2|other|8|other":{"16":1,"17":41,"42":2,"47":4},"other|8|other|2|other":{"0":4,"13":2,"17":17,"35":20},"minor|10|major|5|other":{"42":9,"47":2},"minor|10|major|10|other":{"12":7},"major|10|other|2|major":{"12":1,"35":3,"60":7,"65":1},"dominant|5|major|2|dominant":{"27":1,"30":25,"32":28,"55":3,"60":1},"major|2|dominant|5|dominant":{"0":2,"30":41,"32":7,"44":4,"60":7},"major|8|dominant|5|major":{"13":1,"14":1,"30":1,"44":3,"55":2,"58":1},"suspended|5|major|10|dominant":{"68":4},"major|10|dominant|11|dominant":{"30":3,"31":8},"dominant|11|dominant|5|minor":{"18":1,"31":2,"32":1,"34":4,"44":11,"50":2,"60":5,"62":3},"suspended|5|major|6|dominant":{"66":4},"major|6|dominant|11|major":{"67":4},"dominant|11|major|11|minor":{"61":5},"major|11|minor|6|dominant":{"67":4},"minor|6|dominant|11|minor":{"32":4,"48":2},"dominant|11|minor|5|dominant":{"1":3,"30":1,"32":2,"43":3},"dominant|0|minor|5|suspended":{"30":3},"major|7|suspended|5|dominant":{"30":8},"dominant|5|major|2|suspended":{"0":2,"2":8,"30":10},"major|7|minor|5|dominant":{"30":16,"43":6},"other|0|major|2|major":{"5":1,"60":11},"major|10|other|0|major":{"12":10},"minor|5|dominant|2|minor":{"6":3,"18":12,"30":1,"48":4},"major|9|minor|9|diminished_family":{"6":1,"32":12},"minor|5|major|2|major":{"2":1,"30":4,"31":2,"34":1,"60":1},"major|9|minor|7|major":{"2":1,"30":1,"31":17,"60":3},"minor|7|major|10|major":{"12":5,"30":1,"66":5,"68":2},"minor|10|suspended|0|major":{"4":6,"13":2,"18":9,"30":1,"42":1,"48":1,"60":2,"64":2},"dominant|7|dominant|2|minor":{"57":1,"60":3},"dominant|2|minor|10|major":{"30":7,"60":4},"major|11|other|5|other":{"17":1,"31":4,"35":1,"48":7},"other|5|other|8|major":{"12":2,"71":5},"other|8|major|11|other":{"35":5},"other|8|major|2|major":{"12":3,"14":2,"17":1,"30":1},"major|2|dominant|5|suspended":{"0":1,"13":2},"dominant|5|suspended|2|minor":{"48":3,"64":2},"suspended|2|minor|10|suspended":{"13":9,"60":1},"suspended|2|minor|1|major":{"14":1,"58":3,"71":1},"other|0|minor|8|major":{"12":3,"25":2,"54":1},"minor|5|major|2|suspended":{"1":3,"2":1,"5":1,"31":3},"suspended|0|other|0|suspended":{"1":1,"5":3},"minor|5|suspended|0|major":{"1":1,"4":2,"18":2,"30":14,"31":2,"43":2,"48":1,"60":6,"62":1},"major|11|other|5|major":{"48":3},"other|5|major|8|major":{"12":1,"71":2},"dominant|5|suspended|0|major":{"1":1,"4":2,"13":2,"16":1,"25":3,"30":1,"60":1},"suspended|0|major|5|suspended":{"0":29,"34":1},"major|2|minor|2|minor":{"2":5,"6":21,"13":10,"18":3,"20":6,"30":1,"31":2,"48":1,"61":29},"diminished_family|5|dominant|1|major":{"12":1,"24":1,"42":3,"55":3},"major|10|major|2|dominant":{"0":1,"13":3,"30":11,"60":2},"dominant|10|major|2|dominant":{"30":10,"60":16},"major|5|major|11|dominant":{"6":1,"31":7,"61":3},"major|8|major|11|suspended":{"6":3,"30":1},"major|11|suspended|1|major":{"12":3,"70":5},"suspended|1|major|11|suspended":{"6":4,"60":1},"major|7|major|1|diminished_family":{"7":1,"36":3,"38":1},"minor|7|minor|3|major":{"4":4,"13":2,"18":2,"30":4,"31":1,"55":2,"60":5},"minor|5|minor|6|major":{"12":2,"24":1},"minor|6|major|2|major":{"12":2,"47":1,"55":1},"other|2|diminished_family|10|other":{"30":5},"diminished_family|10|other|5|major":{"42":6},"major|0|other|2|diminished_family":{"31":2,"65":1},"major|4|minor|3|dominant":{"30":9},"minor|3|dominant|5|major":{"1":9,"5":2,"14":3,"30":3,"42":8,"44":1,"56":3,"67":4},"minor|7|major|9|minor":{"30":4,"31":7,"34":5,"48":1},"suspended|0|dominant|5|suspended":{"0":3,"2":5,"30":6},"dominant|5|suspended|5|major":{"34":2,"55":4,"60":5},"minor|5|suspended|5|other":{"15":3},"suspended|5|other|2|diminished_family":{"65":3},"major|2|dominant|9|minor":{"20":2,"22":2,"32":1,"34":1},"dominant|9|minor|5|dominant":{"31":14,"48":6,"62":4},"minor|0|major|7|major":{"42":6,"55":1},"dominant|0|major|9|minor":{"31":6,"48":2,"62":1,"69":1},"minor|11|diminished_family|11|minor":{"4":1,"32":1,"60":1},"major|1|major|2|minor":{"3":1,"27":4,"32":2},"major|2|minor|4|diminished_family":{"8":4},"minor|4|diminished_family|1|dominant":{"43":4},"diminished_family|1|dominant|7|minor":{"18":2,"32":2},"major|4|minor|5|dominant":{"18":4,"31":1,"32":4,"34":1},"minor|5|dominant|5|suspended":{"0":3,"2":9,"13":3,"30":5,"43":1},"suspended|0|dominant|5|dominant":{"30":1,"44":4},"dominant|5|major|11|major":{"2":5,"6":4,"66":2},"minor|5|minor|10|dominant":{"13":3,"36":1},"dominant|7|minor|3|major":{"14":3,"30":5,"42":2},"minor|3|major|2|dominant":{"0":2,"13":1,"18":1,"30":14,"43":2,"56":17},"major|7|major|0|suspended":{"0":15,"2":2,"30":6,"55":1},"major|11|major|5|minor":{"13":2,"18":18,"30":3,"31":1,"48":7,"60":18},"minor|10|major|0|dominant":{"0":2,"30":8,"32":3},"major|8|major|11|major":{"31":4,"60":4},"major|5|major|5|minor":{"0":2,"18":4,"30":3,"42":8,"43":2},"minor|5|dominant|2|major":{"25":2,"31":1,"48":2,"55":5},"major|0|dominant|9|major":{"48":4},"dominant|9|major|8|major":{"24":4},"major|4|major|3|major":{"30":1,"42":1,"60":4},"minor|10|dominant|7|minor":{"31":1,"43":1,"47":1,"60":2},"dominant|7|minor|10|major":{"13":3,"30":4,"71":1},"major|5|major|1|diminished_family":{"6":1,"10":1,"36":1,"49":2},"minor|3|major|11|dominant":{"31":20},"minor|0|other|3|other":{"17":4,"35":1,"59":3},"dominant|5|minor|9|dominant":{"66":3},"minor|9|dominant|11|major":{"38":3},"dominant|11|major|6|dominant":{"6":3},"major|6|dominant|1|major":{"32":3},"dominant|1|major|5|dominant":{"42":3},"major|5|dominant|7|major":{"2":1,"13":1,"14":2,"30":3,"32":34,"34":2,"42":3,"44":30,"47":1,"56":5,"68":1},"dominant|7|major|5|dominant":{"12":2,"30":8,"39":3,"42":46},"major|5|dominant|6|diminished_family":{"32":3},"dominant|6|diminished_family|5|dominant":{"1":2,"6":1,"45":1,"61":1},"minor|5|dominant|11|dominant":{"30":2,"68":1},"dominant|11|dominant|11|dominant":{"54":2,"67":4,"68":1,"69":1},"diminished_family|5|dominant|5|dominant":{"0":1,"4":1,"68":1},"other|8|other|9|major":{"42":3},"other|9|major|7|major":{"42":3},"major|10|major|7|other":{"2":1,"30":2,"53":1,"65":2},"minor|5|major|5|other":{"42":2,"53":1},"other|2|other|5|minor":{"18":1,"43":2},"other|5|minor|3|major":{"12":1,"71":3},"major|3|major|4|minor":{"6":1,"18":6,"22":5,"30":5,"31":6,"42":1,"60":2},"major|5|minor|7|minor":{"6":4,"31":4,"44":2},"major|4|minor|7|major":{"31":1,"42":4,"48":6},"major|9|major|2|minor":{"6":1,"18":1,"60":1},"major|7|minor|0|major":{"14":1,"30":5,"60":2},"major|11|suspended|0|dominant":{"4":1,"6":2,"30":1,"31":19,"49":1,"54":1,"61":1},"suspended|9|major|3|suspended":{"54":4},"major|3|suspended|9|major":{"30":2,"34":2},"minor|8|major|9|dominant":{"18":3,"30":2,"47":1,"60":5},"major|9|dominant|10|major":{"12":1,"13":4,"42":3,"44":5,"48":5,"55":7,"56":8},"major|9|dominant|3|major":{"24":2,"30":2,"42":11,"56":1},"dominant|3|major|7|major":{"13":6,"30":5,"42":4,"60":2,"66":1},"minor|5|minor|1|major":{"42":2,"58":3,"67":1},"minor|1|major|9|suspended":{"2":3,"13":3,"30":3},"suspended|5|major|4|minor":{"6":6,"31":3,"60":1,"62":1},"minor|3|major|0|suspended":{"30":3},"minor|8|major|3|major":{"16":3,"68":4,"70":15},"major|3|major|11|dominant":{"30":1,"60":4},"major|11|dominant|10|major":{"56":4},"dominant|10|major|9|dominant":{"31":1,"32":4,"33":3,"60":5},"dominant|10|major|8|major":{"68":5},"major|8|major|11|dominant":{"30":11},"major|11|dominant|5|major":{"14":1,"18":1,"30":2,"31":2,"48":5,"55":1},"dominant|5|major|3|major":{"12":4,"14":3,"18":1,"42":1},"dominant|5|major|8|major":{"13":1,"30":1,"55":1,"68":5},"minor|7|minor|11|other":{"67":4},"minor|11|other|11|minor":{"43":4},"other|11|minor|7|minor":{"31":2,"43":1,"71":1},"minor|7|minor|5|other":{"65":3},"minor|5|other|10|other":{"17":1,"42":7,"47":1,"65":3},"other|11|other|11|minor":{"31":2,"43":1},"minor|8|major|0|suspended":{"0":2,"42":3},"major|0|suspended|7|major":{"60":3},"suspended|7|major|10|major":{"12":2,"42":3,"46":6},"dominant|5|major|4|dominant":{"6":5,"30":1,"31":14,"32":5},"major|4|minor|8|dominant":{"25":3,"30":5},"dominant|5|major|9|major":{"1":3,"31":4,"44":1,"48":9,"60":1},"major|7|dominant|5|minor":{"30":1,"57":2},"major|0|dominant|5|dominant":{"0":3,"9":2,"12":1,"14":12,"30":1,"42":5,"44":1,"56":2},"dominant|2|major|5|major":{"2":1,"13":2,"42":1},"dominant|7|minor|7|dominant":{"18":2,"62":7},"minor|7|dominant|10|dominant":{"30":4,"43":7},"dominant|10|dominant|7|minor":{"32":6},"minor|5|dominant|4|diminished_family":{"6":2,"68":1},"major|0|diminished_family|7|dominant":{"30":2,"32":1},"dominant|10|dominant|7|major":{"2":1,"3":2,"30":11,"32":11,"42":1,"44":4},"dominant|5|dominant|9|dominant":{"20":3,"32":1,"60":2,"62":3},"dominant|9|dominant|5|dominant":{"30":1,"32":6},"dominant|7|dominant|0|major":{"30":4,"44":1,"60":2},"dominant|0|major|7|dominant":{"30":5,"32":1},"dominant|7|dominant|7|major":{"2":1,"42":2},"dominant|10|dominant|2|dominant":{"0":1,"4":3,"32":1,"62":11},"dominant|2|dominant|10|dominant":{"14":2,"42":2,"44":11},"dominant|3|major|2|major":{"30":2,"42":3,"44":48},"major|7|dominant|3|major":{"12":41,"25":1,"67":1},"other|5|major|5|major":{"9":1,"12":2,"16":3,"42":4,"44":3},"major|7|major|1|dominant":{"12":3},"major|1|dominant|2|major":{"43":3},"dominant|2|major|7|minor":{"13":9},"minor|2|minor|0|other":{"6":1,"30":2},"minor|0|other|5|major":{"12":2,"30":1,"64":1},"suspended|10|major|5|major":{"42":4},"major|2|major|8|dominant":{"12":6},"major|8|dominant|2|major":{"43":6},"major|4|major|5|minor":{"0":1,"9":1,"32":5,"42":4,"47":1,"48":2,"60":3},"minor|10|minor|5|dominant":{"13":4,"30":53,"60":2},"major|9|major|0|minor":{"32":3},"major|0|minor|5|dominant":{"12":5,"30":3,"43":1},"minor|5|dominant|10|major":{"12":6,"30":6,"42":17},"dominant|2|minor|5|minor":{"18":4,"31":2,"32":1},"dominant|2|minor|7|major":{"31":1,"61":5},"minor|5|dominant|3|major":{"9":1,"12":2,"16":5,"25":2,"42":1},"dominant|3|major|4|minor":{"31":1,"48":2},"minor|5|minor|2|major":{"18":1,"31":3,"48":1,"60":2},"major|10|major|11|other":{"35":1,"61":4},"major|11|other|10|minor":{"30":4,"31":1},"other|10|minor|5|major":{"43":4},"major|4|minor|11|minor":{"67":21},"minor|11|minor|11|minor":{"18":2,"32":16,"66":3},"minor|11|minor|5|dominant":{"30":13,"60":3},"minor|7|minor|5|dominant":{"30":1,"34":5,"43":1},"major|0|other|5|major":{"1":5,"13":2,"26":3,"32":1,"42":7,"47":16,"67":2},"other|5|major|0|minor":{"42":5},"minor|10|major|0|other":{"30":4},"major|4|dominant|5|dominant":{"32":4,"48":6},"dominant|5|dominant|0|minor":{"30":2,"32":10,"44":1},"dominant|5|major|0|other":{"0":2,"30":9},"major|0|dominant|9|dominant":{"32":4},"dominant|5|dominant|10|major":{"9":2,"12":1,"42":4,"55":1},"dominant|2|dominant|5|dominant":{"32":9,"44":1},"other|0|major|2|minor":{"3":1,"30":3,"48":4,"60":2},"other|1|other|7|other":{"12":2,"25":1},"major|7|other|1|other":{"11":2,"47":1,"71":1},"major|0|minor|7|minor":{"6":3,"30":8,"60":34},"other|1|major|11|other":{"6":2,"11":5,"23":1,"42":1},"major|11|minor|5|minor":{"4":1,"18":2,"31":32,"32":6,"34":2,"35":1,"43":16,"48":46,"60":1,"64":1},"minor|10|major|4|suspended":{"2":4},"major|8|major|9|minor":{"12":2,"31":1,"32":2,"48":1,"60":6},"major|11|minor|11|major":{"7":1,"42":1,"55":1,"66":6},"major|7|major|10|dominant":{"42":19,"68":2},"major|10|dominant|7|major":{"2":1,"30":2,"32":3,"34":5,"42":8},"dominant|7|major|5|major":{"2":3,"12":1,"30":5,"42":9,"67":2},"dominant|5|dominant|7|major":{"2":2,"13":1,"32":2,"44":2},"major|7|dominant|10|dominant":{"42":24},"minor|5|minor|2|suspended":{"0":17,"31":2},"dominant|4|dominant|5|minor":{"20":2,"48":4},"major|2|major|5|dominant":{"26":3,"28":1,"50":1},"major|5|dominant|4|dominant":{"31":3},"suspended|0|major|1|major":{"12":6,"14":3,"42":2,"55":1},"minor|10|minor|2|suspended":{"0":5,"2":3},"minor|2|suspended|0|dominant":{"31":5,"52":2},"dominant|5|major|6|diminished_family":{"32":5},"major|6|diminished_family|5|dominant":{"31":3,"34":5},"diminished_family|5|dominant|5|suspended":{"0":1,"2":5,"31":6},"suspended|0|dominant|8|major":{"42":6,"67":3},"dominant|8|major|7|major":{"13":2,"30":1,"42":12,"43":1,"55":3,"58":4},"major|2|dominant|2|minor":{"0":1,"31":2,"48":14,"60":4},"major|0|dominant|2|major":{"1":1,"30":2},"major|0|minor|0|diminished_family":{"60":5},"minor|0|diminished_family|10|major":{"6":1,"12":3,"13":14},"major|2|minor|0|diminished_family":{"1":4,"21":10,"43":2,"60":14},"diminished_family|10|major|2|major":{"1":3},"minor|5|dominant|9|minor":{"18":3,"31":20,"32":7,"37":1,"61":6},"dominant|9|minor|5|minor":{"20":3,"22":1,"31":14,"32":2,"43":1,"60":1,"62":3},"suspended|5|major|11|suspended":{"32":4},"major|11|suspended|5|dominant":{"31":5},"suspended|5|dominant|5|minor":{"32":1,"61":4},"dominant|5|minor|10|minor":{"30":4,"32":12,"60":1},"minor|3|suspended|5|major":{"13":1,"30":2,"42":1,"55":1,"67":1,"70":2},"suspended|5|major|9|suspended":{"1":6,"71":1},"suspended|0|dominant|9|minor":{"32":6},"minor|5|major|0|dominant":{"30":5,"55":6},"major|0|dominant|9|minor":{"32":6,"33":4,"60":2},"minor|8|suspended|0|major":{"16":2,"42":1},"dominant|5|major|9|suspended":{"1":1,"2":4},"major|10|major|4|dominant":{"30":1,"31":8},"minor|10|minor|1|minor":{"7":2,"18":1},"major|5|minor|4|minor":{"57":3},"minor|4|minor|9|diminished_family":{"32":1,"36":3},"minor|9|diminished_family|6|major":{"56":2,"58":1},"dominant|5|minor|7|minor":{"6":4,"30":2,"31":7},"major|9|dominant|8|minor":{"42":3},"dominant|8|minor|7|major":{"31":3},"major|2|dominant|0|minor":{"30":4,"32":3},"diminished_family|6|major|7|dominant":{"30":1,"32":3,"60":3},"other|0|major|9|minor":{"18":1,"48":1,"52":10,"60":1},"dominant|5|major|0|suspended":{"0":12,"2":2},"suspended|0|major|9|minor":{"18":1,"31":5,"43":5,"48":15,"60":9,"61":1,"64":9},"major|10|major|11|suspended":{"0":16,"31":1},"major|7|major|8|major":{"12":14,"25":1,"42":5,"54":4,"58":1,"66":4,"70":1},"other|2|other|0|major":{"4":1,"13":4,"30":1,"31":1,"35":7},"major|2|major|0|other":{"17":3,"18":10,"42":2,"65":1},"major|0|other|2|other":{"53":3},"other|7|other|3|other":{"17":77,"35":23,"42":1,"47":1},"other|2|other|7|other":{"0":1,"23":61,"35":11,"48":3},"other|9|other|10|other":{"13":1,"17":2,"47":2},"major|2|dominant|1|major":{"42":4},"dominant|5|minor|8|dominant":{"68":13},"minor|8|dominant|11|dominant":{"31":13,"68":2},"minor|10|major|5|suspended":{"0":3},"major|5|dominant|10|major":{"67":3},"dominant|10|major|11|minor":{"61":4},"major|2|major|9|major":{"31":15},"other|3|other|7|other":{"7":1,"17":6,"47":1,"48":1},"suspended|5|major|10|major":{"12":2,"30":3,"37":5,"42":5,"55":12},"major|2|dominant|7|minor":{"18":6,"30":1,"32":2,"43":1,"60":1},"major|10|major|6|minor":{"32":5},"major|6|minor|5|dominant":{"31":5},"minor|5|dominant|2|dominant":{"31":3,"32":1},"major|2|dominant|0|major":{"12":1,"13":3,"14":3,"30":2,"43":1},"major|7|dominant|0|major":{"13":2,"18":32,"30":4,"55":1},"dominant|0|major|3|major":{"12":33,"42":1},"major|7|dominant|7|major":{"30":1,"32":9},"major|0|dominant|10|suspended":{"67":3},"dominant|10|suspended|11|minor":{"20":2,"66":5},"suspended|11|minor|11|major":{"16":5},"minor|11|major|2|suspended":{"12":5},"major|2|suspended|2|major":{"42":2,"55":2,"56":1},"major|7|major|3|diminished_family":{"67":10},"minor|10|major|7|dominant":{"5":1,"30":11,"46":1,"60":1},"dominant|0|other|5|major":{"30":2,"32":1,"44":1,"55":1},"other|5|major|9|minor":{"18":1,"48":1,"60":1},"major|7|dominant|7|minor":{"30":1,"32":6,"44":2},"other|0|major|0|dominant":{"23":1,"30":3},"minor|2|minor|5|major":{"18":2,"30":1,"55":3},"major|2|major|3|other":{"11":2,"42":1,"54":2},"minor|11|major|1|minor":{"6":1,"66":6},"minor|11|major|9|minor":{"12":2,"48":1},"major|10|suspended|0|major":{"12":2,"25":1,"42":1,"64":3,"70":3},"major|2|major|10|suspended":{"0":2,"42":1},"major|9|minor|10|minor":{"13":3,"18":3,"32":3,"60":5},"diminished_family|1|major|5|major":{"30":1,"42":1,"55":1},"major|2|major|3|dominant":{"67":4},"major|3|dominant|11|minor":{"31":2,"32":2},"other|7|major|1|major":{"42":10,"54":10},"major|11|minor|0|other":{"42":10},"minor|0|other|7|major":{"6":11},"major|9|major|9|major":{"30":10},"major|5|major|5|other":{"12":1,"35":5,"42":6,"65":7},"major|5|other|7|major":{"6":6,"18":2,"30":16,"35":23},"major|0|minor|3|major":{"12":5,"55":1,"67":1},"minor|7|minor|2|major":{"30":4},"minor|5|suspended|2|major":{"2":1,"60":2},"other|0|dominant|5|dominant":{"44":3},"minor|5|major|4|minor":{"31":1,"50":3},"minor|8|dominant|4|minor":{"31":3,"50":9},"dominant|4|minor|8|dominant":{"25":6,"43":3,"44":1,"56":1},"minor|8|dominant|7|minor":{"30":3},"major|0|minor|10|major":{"1":1,"13":12,"42":1,"60":2},"major|9|minor|10|suspended":{"0":18,"30":2,"60":3},"minor|10|suspended|10|major":{"30":2,"32":1,"46":2,"55":6},"suspended|10|major|9|minor":{"18":3,"43":1,"65":2},"major|9|minor|8|suspended":{"0":1,"42":2,"47":8},"major|7|suspended|2|minor":{"5":3,"18":1,"30":3,"43":1,"44":1,"48":23,"52":1,"60":3,"64":1},"major|2|suspended|9|dominant":{"31":4},"suspended|9|dominant|5|minor":{"31":3,"60":1,"62":1,"64":3},"dominant|5|minor|10|suspended":{"13":3,"34":6},"dominant|5|minor|10|dominant":{"30":1,"62":3},"dominant|5|minor|1|minor":{"44":2,"67":1},"major|2|minor|7|dominant":{"6":7,"30":1,"31":1},"minor|7|dominant|5|major":{"13":1,"31":1,"42":1},"major|2|minor|0|major":{"1":2,"13":1,"60":1},"other|0|dominant|7|dominant":{"32":3},"major|2|minor|0|dominant":{"34":6,"48":1},"major|7|dominant|7|dominant":{"0":3,"1":7,"60":2},"major|10|major|9|dominant":{"30":2,"31":1,"34":1},"major|5|suspended|7|major":{"30":2,"42":1,"55":5},"suspended|7|major|9|minor":{"6":5},"minor|1|major|4|suspended":{"2":4},"suspended|0|dominant|3|major":{"16":3,"42":2},"dominant|3|major|2|suspended":{"0":7,"18":1},"minor|1|major|9|major":{"13":1,"42":1,"60":1},"major|4|minor|5|suspended":{"0":1,"2":6},"other|5|other|2|major":{"5":3,"30":1},"major|7|suspended|10|dominant":{"32":2,"42":2},"major|7|major|5|dominant":{"0":2,"12":2,"14":4,"18":4,"30":12,"32":2},"major|5|dominant|2|major":{"9":1,"25":1,"30":1,"60":4},"dominant|2|major|10|major":{"12":4},"major|10|major|7|suspended":{"0":5,"2":1,"5":1,"12":2,"13":7,"30":8,"42":6},"major|7|suspended|0|other":{"0":1,"30":5},"minor|7|dominant|1|major":{"18":2,"25":2,"42":7,"55":1},"minor|5|minor|7|dominant":{"6":1,"31":3},"minor|2|major|10|major":{"12":3},"suspended|7|major|5|major":{"16":2,"30":1,"42":1},"major|5|dominant|2|dominant":{"0":1,"16":2,"30":6,"35":2},"other|0|major|5|major":{"12":4,"16":1,"30":1,"42":7},"dominant|2|dominant|5|major":{"2":5,"25":2,"30":1,"32":5,"44":7,"55":1},"dominant|0|major|10|major":{"12":3,"25":1,"42":3},"minor|7|minor|3|suspended":{"0":8,"2":8,"17":12,"35":2,"55":1},"minor|3|suspended|0|major":{"4":7,"30":4,"42":2},"minor|3|suspended|0|dominant":{"30":10},"minor|7|minor|3|dominant":{"13":14,"48":8},"minor|3|dominant|8|major":{"42":8},"major|7|major|9|suspended":{"0":4,"30":3},"major|9|suspended|0|major":{"4":1,"30":4,"48":1,"60":1},"major|9|suspended|5|major":{"1":3,"30":1,"55":3},"minor|2|minor|5|dominant":{"1":1,"5":5,"31":22},"suspended|0|major|10|suspended":{"0":7,"24":1},"suspended|0|major|11|suspended":{"30":3},"major|11|suspended|5|major":{"55":14,"60":3},"major|0|suspended|0|dominant":{"4":2,"14":2},"suspended|0|dominant|0|suspended":{"2":11,"30":2},"dominant|11|suspended|0|dominant":{"30":1,"31":2},"major|5|dominant|0|major":{"2":1,"25":2,"60":1},"other|8|other|7|other":{"47":4},"other|8|other|7|major":{"13":1,"42":2},"major|10|major|5|dominant":{"14":2,"55":1},"suspended|0|minor|0|dominant":{"31":2,"49":1},"minor|0|dominant|5|minor":{"13":3,"30":2,"32":4,"60":3,"61":5},"other|7|other|8|major":{"12":3,"32":1},"major|11|dominant|5|suspended":{"0":1,"2":2},"major|2|suspended|0|minor":{"2":1,"42":3},"dominant|2|minor|10|dominant":{"30":4,"60":8},"minor|9|diminished_family|5|dominant":{"6":3,"31":10,"34":1,"61":2,"63":1,"64":1},"major|0|dominant|2|minor":{"32":1,"44":1,"62":4},"dominant|5|minor|2|minor":{"6":8,"32":22,"61":2},"minor|7|dominant|3|major":{"44":4,"68":1},"dominant|3|major|7|dominant":{"18":2,"43":2},"dominant|5|dominant|0|major":{"2":3,"13":1,"14":3,"30":5,"42":2,"44":2,"55":1,"56":2},"other|10|other|7|suspended":{"47":7,"55":5},"other|7|suspended|7|other":{"65":7},"suspended|7|other|10|other":{"17":10},"other|7|suspended|9|minor":{"22":5},"suspended|9|minor|3|suspended":{"47":2,"55":3},"minor|3|suspended|9|minor":{"35":1,"65":3},"suspended|9|minor|10|other":{"65":3},"minor|10|other|10|other":{"17":3},"major|7|suspended|0|dominant":{"4":1,"30":5,"43":6,"60":1},"major|0|other|5|other":{"17":4,"47":2},"minor|8|minor|7|major":{"39":3,"44":2},"minor|7|minor|10|other":{"29":3,"43":1},"other|7|minor|7|minor":{"8":1,"18":2,"65":1},"minor|10|other|4|other":{"65":3},"other|4|other|10|other":{"65":3},"dominant|0|major|7|major":{"30":3,"42":1,"60":3,"61":3},"dominant|5|major|5|minor":{"14":2,"18":20,"30":2,"32":1,"42":7,"43":2},"major|3|major|2|dominant":{"42":15},"major|2|dominant|7|major":{"1":2,"18":13},"dominant|7|major|3|major":{"14":13},"dominant|10|major|5|major":{"42":10},"other|7|major|2|minor":{"35":5,"60":6},"major|5|major|6|major":{"31":3},"major|6|major|5|minor":{"31":3},"major|9|minor|3|suspended":{"30":2,"43":2},"minor|3|suspended|7|minor":{"16":5,"43":2},"minor|5|dominant|10|dominant":{"55":4,"68":4},"dominant|10|dominant|11|dominant":{"31":7,"68":4},"dominant|11|dominant|11|minor":{"14":1,"32":3},"major|2|dominant|5|minor":{"30":17,"31":2},"major|6|major|4|minor":{"48":3},"dominant|10|suspended|2|dominant":{"64":8},"suspended|2|dominant|10|suspended":{"14":5,"44":3},"dominant|10|suspended|7|dominant":{"44":6},"suspended|7|dominant|7|dominant":{"64":6},"dominant|7|dominant|10|suspended":{"14":2,"44":3,"56":3},"dominant|10|suspended|9|dominant":{"62":3},"suspended|9|dominant|10|dominant":{"44":3},"major|4|major|7|major":{"13":2,"30":5},"dominant|0|minor|2|minor":{"6":1,"48":1,"61":2},"major|9|minor|7|other":{"31":1,"32":3,"44":1},"dominant|5|major|8|dominant":{"30":3,"37":1,"44":1},"major|2|minor|10|suspended":{"0":3},"dominant|0|major|2|minor":{"6":3,"30":1,"60":3},"minor|5|major|0|suspended":{"0":8},"major|9|diminished_family|3|diminished_family":{"13":3},"diminished_family|3|diminished_family|2|minor":{"30":3},"diminished_family|2|minor|5|major":{"2":3},"dominant|2|major|4|minor":{"32":3},"major|3|diminished_family|4|dominant":{"30":4},"diminished_family|4|dominant|5|major":{"14":7},"dominant|5|major|3|diminished_family":{"26":3,"67":6},"dominant|1|dominant|5|dominant":{"20":2,"30":1},"minor|0|diminished_family|3|diminished_family":{"42":10},"diminished_family|3|diminished_family|7|major":{"25":10},"diminished_family|7|major|4|minor":{"61":10},"minor|10|minor|3|minor":{"42":13},"other|5|major|2|minor":{"3":2,"35":2},"dominant|7|major|5|suspended":{"0":7},"suspended|0|dominant|0|other":{"60":3},"dominant|0|other|10|major":{"25":1,"67":3},"other|10|major|11|minor":{"18":3},"minor|5|suspended|5|suspended":{"0":3},"suspended|5|suspended|0|major":{"4":2,"25":3,"30":1,"55":9,"60":1},"major|3|major|1|diminished_family":{"20":3,"32":6},"major|1|diminished_family|3|dominant":{"20":3},"diminished_family|3|dominant|3|dominant":{"25":3},"dominant|3|dominant|4|minor":{"32":1,"43":2},"major|1|diminished_family|5|dominant":{"31":6},"minor|10|suspended|5|suspended":{"0":7,"30":2},"dominant|4|minor|5|dominant":{"27":1,"30":1,"68":2},"minor|3|dominant|2|dominant":{"20":3,"43":6},"dominant|2|dominant|7|minor":{"20":6},"dominant|7|minor|3|dominant":{"14":6},"dominant|2|dominant|3|dominant":{"14":3,"32":4,"44":1},"dominant|3|dominant|2|dominant":{"13":3},"dominant|2|minor|5|major":{"30":2,"43":1},"suspended|5|minor|8|major":{"25":2,"55":1,"66":1},"major|7|major|1|other":{"0":1,"11":2},"dominant|9|dominant|3|dominant":{"56":17},"dominant|3|dominant|9|dominant":{"20":13,"62":3},"dominant|9|dominant|10|dominant":{"32":3,"44":3},"dominant|10|dominant|5|dominant":{"56":3},"dominant|0|major|8|major":{"24":13,"54":1},"major|4|major|0|dominant":{"0":12},"major|8|major|9|major":{"17":4,"18":1,"30":1,"42":4,"55":1},"suspended|5|minor|10|major":{"25":6,"60":1},"suspended|0|major|0|minor":{"31":1,"32":1,"43":2,"50":1},"minor|2|minor|7|minor":{"6":4},"diminished_family|6|major|0|dominant":{"30":2,"32":1},"major|1|diminished_family|1|major":{"2":2,"30":1,"56":1,"60":1},"diminished_family|5|dominant|10|minor":{"30":1,"60":2},"minor|2|minor|10|major":{"1":20},"major|9|suspended|2|minor":{"6":3},"suspended|0|major|10|dominant":{"17":3,"60":1},"major|10|dominant|2|other":{"6":3},"dominant|2|other|1|major":{"70":3},"other|1|major|11|suspended":{"0":3},"major|1|major|2|dominant":{"13":3},"dominant|7|minor|7|minor":{"0":1,"48":1,"62":1},"other|5|other|5|minor":{"0":1,"18":3},"minor|3|major|11|other":{"35":3},"dominant|7|major|9|dominant":{"32":5},"other|7|other|3|major":{"17":1,"42":3},"other|5|other|10|other":{"17":5,"47":1},"major|2|major|1|diminished_family":{"7":5},"major|9|minor|2|dominant":{"6":2,"30":4,"32":2,"48":3},"minor|2|dominant|8|major":{"30":2,"42":1,"56":1},"major|9|dominant|8|major":{"32":5},"major|5|dominant|1|dominant":{"6":1,"25":2,"50":2},"dominant|11|dominant|5|major":{"2":3,"13":1,"32":1,"43":3,"56":1},"minor|1|major|10|major":{"25":3,"48":7,"67":4},"diminished_family|6|major|5|major":{"42":3},"diminished_family|1|minor|5|dominant":{"0":1,"32":2},"minor|8|major|0|minor":{"25":3,"42":1},"minor|7|suspended|5|minor":{"46":6,"48":1},"suspended|5|minor|7|suspended":{"31":4,"48":2},"other|2|other|5|major":{"25":3,"30":3,"42":2},"minor|1|major|4|dominant":{"31":3},"minor|3|minor|11|dominant":{"48":3},"minor|11|dominant|8|major":{"60":3},"dominant|8|major|10|major":{"30":3},"suspended|0|minor|7|suspended":{"31":1,"34":12},"minor|1|major|11|major":{"30":4,"52":1},"other|5|other|9|major":{"30":11},"major|5|other|10|other":{"17":7,"47":10},"minor|1|major|4|major":{"30":1,"31":3,"55":1},"minor|2|other|5|other":{"35":1,"47":4},"other|7|other|1|other":{"11":4},"other|1|other|7|minor":{"17":2,"60":2},"other|7|minor|10|major":{"13":5},"other|1|other|1|major":{"30":6},"other|1|major|5|major":{"30":1,"42":3,"60":2},"other|5|dominant|5|major":{"1":1,"30":4},"major|9|minor|7|dominant":{"30":1,"62":4},"dominant|10|dominant|5|major":{"55":4},"minor|7|other|5|dominant":{"30":3},"minor|11|minor|11|major":{"66":3},"minor|11|major|11|major":{"2":1,"5":1,"13":2,"21":1,"30":1,"43":1,"60":6},"major|11|major|2|minor":{"6":3,"32":1,"48":1,"66":2},"other|5|major|4|dominant":{"31":4},"major|11|major|0|dominant":{"30":1,"31":8,"61":5},"minor|2|minor|3|suspended":{"2":2,"16":3,"30":3,"56":1},"minor|3|dominant|7|minor":{"13":3},"dominant|7|minor|2|minor":{"6":1,"20":3},"minor|0|major|10|major":{"42":4},"major|7|dominant|2|dominant":{"20":4},"dominant|3|dominant|5|dominant":{"14":4},"dominant|2|dominant|3|major":{"2":3,"12":4},"dominant|7|dominant|2|dominant":{"18":3,"32":5},"dominant|5|dominant|3|major":{"12":2,"26":4},"diminished_family|5|dominant|5|major":{"13":1,"42":1,"44":2,"48":1},"minor|5|suspended|9|minor":{"6":3,"31":2},"other|2|other|2|minor":{"48":2,"60":1},"major|3|major|11|major":{"31":11,"66":9},"major|2|other|0|minor":{"48":2,"60":1},"major|7|minor|2|major":{"31":1,"48":2},"major|8|major|9|dominant":{"30":3},"minor|5|major|2|dominant":{"31":16,"48":2},"minor|11|minor|1|minor":{"30":2,"67":2},"minor|1|minor|11|minor":{"24":2,"42":1,"44":1},"major|4|minor|3|suspended":{"30":1,"43":5},"suspended|7|minor|2|suspended":{"29":1,"30":4},"minor|2|suspended|5|major":{"18":2,"25":2},"suspended|5|major|3|major":{"25":4},"minor|1|major|5|suspended":{"11":2,"12":2},"other|5|dominant|5|minor":{"32":6},"major|5|dominant|1|other":{"32":3},"dominant|1|other|5|dominant":{"31":3},"major|9|minor|2|other":{"31":12},"minor|2|other|5|minor":{"48":12},"other|5|minor|8|major":{"25":2,"55":12},"minor|7|minor|10|dominant":{"13":1,"32":3,"43":1},"major|5|minor|7|suspended":{"0":3},"minor|7|suspended|0|major":{"31":3},"other|3|other|5|other":{"55":2,"59":27},"other|5|other|9|other":{"47":26,"48":23,"52":1},"other|0|minor|0|other":{"1":6,"23":3},"minor|0|other|0|minor":{"5":6},"other|5|other|9|minor":{"47":2,"48":2},"minor|1|major|6|diminished_family":{"32":3},"major|9|dominant|5|diminished_family":{"32":3},"dominant|5|diminished_family|5|dominant":{"6":1,"30":2},"dominant|1|major|9|major":{"30":3},"minor|9|diminished_family|1|minor":{"19":2,"69":1},"major|7|minor|9|minor":{"32":4},"minor|9|minor|5|dominant":{"30":1,"31":4},"dominant|5|minor|11|major":{"42":4},"suspended|5|major|3|minor":{"25":1,"37":10},"major|3|minor|6|minor":{"60":10},"minor|6|minor|10|major":{"4":10},"minor|0|major|3|major":{"25":4,"55":2},"other|7|major|5|other":{"42":22,"60":1},"dominant|3|other|2|other":{"44":3},"other|2|other|7|dominant":{"0":1,"23":2},"major|7|major|10|minor":{"2":3},"major|10|minor|0|dominant":{"30":3},"diminished_family|1|minor|7|minor":{"13":5,"48":1,"61":1},"minor|1|major|7|suspended":{"0":7},"suspended|0|major|4|minor":{"6":6,"22":1,"48":1},"minor|8|major|7|suspended":{"0":10},"other|10|major|7|major":{"13":1,"43":1,"47":2},"minor|2|minor|8|suspended":{"2":3},"minor|8|suspended|0|dominant":{"30":3},"major|9|diminished_family|10|dominant":{"4":6},"diminished_family|10|dominant|0|suspended":{"16":3,"30":3},"suspended|5|major|9|diminished_family":{"62":3},"dominant|0|suspended|2|suspended":{"2":3},"suspended|2|suspended|0|dominant":{"34":3},"suspended|0|dominant|10|major":{"14":1,"42":4},"suspended|7|minor|5|suspended":{"0":3,"18":1,"30":1,"43":8},"major|7|suspended|7|major":{"34":1,"43":1,"60":6},"suspended|2|major|10|major":{"12":4,"42":2},"minor|1|major|11|suspended":{"0":4,"2":2},"minor|5|suspended|1|dominant":{"7":6},"suspended|1|dominant|1|minor":{"43":6},"dominant|1|minor|7|minor":{"61":5},"major|5|major|3|diminished_family":{"7":4},"major|3|diminished_family|1|minor":{"18":1,"43":7,"48":2},"major|2|dominant|3|dominant":{"44":3},"dominant|3|dominant|7|dominant":{"14":4},"dominant|3|major|0|dominant":{"56":3},"minor|10|minor|2|dominant":{"31":16},"major|2|major|10|diminished_family":{"25":3},"major|10|diminished_family|4|minor":{"31":1,"48":2},"diminished_family|11|minor|5|suspended":{"30":4},"suspended|5|major|2|dominant":{"13":2,"60":1},"minor|5|minor|11|major":{"66":2,"70":4},"dominant|10|major|2|minor":{"13":1,"18":4},"dominant|10|minor|2|minor":{"13":2,"31":1,"61":5},"minor|2|minor|2|minor":{"7":1,"8":1,"31":9,"61":2},"minor|7|suspended|5|suspended":{"1":12},"suspended|5|suspended|0|minor":{"36":6,"46":6},"suspended|0|minor|6|major":{"60":6},"major|11|major|6|major":{"16":20},"major|6|major|2|suspended":{"36":17,"42":3},"major|2|suspended|6|major":{"66":16,"71":1},"suspended|6|major|11|major":{"66":16},"major|2|suspended|7|major":{"44":3},"suspended|7|major|7|dominant":{"30":3},"dominant|5|major|4|suspended":{"32":3},"major|4|suspended|5|dominant":{"30":3},"dominant|5|major|1|suspended":{"30":3},"major|1|suspended|5|major":{"5":3},"suspended|5|major|0|other":{"35":3},"major|10|major|4|other":{"1":3},"major|4|other|0|minor":{"43":1,"60":2},"major|8|major|4|minor":{"6":2,"48":1,"60":2},"minor|2|major|8|major":{"42":2,"54":1},"diminished_family|10|major|0|dominant":{"30":2,"55":3},"minor|0|diminished_family|0|minor":{"34":1,"60":3},"diminished_family|0|minor|10|major":{"13":2,"55":1},"suspended|0|dominant|7|minor":{"18":2,"30":3,"34":3,"60":3},"dominant|7|minor|5|suspended":{"2":3},"major|2|minor|3|suspended":{"0":5},"dominant|0|major|9|dominant":{"32":3},"major|1|major|10|major":{"42":3},"major|5|major|9|suspended":{"2":1,"17":5,"46":1},"other|9|other|8|major":{"12":1,"17":22,"59":1},"major|2|suspended|10|suspended":{"16":4,"47":1},"suspended|7|other|0|major":{"55":10},"minor|8|suspended|7|other":{"0":8},"major|2|suspended|5|suspended":{"0":4},"suspended|0|major|4|dominant":{"6":1,"30":2},"minor|7|major|2|dominant":{"1":4,"32":6},"diminished_family|6|dominant|5|major":{"31":3,"44":2},"major|7|dominant|9|minor":{"31":1,"32":2},"major|4|minor|3|minor":{"12":3},"minor|3|minor|2|major":{"2":3},"minor|9|minor|5|major":{"30":5,"55":1},"dominant|5|minor|3|dominant":{"13":2,"30":17,"39":4,"42":1},"minor|3|dominant|2|minor":{"32":3,"43":17},"dominant|2|minor|5|dominant":{"30":4,"34":3,"55":4},"minor|5|minor|3|dominant":{"13":1,"14":1,"30":1,"70":1},"minor|2|minor|0|dominant":{"31":5},"major|3|other|9|major":{"23":6},"other|9|major|3|other":{"12":2,"54":4},"major|3|other|1|other":{"6":3,"36":1},"minor|0|dominant|5|suspended":{"2":3,"56":3},"dominant|5|suspended|9|dominant":{"31":3},"major|10|major|8|major":{"30":2,"31":3,"44":1},"major|5|minor|1|major":{"60":5},"major|8|major|5|minor":{"6":3},"major|9|minor|6|major":{"42":3},"major|5|major|9|other":{"16":3,"47":1},"other|3|other|11|other":{"23":2,"30":1,"35":2},"major|3|major|11|suspended":{"2":8,"30":14},"suspended|2|suspended|5|minor":{"13":6},"minor|3|suspended|2|suspended":{"31":3},"minor|1|major|11|dominant":{"31":8},"minor|3|major|3|major":{"12":2,"67":3},"dominant|8|major|11|minor":{"6":1,"31":2},"major|2|suspended|7|minor":{"13":2,"32":1},"dominant|9|dominant|5|major":{"31":19,"48":1},"major|11|minor|3|dominant":{"56":3},"minor|3|dominant|9|dominant":{"30":3},"major|2|dominant|9|dominant":{"30":15,"61":1},"minor|7|suspended|0|dominant":{"6":1,"31":4},"dominant|5|minor|7|suspended":{"2":3},"major|0|dominant|3|major":{"12":3,"60":1},"major|10|minor|5|major":{"30":7},"major|8|major|2|suspended":{"64":3},"suspended|10|suspended|2|suspended":{"30":1,"64":16},"suspended|2|suspended|10|suspended":{"12":2,"16":12,"17":1},"major|2|minor|7|major":{"18":3,"31":1},"dominant|3|major|4|dominant":{"44":4},"major|4|dominant|7|dominant":{"32":4},"dominant|10|minor|10|major":{"25":2,"30":2},"major|4|minor|10|suspended":{"18":2,"44":3,"57":6},"minor|10|suspended|9|diminished_family":{"32":6},"suspended|9|diminished_family|5|dominant":{"34":6},"dominant|5|suspended|5|minor":{"60":6},"minor|10|suspended|3|major":{"16":2,"58":1,"67":9},"suspended|5|major|5|suspended":{"0":9,"16":44,"25":3},"suspended|2|suspended|5|major":{"34":41,"55":2},"other|0|major|8|major":{"54":3},"major|9|major|2|other":{"0":2,"31":3,"53":1},"major|2|other|5|minor":{"23":3},"other|5|minor|3|other":{"17":4},"minor|3|other|2|other":{"1":1,"42":1,"43":14,"46":1,"47":1},"other|2|other|7|minor":{"5":1,"23":14,"32":1,"43":1},"other|7|minor|3|other":{"17":14},"major|2|other|8|other":{"17":2,"59":1},"other|7|suspended|5|major":{"47":10},"suspended|5|major|7|other":{"0":10},"other|0|major|3|major":{"17":10},"major|3|major|2|other":{"46":9,"65":2},"major|2|other|7|suspended":{"30":9},"other|0|major|0|other":{"0":2,"30":18},"other|0|suspended|0|minor":{"4":3,"43":15},"minor|3|suspended|2|other":{"4":12},"suspended|2|other|0|suspended":{"1":12},"major|2|other|0|suspended":{"1":3},"suspended|0|minor|0|suspended":{"0":2,"1":3},"minor|0|suspended|0|minor":{"60":3},"other|5|major|3|dominant":{"32":2,"54":1},"major|9|other|2|suspended":{"31":2,"65":1},"major|9|suspended|2|other":{"6":3,"31":2},"suspended|2|other|1|major":{"12":1,"68":2},"suspended|2|minor|3|major":{"30":5,"42":1,"55":3},"minor|10|major|4|major":{"11":6},"major|4|major|1|other":{"0":1,"55":5},"major|1|other|9|minor":{"60":5},"other|9|minor|10|major":{"13":1,"24":5},"other|11|other|1|other":{"17":1,"66":2,"71":27},"other|11|other|1|major":{"71":6},"major|11|other|1|other":{"66":1,"71":5},"other|11|other|3|other":{"17":2,"59":1},"other|9|other|2|other":{"0":1,"11":1,"65":1},"other|2|other|9|other":{"11":2,"48":1},"other|9|other|1|other":{"17":1,"71":3},"dominant|5|dominant|8|major":{"44":6},"dominant|8|major|7|dominant":{"30":6},"major|9|dominant|5|suspended":{"0":1,"2":2,"6":2,"32":2},"minor|3|major|9|other":{"35":29,"65":1},"major|9|other|5|other":{"60":29},"other|5|other|10|major":{"55":29},"other|10|major|9|minor":{"18":29},"suspended|10|major|11|minor":{"6":1,"31":1,"61":3},"major|11|minor|5|suspended":{"0":5},"other|10|other|7|major":{"13":7,"30":1},"dominant|2|minor|1|major":{"12":3},"other|10|other|9|other":{"11":1,"12":4,"23":1,"65":2},"other|10|other|5|other":{"17":1,"29":3,"47":6},"other|5|other|4|other":{"35":3},"other|4|other|5|other":{"47":1,"65":3},"dominant|3|major|5|major":{"55":3},"major|9|minor|4|diminished_family":{"7":3},"minor|4|diminished_family|1|minor":{"30":3},"diminished_family|1|minor|5|major":{"20":1,"30":2},"major|1|minor|11|major":{"7":4,"24":2},"major|3|major|2|minor":{"60":6},"minor|7|major|3|major":{"12":1,"13":2},"dominant|4|minor|5|minor":{"43":3},"minor|7|minor|8|dominant":{"25":2,"68":2},"minor|10|major|10|dominant":{"55":1,"68":5},"major|11|minor|3|minor":{"13":3},"minor|3|minor|2|minor":{"6":3},"major|5|dominant|3|major":{"42":4},"minor|4|minor|5|dominant":{"60":3},"minor|4|minor|8|major":{"25":3},"minor|10|major|7|other":{"43":3,"65":3},"major|7|other|7|minor":{"60":3},"other|10|other|9|minor":{"35":3},"other|9|minor|5|other":{"43":3},"minor|5|other|7|minor":{"35":3},"other|7|minor|5|other":{"47":3},"minor|5|other|7|other":{"35":4},"other|8|major|2|minor":{"30":1,"35":2},"minor|5|other|5|major":{"13":2,"42":6},"minor|7|dominant|10|minor":{"4":2,"43":6,"60":2},"dominant|10|major|7|dominant":{"30":5,"32":2},"major|11|major|11|dominant":{"32":4},"major|11|dominant|5|dominant":{"32":4},"diminished_family|11|diminished_family|11|diminished_family":{"44":1,"69":5},"dominant|7|major|2|dominant":{"32":2,"33":1},"minor|3|dominant|6|diminished_family":{"10":4},"dominant|6|diminished_family|1|suspended":{"30":4},"diminished_family|1|suspended|5|major":{"32":4},"suspended|5|major|5|dominant":{"42":4},"dominant|7|minor|10|suspended":{"13":2,"44":11},"major|2|suspended|5|minor":{"30":3},"major|11|dominant|8|dominant":{"44":3},"dominant|8|dominant|7|dominant":{"31":3},"dominant|7|dominant|5|minor":{"19":3},"dominant|7|dominant|0|minor":{"32":7},"major|5|minor|6|minor":{"31":1,"32":3},"minor|6|minor|5|dominant":{"31":3},"suspended|0|dominant|2|minor":{"32":6},"dominant|5|major|5|suspended":{"30":3},"major|5|suspended|4|minor":{"13":3},"suspended|4|minor|2|minor":{"6":3},"minor|1|major|3|diminished_family":{"7":6},"minor|7|minor|2|minor":{"32":5},"minor|5|dominant|0|other":{"31":5},"dominant|0|other|5|minor":{"31":5},"other|5|minor|5|minor":{"31":5},"minor|10|dominant|0|major":{"30":4,"60":1},"dominant|9|minor|3|dominant":{"0":1,"5":1,"55":11},"minor|3|dominant|9|minor":{"20":10},"dominant|10|dominant|9|minor":{"6":2,"32":2},"dominant|9|minor|10|minor":{"32":6},"major|0|dominant|10|minor":{"13":5},"dominant|9|minor|3|major":{"42":3},"minor|5|minor|2|diminished_family":{"32":4},"minor|2|diminished_family|5|dominant":{"31":4},"major|5|major|11|suspended":{"0":4,"2":1},"major|11|suspended|10|major":{"14":3},"suspended|10|major|2|dominant":{"30":3},"major|7|major|9|other":{"64":4},"major|9|other|10|suspended":{"0":4},"other|10|suspended|0|major":{"30":2,"42":2},"minor|7|major|7|suspended":{"0":1,"5":6},"suspended|0|other|5|major":{"26":1,"42":4},"minor|0|suspended|8|major":{"28":1,"70":7},"other|9|other|2|major":{"18":4},"other|2|major|3|major":{"13":2,"17":2},"other|0|major|5|minor":{"13":3},"other|0|major|5|other":{"53":1,"65":7},"minor|7|major|6|dominant":{"67":3},"major|6|dominant|11|minor":{"18":2,"60":1},"minor|1|major|2|minor":{"13":1,"60":3},"dominant|2|minor|7|minor":{"20":10,"61":3,"64":4},"dominant|5|major|1|major":{"32":3,"66":1,"68":1},"major|1|major|5|dominant":{"42":3},"major|11|minor|10|suspended":{"2":3,"18":6,"34":3,"60":6},"other|10|major|2|minor":{"60":3},"dominant|10|minor|5|suspended":{"2":3},"minor|10|suspended|0|dominant":{"30":1,"34":3},"minor|5|major|10|suspended":{"12":4,"42":1},"major|10|suspended|2|major":{"13":3},"suspended|2|major|2|minor":{"43":3},"minor|10|dominant|9|minor":{"31":3},"dominant|2|minor|8|minor":{"42":3},"minor|7|major|6|diminished_family":{"66":3},"major|6|diminished_family|11|major":{"67":3},"diminished_family|11|major|11|minor":{"31":3},"minor|7|minor|7|dominant":{"31":1,"61":8},"suspended|9|minor|1|major":{"67":3},"major|4|major|7|suspended":{"6":3},"major|7|suspended|1|major":{"12":7},"minor|10|dominant|10|dominant":{"68":8},"major|4|minor|0|suspended":{"18":3},"minor|0|suspended|3|major":{"42":3},"suspended|3|major|7|major":{"43":1,"60":3},"suspended|0|major|8|major":{"14":1,"30":5,"42":1},"other|7|other|7|major":{"13":3},"minor|7|minor|10|suspended":{"18":4},"suspended|3|major|11|minor":{"6":1,"61":4,"64":4},"minor|10|suspended|7|dominant":{"43":12,"47":1},"suspended|7|dominant|7|minor":{"48":1,"64":11},"major|5|dominant|1|diminished_family":{"8":1,"36":5},"dominant|1|diminished_family|6|major":{"2":1,"44":4},"minor|6|dominant|11|dominant":{"30":3},"minor|1|major|9|dominant":{"34":2,"60":4},"dominant|1|major|2|dominant":{"30":3},"minor|10|other|7|other":{"13":12,"17":1},"other|7|other|2|minor":{"18":11,"64":1},"other|2|minor|3|major":{"30":11},"dominant|2|dominant|0|suspended":{"2":3},"other|2|major|0|other":{"18":4},"major|0|other|3|major":{"42":14},"other|8|major|9|other":{"18":6},"major|9|other|3|major":{"47":6,"59":3},"other|3|major|4|other":{"23":1,"50":5},"major|4|other|8|dominant":{"29":1,"41":3},"other|8|dominant|6|other":{"48":3},"dominant|6|other|8|major":{"59":3},"major|0|suspended|4|minor":{"6":6},"suspended|4|minor|1|major":{"46":6},"dominant|10|minor|7|minor":{"31":1,"32":1,"44":4},"major|1|diminished_family|10|minor":{"15":3},"diminished_family|10|minor|2|diminished_family":{"38":3,"60":1},"minor|2|diminished_family|6|dominant":{"30":3},"suspended|8|major|11|suspended":{"2":7},"dominant|5|minor|0|suspended":{"48":4},"suspended|0|minor|7|major":{"9":3},"minor|7|major|1|diminished_family":{"71":3},"major|1|diminished_family|11|other":{"1":2,"48":1},"dominant|2|major|9|minor":{"18":5},"diminished_family|1|minor|3|major":{"30":8},"major|2|suspended|1|diminished_family":{"7":7},"suspended|1|diminished_family|1|minor":{"18":7},"dominant|9|minor|5|diminished_family":{"60":4},"minor|5|diminished_family|10|major":{"2":3,"42":1},"minor|2|dominant|10|minor":{"14":6},"dominant|10|minor|2|dominant":{"30":3,"31":3},"major|2|dominant|6|major":{"55":3},"dominant|6|major|9|minor":{"48":3},"minor|7|major|10|minor":{"30":5},"major|5|dominant|9|minor":{"18":1,"30":2},"minor|1|minor|1|minor":{"6":3},"minor|1|minor|1|major":{"12":3},"major|2|minor|1|minor":{"7":1,"13":3},"major|7|dominant|9|major":{"31":4},"dominant|9|major|5|minor":{"48":4},"dominant|0|major|4|minor":{"31":3},"other|2|major|5|other":{"42":4},"major|7|major|10|other":{"12":3},"major|2|minor|9|diminished_family":{"32":3},"major|7|dominant|5|other":{"23":3},"dominant|5|other|3|other":{"17":3},"other|3|major|9|other":{"1":3,"18":3},"major|9|other|0|minor":{"20":2,"30":1},"dominant|0|major|2|dominant":{"0":6},"other|3|major|2|other":{"13":7,"18":4,"47":1},"major|2|other|2|minor":{"35":7},"other|2|minor|5|other":{"18":7},"minor|1|minor|2|minor":{"55":3},"minor|2|minor|9|minor":{"30":3},"major|9|major|7|minor":{"30":3}}}},"support":{"sequences":732,"events":67982,"contexts_kept":1931,"contexts_pruned":1226},"heldout_bits":{"order":{"0":4.371,"1":3.945,"2":3.474,"3":3.303},"train":586,"test":146}},"beatles":{"model":{"base":[0.015961,0.008393,0.010307,0.001696,0.006741,0.001783,0.01396,0.002131,0.000652,0.002131,4.3e-05,0.001174,0.075454,0.032748,0.006915,0.00187,0.000826,0.000826,0.034226,0.002044,0.00361,0.000913,0.00013,4.3e-05,0.009176,0.019353,0.001348,0.00013,0.000391,0.000478,0.244977,0.052927,0.019701,0.000217,0.004392,0.000217,0.002653,0.001,0.001174,0.000913,4.3e-05,0.000217,0.156084,0.027007,0.016917,0.000217,0.001261,0.002827,0.030051,0.002392,0.003349,0.000565,4.3e-05,0.001348,0.013438,0.040663,0.004566,0.001957,0.00013,0.000304,0.062408,0.008393,0.006219,0.002131,0.000478,0.000652,0.010655,0.008741,0.004305,0.002218,0.000739,0.006045],"orders":{"1":{"major":{"1":83,"2":100,"3":8,"4":74,"5":19,"6":66,"7":1,"8":5,"9":15,"11":4,"12":778,"13":288,"14":42,"15":8,"16":9,"17":7,"18":167,"19":6,"20":4,"21":8,"24":89,"25":191,"26":12,"28":4,"29":5,"30":2095,"31":216,"32":83,"34":14,"35":1,"36":21,"37":7,"38":2,"39":8,"41":2,"42":1563,"43":133,"44":96,"45":1,"46":8,"47":19,"48":66,"50":5,"51":6,"54":135,"55":449,"56":38,"57":1,"58":1,"59":3,"60":470,"61":17,"62":34,"63":7,"64":5,"65":3,"66":84,"67":50,"68":13,"69":13,"70":7},"dominant":{"0":21,"1":5,"3":4,"4":1,"6":2,"8":2,"9":1,"12":21,"13":16,"14":10,"15":2,"18":12,"20":15,"22":1,"24":4,"25":24,"30":297,"31":55,"32":78,"34":14,"38":4,"39":2,"42":72,"43":20,"44":75,"46":5,"48":3,"53":15,"54":2,"55":15,"56":8,"60":31,"61":3,"62":27,"66":5,"67":1,"68":12,"70":1,"71":19},"minor":{"0":30,"2":4,"3":7,"4":1,"5":1,"6":65,"7":4,"11":1,"12":66,"13":64,"14":27,"15":4,"17":1,"18":203,"19":16,"20":21,"24":4,"25":5,"30":383,"31":309,"32":63,"34":22,"36":4,"37":4,"42":146,"43":157,"44":23,"47":12,"48":273,"49":27,"50":28,"54":5,"56":6,"57":21,"60":204,"61":73,"62":3,"66":9,"67":38,"68":1,"69":8,"71":35},"other":{"0":4,"1":6,"2":4,"4":1,"6":1,"7":8,"11":8,"12":2,"13":4,"17":1,"18":10,"24":7,"26":3,"30":22,"31":27,"36":1,"38":4,"47":1,"48":2,"60":6,"61":2,"63":13,"65":4,"66":4,"68":15,"71":15},"diminished_family":{"2":3,"6":26,"7":11,"9":8,"15":7,"19":1,"21":2,"24":1,"25":2,"27":1,"30":7,"31":1,"32":2,"33":2,"35":1,"36":4,"38":3,"42":2,"45":1,"46":1,"48":1,"50":5,"54":12,"60":6,"61":1,"62":7,"63":4,"66":20,"67":11,"68":8,"69":4},"suspended":{"0":128,"1":2,"2":7,"13":4,"18":1,"20":1,"30":12,"42":11,"55":3}},"2":{"major|7|major":{"1":2,"2":33,"3":1,"4":16,"5":5,"6":2,"8":1,"12":51,"13":99,"14":3,"17":1,"18":68,"24":3,"25":17,"26":8,"28":1,"30":635,"31":3,"32":6,"42":276,"43":25,"44":19,"47":2,"48":7,"54":2,"55":64,"56":5,"59":1,"60":173,"61":1,"62":21,"65":1,"66":1,"67":2},"major|5|major":{"1":32,"2":23,"4":7,"5":3,"6":6,"8":2,"9":5,"12":249,"13":53,"14":18,"15":4,"16":9,"17":1,"18":6,"19":1,"24":25,"25":53,"28":3,"30":408,"31":32,"32":12,"34":4,"36":1,"38":2,"39":7,"42":702,"43":15,"44":11,"47":7,"48":20,"54":39,"55":193,"56":15,"58":1,"59":1,"60":70,"66":22,"67":13},"major|0|dominant":{"0":4,"4":1,"9":1,"13":4,"30":62,"31":2,"32":4,"42":3,"43":1,"55":9,"60":2,"67":1,"70":1},"dominant|5|major":{"1":25,"2":5,"3":5,"4":4,"6":1,"7":1,"9":6,"12":23,"13":15,"20":2,"24":9,"25":3,"30":81,"31":1,"32":5,"42":31,"44":18,"48":5,"54":10,"55":19,"56":7,"57":1,"60":2,"63":3,"66":3,"67":10},"major|0|minor":{"0":10,"3":2,"19":2,"30":4,"42":43,"43":1,"44":4,"54":3,"56":5,"57":6,"60":4},"minor|7|major":{"2":3,"12":4,"13":5,"14":2,"18":3,"25":10,"30":16,"31":46,"42":21,"44":2,"55":15,"56":2,"60":3,"61":5,"62":3,"66":1},"major|2|major":{"1":4,"2":4,"5":4,"6":3,"11":4,"12":28,"13":37,"14":1,"18":31,"25":4,"30":420,"31":14,"32":5,"34":3,"35":1,"42":82,"43":12,"44":4,"47":4,"48":11,"54":6,"55":17,"60":86,"61":1,"66":1},"major|10|major":{"6":4,"12":136,"14":4,"24":9,"25":5,"26":2,"29":4,"30":22,"36":3,"37":3,"42":200,"43":1,"44":12,"46":1,"54":17,"55":12,"56":3,"60":15,"66":13,"67":2,"68":6},"major|9|minor":{"0":2,"6":6,"12":1,"18":71,"20":3,"30":58,"31":82,"32":12,"34":17,"43":50,"48":92,"57":6,"60":32,"61":5,"66":3,"71":11},"minor|10|major":{"2":1,"4":4,"6":4,"12":1,"13":39,"24":5,"25":8,"30":62,"42":29,"43":6,"44":4,"46":6,"55":7,"60":30,"69":1},"minor|3|major":{"1":6,"2":7,"12":23,"13":4,"25":11,"30":28,"31":1,"32":2,"37":4,"42":46,"43":2,"44":5,"45":1,"55":65,"60":1},"minor|5|minor":{"0":1,"12":34,"13":10,"14":3,"18":9,"19":3,"30":74,"31":18,"32":10,"42":1,"43":73,"47":1,"48":37,"49":4,"57":2,"60":31,"66":1},"minor|5|major":{"1":1,"2":4,"4":3,"5":5,"6":1,"13":14,"18":18,"19":3,"30":187,"31":20,"32":14,"42":3,"43":58,"46":1,"48":7,"51":6,"54":2,"60":36,"62":2},"major|9|dominant":{"0":1,"18":1,"30":13,"31":9,"32":8,"34":3,"42":1,"43":1,"60":1},"minor|9|dominant":{"30":2,"34":4},"dominant|7|major":{"2":3,"12":6,"13":5,"18":5,"30":5,"32":8,"42":20,"44":7,"47":1,"48":1,"55":4,"60":4,"62":5},"major|7|dominant":{"0":10,"3":1,"13":6,"25":3,"30":43,"32":3,"42":3,"44":5,"54":2,"60":7,"62":12,"68":1},"dominant|10|dominant":{"14":4,"42":11,"43":2,"44":9,"68":2},"major|5|dominant":{"12":9,"14":2,"30":32,"32":12,"42":22,"43":1,"44":1,"56":4},"minor|2|minor":{"6":17,"11":1,"18":2,"20":2,"30":4,"31":1,"32":3,"48":5,"50":4,"54":1,"61":17,"69":8},"minor|10|minor":{"12":5,"13":6,"14":2,"18":7,"19":2,"30":29,"31":1,"32":6,"34":2,"43":2,"60":10},"minor|5|dominant":{"0":1,"18":3,"30":37,"31":4,"32":4,"34":5,"42":1,"43":9,"60":3},"major|2|minor":{"0":5,"3":2,"4":1,"7":1,"13":39,"18":45,"20":6,"30":44,"31":19,"32":2,"42":5,"43":7,"44":6,"48":42,"49":11,"50":2,"57":1,"60":51,"66":1},"major|4|major":{"2":2,"6":2,"30":22,"31":37,"48":9,"55":7,"61":9},"major|5|minor":{"6":7,"12":21,"18":20,"20":5,"30":25,"31":44,"32":2,"37":1,"42":36,"43":2,"44":4,"47":5,"48":28,"49":1,"57":4,"60":5,"71":4},"minor|8|major":{"12":88,"14":3,"17":5,"18":5,"20":1,"24":4,"25":48,"29":1,"30":24,"32":6,"41":2,"42":35,"54":17,"55":23,"56":2,"59":1,"63":4,"66":5,"68":3},"major|0|other":{"0":1,"4":1,"30":9,"31":5,"47":1,"60":2},"other|5|major":{"12":4,"25":3,"30":3,"32":1,"42":3,"43":4,"44":1,"55":2},"minor|1|major":{"12":16,"42":23,"54":6,"55":4,"67":16},"major|11|minor":{"6":12,"7":1,"30":5,"31":11,"43":7,"48":5,"60":4,"61":4,"71":1},"minor|8|minor":{"0":2,"7":1,"25":5,"30":1,"42":16,"48":2,"56":1},"major|3|major":{"12":74,"13":4,"14":2,"18":1,"24":15,"25":2,"26":1,"30":3,"42":38,"54":23,"56":1,"60":4,"66":1},"minor|7|minor":{"2":1,"6":13,"12":1,"18":15,"24":1,"30":6,"31":52,"32":2,"42":8,"43":4,"44":4,"48":15,"50":3,"54":1,"60":19,"61":16},"major|11|major":{"2":1,"6":3,"12":1,"24":2,"30":27,"31":11,"36":10,"42":2,"54":7,"55":1,"60":1,"66":17,"67":2},"dominant|1|major":{"30":2,"42":1},"major|1|major":{"6":16,"8":2,"12":17,"24":3,"25":5,"30":14,"36":1,"42":2,"54":1,"55":1,"60":1,"66":3},"major|8|major":{"6":7,"12":9,"24":11,"36":3,"42":15,"44":1,"56":1,"60":1,"66":12,"67":2,"68":4},"major|6|major":{"6":4,"12":10,"25":1,"30":1,"42":1,"48":1,"54":3},"major|4|minor":{"3":1,"5":1,"6":7,"13":1,"18":1,"20":1,"30":20,"31":39,"32":3,"36":4,"42":5,"43":3,"48":26,"50":11,"60":20,"61":27,"66":1,"67":19,"71":2},"minor|11|minor":{"30":9,"32":6,"37":3,"67":19,"68":1},"minor|6|minor":{"24":3,"60":1},"minor|4|major":{"25":3,"31":1},"minor|11|major":{"2":1,"12":3,"13":1,"24":2,"26":1,"67":1,"70":1},"major|7|minor":{"12":3,"13":7,"14":1,"17":1,"18":22,"30":60,"31":5,"42":1,"43":7,"44":2,"48":7,"57":2,"60":17},"dominant|0|major":{"2":2,"12":1,"30":8,"60":6,"65":1,"66":1},"major|10|diminished_family":{"38":3,"54":4},"diminished_family|9|major":{"20":1,"21":8,"47":2,"48":1},"major|7|other":{"1":2,"13":3,"30":5,"31":6,"65":1},"other|0|minor":{"14":2,"18":3,"31":1,"60":1},"minor|2|dominant":{"30":1,"31":4,"38":4,"48":3,"53":15},"dominant|8|major":{"12":2,"24":1},"major|3|dominant":{"24":2,"30":1,"68":1},"dominant|11|dominant":{"8":1,"32":3,"66":1,"68":7},"minor|3|minor":{"42":16},"major|9|major":{"6":1,"18":28,"25":3,"30":51,"31":2,"32":9,"36":3,"42":5,"43":9,"60":18,"66":4},"minor|11|other":{"7":4,"24":7,"26":3,"38":4,"63":13,"66":4},"other|4|major":{"2":3,"32":1,"55":3},"diminished_family|1|minor":{"19":5,"32":2,"60":1,"71":4},"major|1|diminished_family":{"6":5,"7":10},"dominant|5|minor":{"2":2,"15":1,"18":2,"30":7,"31":25,"34":3,"42":2,"44":3,"48":4,"60":3,"71":3},"minor|0|dominant":{"20":2,"32":2},"dominant|5|dominant":{"0":2,"30":23,"32":11,"42":3,"43":5,"44":33,"60":1,"62":3},"dominant|11|major":{"2":1,"5":2},"minor|0|major":{"1":9,"12":2,"18":1,"30":6,"31":4,"44":2,"47":3,"60":2},"minor|9|major":{"19":2,"30":3},"minor|9|diminished_family":{"6":3,"19":1,"31":1,"50":4,"66":11},"minor|3|dominant":{"13":3,"30":18},"dominant|2|minor":{"18":4,"19":4,"30":2,"31":1,"42":3,"62":2},"major|4|dominant":{"30":2,"31":8,"55":1,"62":2},"dominant|7|minor":{"18":1,"30":11,"32":6,"42":1,"60":1},"minor|7|dominant":{"30":6,"31":17},"dominant|7|dominant":{"14":4,"20":1,"24":2,"25":3,"30":6,"32":21,"42":5,"44":18,"46":5,"60":3,"62":8},"major|2|dominant":{"13":2,"18":4,"22":1,"25":2,"30":17,"31":1,"32":6,"60":8},"major|0|suspended":{"0":67,"13":4,"30":2,"55":1},"suspended|0|major":{"2":4,"4":37,"12":2,"18":1,"30":43,"31":4,"32":12,"44":5,"55":6,"60":6,"64":5},"major|11|dominant":{"30":4,"31":3,"34":2,"60":3},"minor|11|diminished_family":{"67":8},"diminished_family|11|minor":{"15":3,"30":8},"minor|2|major":{"6":7,"12":9,"15":3,"30":6,"31":31,"42":1,"48":4,"50":5,"61":1},"major|2|other":{"0":1,"13":1,"30":4,"60":1},"other|2|minor":{"31":1,"49":3},"major|3|minor":{"0":1,"42":3,"43":1,"61":1},"suspended|0|dominant":{"30":6,"31":1},"major|10|dominant":{"8":1,"12":8,"25":3,"30":3,"39":1,"42":13,"43":1,"44":5},"dominant|4|minor":{"20":3,"31":5,"32":4,"50":7,"60":3,"61":3},"minor|10|dominant":{"0":2,"13":1},"dominant|4|major":{"12":2,"31":2},"dominant|2|major":{"13":6,"30":8,"55":3,"62":3},"suspended|9|minor":{"3":2,"48":1},"major|1|dominant":{"30":2,"66":2,"68":1},"major|10|minor":{"12":1,"13":1,"30":13,"42":1,"47":1},"dominant|9|minor":{"0":1,"2":1,"48":1,"49":2,"62":1,"66":3,"71":6},"dominant|10|major":{"2":1,"3":1,"4":1,"14":8,"25":2,"42":6,"43":1,"44":5,"60":3,"67":1,"69":2},"minor|4|minor":{"49":5},"major|2|suspended":{"0":9},"minor|6|major":{"42":4},"other|10|major":{"12":5,"67":1},"major|4|suspended":{"0":4},"dominant|3|major":{"12":1,"42":6,"56":1,"60":4},"minor|8|dominant":{"12":1,"25":13,"30":13,"60":1},"minor|0|diminished_family":{"21":2,"35":1,"36":2,"60":4},"major|5|suspended":{"0":3,"42":9,"55":2},"dominant|7|suspended":{"0":5},"major|10|suspended":{"0":5},"other|1|minor":{"0":3,"31":1,"48":5},"major|8|diminished_family":{"6":6},"diminished_family|1|major":{"2":1,"9":4,"12":2,"25":1,"30":2,"31":4,"42":4,"55":2,"69":6},"major|11|diminished_family":{"6":6,"33":2,"48":1,"66":4},"dominant|2|dominant":{"20":6,"60":1,"62":2},"dominant|3|dominant":{"12":3,"42":2,"44":4,"55":2,"56":4},"major|11|suspended":{"0":6,"1":1},"major|6|minor":{"6":3,"32":4},"other|10|diminished_family":{"66":5,"68":8},"diminished_family|11|major":{"1":4,"13":2,"25":2,"42":5,"70":6},"minor|5|suspended":{"0":22},"suspended|7|major":{"12":2,"30":2,"34":7},"diminished_family|10|major":{"4":2,"12":2,"15":1,"54":1},"major|7|suspended":{"0":1,"2":6,"42":1},"other|4|dominant":{"55":3},"other|5|minor":{"0":5,"14":16,"32":1,"47":5},"minor|7|other":{"0":1,"18":10},"other|3|major":{"25":10},"diminished_family|6|dominant":{"32":3},"major|10|other":{"1":1,"12":1,"30":1},"other|10|other":{"17":1,"60":2,"65":1},"major|3|diminished_family":{"54":8},"diminished_family|6|major":{"2":1,"3":1,"30":1,"39":1},"major|6|diminished_family":{"30":3,"32":2,"36":2,"61":1},"major|0|diminished_family":{"15":1,"24":1,"25":2,"67":3},"major|4|other":{"11":4,"65":1},"major|9|other":{"36":1,"48":1,"65":1},"dominant|9|dominant":{"20":6,"32":1},"diminished_family|11|diminished_family":{"15":2,"69":1},"diminished_family|2|diminished_family":{"60":1,"62":4,"63":1,"69":1},"diminished_family|10|diminished_family":{"2":3,"27":1},"diminished_family|8|dominant":{"30":4,"39":1,"60":1},"suspended|5|major":{"12":2,"13":4,"30":3,"60":2},"other|11|major":{"42":1,"69":4},"dominant|5|suspended":{"0":5,"30":9},"major|2|diminished_family":{"9":4,"62":3,"63":1},"diminished_family|1|diminished_family":{"6":4,"9":4},"minor|1|minor":{"7":1,"48":1,"49":1},"major|8|dominant":{"1":5},"dominant|0|minor":{"42":5},"diminished_family|11|dominant":{"42":8},"suspended|2|minor":{"71":4},"other|6|dominant":{"18":4},"dominant|6|dominant":{"71":5},"dominant|11|other":{"1":3,"31":16},"major|1|other":{"7":4},"other|1|other":{"2":4,"11":4},"other|0|dominant":{"31":1,"61":3},"dominant|10|minor":{"14":3},"dominant|8|other":{"71":15},"other|11|other":{"68":15},"other|11|dominant":{"66":1,"71":14},"diminished_family|5|major":{"6":5,"31":3},"minor|2|diminished_family":{"30":4},"diminished_family|10|dominant":{"3":1,"15":2,"31":3},"dominant|0|diminished_family":{"15":4},"diminished_family|0|dominant":{"0":1,"3":2}},"3":{"major|5|major|7|major":{"1":2,"2":11,"3":1,"4":12,"5":1,"6":2,"8":1,"12":8,"13":33,"14":1,"18":28,"25":4,"26":8,"30":405,"31":2,"32":4,"42":93,"43":9,"44":11,"54":1,"55":13,"56":4,"59":1,"60":38,"62":10},"major|7|major|7|major":{"2":2,"4":2,"12":1,"13":18,"18":9,"25":3,"30":78,"42":25,"43":7,"47":1,"48":6,"55":4,"60":111,"62":5,"65":1},"major|7|major|5|major":{"1":10,"2":7,"6":6,"9":1,"12":50,"13":11,"16":5,"18":1,"24":6,"25":16,"30":72,"31":16,"32":7,"36":1,"42":378,"43":2,"44":2,"47":1,"54":3,"55":21,"56":1,"60":14},"major|5|major|0|dominant":{"0":1,"13":2,"30":17,"67":1},"major|0|dominant|5|major":{"1":13,"2":2,"12":3,"13":1,"20":2,"30":9,"31":1,"42":20,"44":1,"55":2,"63":3,"67":6},"dominant|5|major|0|minor":{"0":1,"42":21,"44":3},"major|0|minor|7|major":{"12":3,"13":3,"14":1,"25":3,"30":9,"31":4,"42":9,"44":2,"55":3,"56":2,"60":3},"minor|7|major|7|major":{"13":4,"30":11,"60":5,"61":1},"major|5|major|5|major":{"1":2,"2":6,"12":136,"14":2,"16":4,"24":4,"25":1,"28":2,"30":36,"34":4,"39":2,"42":141,"43":1,"44":2,"47":2,"48":5,"54":25,"55":25,"60":9,"66":2},"major|5|major|2|major":{"2":2,"12":3,"13":6,"18":4,"25":4,"30":200,"34":1,"42":9,"43":2,"44":3,"54":3,"55":5,"60":11},"major|2|major|10|major":{"12":45,"25":5,"37":3,"42":20,"44":9,"54":1,"60":1,"67":1},"major|10|major|7|major":{"2":1,"5":1,"12":14,"13":2,"14":1,"18":1,"25":2,"30":36,"32":1,"42":105,"43":3,"44":2,"55":30,"66":1},"major|5|major|0|minor":{"0":3,"42":17,"44":1,"56":1,"57":6,"60":3},"major|7|major|10|major":{"6":2,"12":24,"29":4,"30":2,"42":136,"54":2,"56":3,"60":2,"67":1},"major|2|major|5|major":{"2":5,"4":1,"5":3,"8":2,"12":17,"13":7,"18":5,"19":1,"24":2,"25":5,"30":181,"31":2,"32":2,"42":63,"43":8,"44":6,"47":3,"48":1,"55":62,"59":1,"60":21,"66":14},"major|5|major|9|minor":{"0":2,"6":4,"18":32,"20":3,"30":11,"31":45,"32":5,"34":6,"43":22,"48":42,"57":1,"60":16,"61":4,"71":2},"major|9|minor|10|major":{"13":3,"30":12,"42":4,"43":2,"55":2,"60":9},"minor|10|major|5|major":{"9":4,"12":6,"13":2,"24":7,"30":18,"32":2,"42":15,"55":5,"58":1},"major|9|minor|3|major":{"2":1,"25":1,"30":6,"42":7,"55":55},"minor|3|major|5|major":{"12":9,"42":8,"55":6,"56":3,"67":1},"minor|3|major|9|minor":{"18":30,"30":4,"31":12,"43":2,"48":9,"60":6},"major|9|minor|5|minor":{"12":2,"13":2,"14":2,"19":3,"30":48,"32":3,"48":11,"57":1,"60":9,"66":1},"minor|5|minor|5|major":{"13":3,"18":3,"30":43,"31":4,"32":8,"43":3,"60":10},"minor|5|major|5|major":{"2":3,"12":1,"13":23,"14":3,"15":4,"24":6,"25":22,"28":1,"30":28,"31":2,"42":15,"48":4,"54":2,"55":47,"56":7,"60":16,"67":2},"major|5|major|9|dominant":{"30":4,"31":7,"32":1,"34":3},"major|9|dominant|5|major":{"30":8,"32":4,"42":1},"dominant|5|major|5|major":{"2":1,"4":2,"12":3,"13":2,"14":12,"30":7,"42":28,"43":1,"47":1,"48":1,"54":4,"55":9,"56":1,"60":5,"67":4},"major|0|minor|9|dominant":{"30":1,"34":4},"major|5|dominant|7|major":{"12":1,"13":1,"30":2,"32":7,"42":7,"44":6},"dominant|7|major|7|dominant":{"60":1,"62":6},"major|7|dominant|10|dominant":{"42":9,"44":4},"dominant|10|dominant|7|major":{"2":3,"30":1,"42":6,"60":1},"dominant|7|major|7|major":{"30":12,"32":1,"60":1,"62":6},"major|5|major|5|dominant":{"12":2,"42":9,"43":1,"56":1},"dominant|7|major|0|dominant":{"30":2,"32":1},"dominant|5|major|7|major":{"2":2,"12":2,"18":1,"25":2,"30":6,"42":9,"44":5,"48":1,"60":2},"major|2|minor|2|minor":{"6":17,"31":1,"50":4,"61":10,"69":8},"minor|2|minor|10|minor":{"18":5,"32":5,"60":6},"minor|10|minor|5|dominant":{"30":6},"minor|5|dominant|5|major":{"2":1,"9":4,"13":6,"24":6,"25":2,"30":11,"44":1,"54":2,"55":1,"56":2},"dominant|5|major|2|minor":{"4":1,"13":5,"18":4,"30":1,"32":2,"60":2},"dominant|5|major|4|major":{"31":9},"major|4|major|5|minor":{"18":3,"20":2,"30":3,"31":4,"32":2,"44":4,"48":13,"49":1,"57":4,"60":1},"major|5|minor|8|major":{"12":4,"24":2,"25":12,"42":2,"55":7,"56":1},"major|5|major|2|minor":{"7":1,"13":20,"18":8,"30":16,"31":2,"43":2,"60":4},"minor|10|minor|10|major":{"24":1,"25":4,"30":4,"55":1},"minor|10|major|4|major":{"31":5},"minor|8|major|7|major":{"2":4,"4":2,"5":1,"24":2,"25":2,"30":13,"42":10,"55":3},"major|7|major|0|other":{"0":1,"4":1,"30":2,"47":1},"major|0|other|5|major":{"12":4,"25":2,"30":1,"42":2},"other|5|major|2|major":{"30":4},"major|5|major|0|other":{"30":3},"minor|2|minor|1|major":{"12":2,"42":10,"54":2,"67":3},"minor|1|major|11|minor":{"6":11,"60":4,"61":1},"major|11|minor|1|major":{"12":5,"42":3,"55":1,"67":3},"minor|1|major|7|major":{"5":1,"13":10,"30":3,"42":7,"47":1},"major|7|major|2|minor":{"0":1,"3":2,"13":14,"18":20,"20":6,"30":12,"31":6,"42":2,"48":22,"60":15},"major|7|major|3|major":{"12":55,"18":1,"24":10,"25":2,"54":1},"major|3|major|2|major":{"12":3,"13":5,"14":1,"30":19,"42":42,"60":5},"major|2|major|2|major":{"13":2,"30":8,"32":3,"42":1,"48":10,"60":4},"major|9|minor|7|minor":{"6":11,"18":6,"31":4,"48":7,"50":3,"60":10,"61":9},"minor|7|minor|8|major":{"12":5,"25":2,"42":3,"55":5},"major|5|major|3|major":{"12":4,"26":1,"30":1},"major|3|major|5|major":{"55":2,"66":1},"major|5|major|11|major":{"24":2,"30":1,"31":5,"36":8,"66":7},"major|6|dominant|1|major":{"30":2,"42":1},"major|2|minor|10|major":{"6":4,"13":24,"30":8,"42":6,"43":4,"46":6},"minor|10|major|7|major":{"2":1,"5":1,"12":7,"13":5,"30":3,"43":6,"60":6},"minor|10|major|1|major":{"12":4},"major|1|major|2|major":{"6":1,"12":10,"13":1,"30":5},"major|2|major|2|minor":{"18":5,"30":7,"31":5,"48":10,"49":8,"60":2},"major|2|major|8|major":{"12":4,"36":3,"42":3,"56":1},"major|8|major|2|major":{"12":4,"13":2,"55":3},"major|9|minor|8|major":{"12":48,"14":2,"17":4,"18":5,"25":4,"30":8,"32":6,"42":7,"54":3,"55":3,"63":4},"major|7|major|9|minor":{"18":2,"30":6,"31":15,"43":9,"48":19,"57":2,"60":8,"66":3},"minor|5|minor|10|major":{"4":4,"13":2,"24":4,"25":3,"30":10,"44":4,"55":4,"69":1},"minor|10|major|9|minor":{"6":2,"31":1,"43":1,"48":3},"minor|8|major|2|major":{"13":5,"30":64,"42":6,"54":3,"55":7,"60":2,"61":1},"minor|5|minor|7|minor":{"2":1,"12":1,"18":8,"24":1,"30":2,"31":31,"32":1,"42":8,"44":4,"48":8,"54":1,"60":4,"61":5},"minor|7|minor|3|major":{"12":3,"25":4,"30":6,"43":1,"60":1},"major|10|major|6|major":{"25":1,"30":1,"48":1},"major|5|major|4|minor":{"30":5,"31":10,"36":1,"48":9,"50":1,"60":2,"61":15,"66":1,"67":9},"major|4|minor|11|minor":{"67":19},"minor|11|minor|11|minor":{"30":9,"32":6,"37":3,"68":1},"minor|11|minor|5|major":{"30":6,"60":3},"minor|11|minor|6|minor":{"24":3},"minor|6|minor|4|major":{"25":3},"minor|4|major|4|minor":{"67":3},"minor|11|minor|5|dominant":{"30":6},"dominant|5|major|4|minor":{"32":1,"67":2},"minor|5|major|10|major":{"12":16,"24":2,"26":2,"42":6,"43":1,"55":5,"60":4},"major|10|major|2|major":{"1":2,"2":2,"12":2,"13":5,"18":6,"30":46,"31":7,"42":13,"43":4,"44":1,"55":2,"60":46,"66":1},"major|2|minor|5|minor":{"12":1,"30":6,"43":3,"48":5,"60":4},"major|11|minor|5|major":{"30":1,"31":4},"major|10|major|9|minor":{"30":9,"43":1,"60":2},"minor|7|minor|10|minor":{"14":1,"18":2,"19":2,"30":8,"43":2,"60":1},"minor|7|minor|5|major":{"18":3,"30":3},"minor|5|major|2|minor":{"31":2,"44":3,"48":6,"60":2,"66":1},"minor|3|major|7|major":{"13":17,"24":1,"25":4,"30":12,"42":4,"55":4,"60":4},"major|2|minor|5|major":{"13":4,"18":2,"30":24,"43":13,"60":1,"62":2},"minor|5|major|7|minor":{"13":4,"17":1,"18":2,"30":35,"31":4,"42":1,"43":2,"44":2,"48":7,"60":2},"major|7|minor|5|major":{"30":31,"32":3,"43":18,"54":2,"60":6},"major|7|minor|3|major":{"12":13,"42":8,"44":1,"55":1},"minor|7|minor|5|minor":{"0":1,"13":1,"18":4,"30":1,"31":6,"42":1,"43":39},"minor|3|major|2|major":{"11":4,"30":11,"43":3,"47":4,"60":1},"major|2|major|7|minor":{"12":2,"18":2,"30":8},"major|9|minor|1|major":{"42":2,"54":4},"minor|7|minor|10|major":{"13":8,"30":6,"60":5},"minor|10|major|10|major":{"12":11,"54":5,"55":5,"66":7,"68":2},"major|10|major|4|major":{"30":1,"31":8},"major|5|minor|5|major":{"4":1,"30":13,"31":2,"46":1,"51":6,"60":1},"major|5|minor|10|major":{"30":2,"60":3},"major|2|major|0|dominant":{"0":1,"30":2,"55":1},"major|0|dominant|0|major":{"2":1,"30":1,"60":1},"dominant|0|major|5|major":{"13":1,"30":1,"42":5,"55":1},"minor|8|major|10|diminished_family":{"54":4},"major|10|diminished_family|9|major":{"20":1,"47":2,"48":1},"major|8|major|4|major":{"48":8,"55":3},"major|4|major|8|major":{"24":3,"42":1,"66":1,"68":4},"major|4|major|9|minor":{"18":3,"48":4},"minor|2|dominant|8|major":{"12":2,"24":1},"major|5|major|8|major":{"6":7,"24":2,"66":11},"dominant|11|dominant|11|dominant":{"32":3,"66":1,"68":3},"minor|5|minor|3|minor":{"42":3},"minor|3|minor|7|major":{"2":2,"13":2,"14":1,"25":5,"30":2,"42":1,"55":3},"minor|7|major|9|minor":{"18":3,"30":1,"43":6,"48":3,"57":2},"minor|7|major|5|major":{"1":9,"25":2,"42":5},"major|4|minor|8|major":{"25":12,"42":7,"54":7,"59":1},"minor|8|major|9|minor":{"12":1,"30":8,"31":3,"32":4,"43":2,"48":5,"61":1},"minor|8|major|9|major":{"18":3,"30":12,"43":3},"major|9|major|7|minor":{"30":3,"31":1,"60":5},"major|9|minor|11|other":{"24":4,"63":7},"minor|11|other|4|major":{"2":3,"32":1,"55":3},"other|4|major|9|minor":{"18":1,"71":2},"dominant|7|major|2|minor":{"30":1,"48":4},"major|2|minor|7|minor":{"31":5,"60":1,"61":2},"major|10|major|9|major":{"25":3,"30":4,"43":5,"60":5},"major|7|minor|10|major":{"12":1,"13":2,"25":1,"42":9,"60":5},"major|9|minor|5|major":{"1":1,"4":2,"13":2,"18":8,"19":3,"30":15,"32":1,"43":15,"48":7,"60":4},"major|7|minor|7|minor":{"31":1,"43":4,"60":2},"minor|10|major|2|minor":{"0":4,"18":1,"30":2,"31":4,"42":3,"43":4,"60":22},"minor|10|minor|3|major":{"12":1,"25":4,"55":2},"minor|3|major|4|minor":{"31":3,"36":1,"43":2,"61":5},"major|4|minor|7|minor":{"31":1,"60":2},"major|5|major|7|dominant":{"0":1,"3":1,"13":3,"30":3,"62":3},"major|7|dominant|0|major":{"30":5,"60":5},"major|10|major|9|dominant":{"30":3},"major|9|major|5|major":{"4":4,"13":2,"25":3,"30":18,"42":6,"55":9,"60":3,"66":5},"major|5|major|9|major":{"18":4,"30":20,"32":3,"36":1,"42":4,"60":5,"66":2},"major|1|diminished_family|1|minor":{"19":5,"32":2,"71":4},"dominant|5|major|1|diminished_family":{"7":6},"diminished_family|1|minor|3|minor":{"42":5},"minor|7|major|4|minor":{"6":3,"31":2,"67":5},"dominant|5|major|0|dominant":{"30":3},"major|9|dominant|5|minor":{"2":2,"30":4,"31":3},"dominant|5|dominant|5|major":{"9":2,"12":3,"24":3,"30":4,"32":1,"54":4,"55":2,"56":2},"dominant|5|major|7|dominant":{"30":12,"42":3,"54":2,"68":1},"dominant|5|major|8|major":{"24":5},"minor|5|minor|3|major":{"2":4,"12":2,"25":2,"42":1,"55":1},"minor|7|major|5|minor":{"12":18,"18":4,"30":4,"31":10,"42":9},"major|5|minor|7|major":{"12":1,"18":3,"31":26,"42":2,"62":2},"minor|7|major|3|major":{"54":3},"major|3|major|9|major":{"18":15,"30":2,"60":3},"major|9|major|3|major":{"12":2,"13":3,"42":6,"54":16},"minor|0|major|5|major":{"30":2,"42":4},"major|5|major|10|major":{"12":27,"14":4,"30":3,"42":30,"46":1,"54":3,"66":2},"major|2|minor|3|major":{"1":6,"12":4,"30":5,"37":4,"42":24,"44":1,"45":1,"55":1},"minor|3|major|0|minor":{"42":3,"54":3},"minor|7|major|2|minor":{"18":3,"30":2},"major|0|minor|9|major":{"30":3},"minor|9|major|5|major":{"43":3},"major|5|major|7|minor":{"13":3,"18":6,"30":4,"43":2},"minor|10|major|7|minor":{"18":4,"30":2},"major|7|minor|2|minor":{"30":2,"32":3,"48":2},"minor|2|minor|8|major":{"24":2,"55":3},"minor|3|dominant|2|minor":{"18":2,"31":1},"minor|5|minor|2|minor":{"11":1,"18":2,"20":2,"30":2,"48":3},"dominant|2|minor|3|major":{"44":2,"55":2},"dominant|7|minor|5|major":{"18":1,"30":5,"31":1,"43":3,"60":1},"minor|7|dominant|5|major":{"1":4,"30":2},"major|7|major|5|dominant":{"12":1,"14":1,"30":1,"42":2,"44":1},"dominant|10|dominant|7|dominant":{"24":2,"44":7},"dominant|7|dominant|7|dominant":{"30":5,"32":6,"62":7},"dominant|7|dominant|5|major":{"6":1,"30":5},"dominant|7|dominant|10|dominant":{"14":1,"42":2,"44":5},"major|7|major|7|dominant":{"30":10,"60":6,"62":3},"dominant|7|major|5|major":{"17":1,"42":1,"44":1},"suspended|0|major|5|major":{"1":6,"2":1,"12":3,"14":1,"25":1,"30":7,"31":2,"39":5,"42":15,"55":2},"major|7|major|4|minor":{"3":1,"20":1,"30":4,"31":4,"43":1,"50":1,"61":3,"71":2},"major|4|minor|5|minor":{"13":2,"30":1,"31":2,"43":9,"48":18,"49":4,"57":1,"60":4},"minor|8|major|2|dominant":{"30":3},"major|2|dominant|5|major":{"12":2,"13":1,"25":1,"30":11,"55":1,"60":1},"major|7|major|0|suspended":{"0":16},"major|0|suspended|0|major":{"2":4,"4":34,"12":2,"30":17,"55":5,"60":3},"major|2|minor|8|major":{"12":19,"25":4,"42":11,"54":3,"55":4,"66":1,"68":1},"minor|8|major|11|major":{"30":4,"31":1},"major|11|major|5|minor":{"6":7,"30":1,"48":1,"71":3},"major|7|major|4|major":{"30":1,"31":2},"major|5|minor|3|major":{"2":2,"30":8,"31":1,"42":6,"55":2},"minor|3|major|0|dominant":{"30":6},"dominant|5|major|2|major":{"13":4,"18":2,"30":5,"32":1,"42":2,"60":10},"minor|8|major|11|dominant":{"31":3},"major|11|dominant|5|minor":{"48":1,"60":2},"dominant|5|minor|8|major":{"14":1,"42":1,"68":2},"minor|2|minor|11|diminished_family":{"67":8},"minor|11|diminished_family|11|minor":{"30":8},"diminished_family|11|minor|5|major":{"30":6,"32":2},"major|5|major|5|minor":{"12":3,"18":2,"30":7,"42":20},"major|5|minor|2|major":{"12":9,"30":4,"31":3,"42":1,"48":4},"minor|2|major|5|major":{"13":2,"31":1,"42":3},"minor|5|major|5|dominant":{"30":7,"32":3,"56":3},"major|5|dominant|5|major":{"1":2,"4":4,"12":1,"13":3,"30":5,"42":1,"55":13,"67":4},"major|7|dominant|5|major":{"2":2,"12":9,"13":2,"30":7,"42":3,"44":16,"48":4,"60":1},"minor|5|minor|2|major":{"6":5,"15":3,"30":1,"31":26},"minor|2|major|5|minor":{"18":8,"30":3,"31":17,"47":2},"major|5|minor|5|minor":{"12":22,"13":4,"18":2,"30":1,"32":4,"43":10,"48":1},"minor|2|major|1|major":{"12":6,"42":1},"major|4|minor|10|minor":{"13":6,"14":1,"30":17,"34":2,"60":1},"minor|10|minor|5|major":{"2":4,"13":3,"30":12,"31":2,"43":4,"60":4},"minor|8|major|2|other":{"13":1,"30":3,"60":1},"major|2|other|5|major":{"42":1,"55":2},"other|5|major|7|major":{"13":3,"30":1},"other|5|major|9|minor":{"31":3},"minor|5|minor|5|minor":{"30":14,"60":4},"major|5|dominant|5|dominant":{"30":5,"44":8},"dominant|5|dominant|7|dominant":{"30":1,"32":13,"42":5,"44":10,"46":5},"dominant|7|dominant|7|major":{"62":5},"dominant|7|major|10|dominant":{"44":5},"major|10|dominant|7|dominant":{"25":3,"32":2},"dominant|7|dominant|5|dominant":{"0":2,"32":3,"42":2,"44":14},"dominant|7|dominant|4|minor":{"31":3},"dominant|4|minor|5|minor":{"18":2,"43":1,"60":2},"minor|5|minor|8|minor":{"42":4},"minor|8|minor|7|major":{"2":1,"25":2,"30":5,"42":5,"55":2,"66":1},"major|7|dominant|2|minor":{"18":2,"42":3,"62":1},"major|11|major|11|major":{"6":1,"12":1,"30":2,"31":2,"54":7,"66":4},"major|11|major|1|major":{"6":1,"36":1,"60":1},"major|1|major|1|major":{"6":3,"12":1,"30":7,"55":1,"66":3},"major|1|major|11|major":{"66":3},"major|4|minor|10|major":{"2":1,"30":12,"42":7},"major|5|major|11|minor":{"6":1,"30":2,"31":1,"43":4,"48":5},"major|11|minor|7|minor":{"31":7},"major|9|major|5|dominant":{"30":4,"32":5},"major|9|major|11|major":{"66":2,"67":2},"major|2|major|5|dominant":{"14":1,"30":4},"major|0|dominant|5|dominant":{"42":1,"44":4},"dominant|5|dominant|5|dominant":{"30":8,"44":3},"minor|8|major|4|major":{"31":4},"dominant|7|major|10|major":{"6":1,"44":3},"major|10|major|1|major":{"6":4},"major|0|minor|10|major":{"60":4},"major|10|major|11|major":{"2":1,"6":1,"30":9,"42":1,"60":1},"major|11|major|5|major":{"1":5,"13":1,"30":1,"31":4,"42":1,"48":9,"55":2,"60":2},"major|2|major|5|minor":{"42":3,"48":7,"60":3},"minor|5|major|3|major":{"12":11,"14":2,"30":2,"42":3},"minor|7|minor|1|major":{"12":2,"42":8,"67":3},"major|11|minor|10|minor":{"30":1,"32":1,"60":2},"minor|1|major|2|major":{"30":16},"major|5|major|4|major":{"30":8,"31":9,"61":7},"major|4|major|5|major":{"12":2,"25":2,"30":9,"31":3,"42":4,"54":1,"67":1},"major|7|minor|8|major":{"12":3,"30":2,"42":1,"54":1},"major|2|major|7|major":{"2":3,"12":3,"13":7,"18":27,"30":32,"42":2,"55":2,"60":5},"minor|5|minor|8|major":{"12":6,"25":14,"30":12,"42":1,"54":3,"56":1},"major|7|major|10|dominant":{"8":1,"12":6,"30":3,"42":11},"major|10|dominant|2|major":{"30":8},"dominant|2|major|5|major":{"13":2,"30":6},"major|7|major|0|dominant":{"0":1,"4":1,"9":1,"30":23,"32":2,"42":1,"55":2,"60":1},"major|10|dominant|7|major":{"12":5,"30":1,"42":6},"dominant|7|major|2|major":{"32":1,"60":5},"major|10|major|4|minor":{"60":5},"major|0|dominant|2|minor":{"19":4},"dominant|2|minor|3|minor":{"42":4},"minor|7|major|0|dominant":{"13":2,"55":1},"suspended|0|major|0|suspended":{"0":34,"30":2,"55":1},"major|7|major|9|dominant":{"0":1,"30":4},"dominant|5|major|5|dominant":{"30":4,"42":1},"dominant|5|major|0|suspended":{"0":4},"major|5|major|1|major":{"6":5,"8":1},"major|1|major|5|major":{"30":12},"major|2|major|3|major":{"42":26,"54":2,"60":4},"major|3|major|7|major":{"2":3,"12":12,"17":1,"18":1,"28":1,"30":6,"42":8,"55":4},"major|7|major|2|major":{"5":4,"6":1,"13":5,"18":14,"30":18,"31":7,"35":1,"42":1,"48":1},"minor|8|major|4|minor":{"5":1,"6":4,"13":1,"18":1,"30":5,"31":5,"32":2,"48":17,"60":13},"major|4|minor|5|major":{"5":5,"18":1,"30":3,"31":6,"60":6},"major|8|major|11|dominant":{"30":4},"major|11|dominant|5|major":{"30":4},"major|8|major|11|major":{"30":11},"major|2|minor|7|major":{"31":2,"61":2},"minor|7|major|10|minor":{"30":5},"major|10|minor|5|major":{"30":13},"major|2|major|9|minor":{"30":12,"48":1,"71":3},"dominant|2|minor|7|major":{"61":3},"major|2|major|7|dominant":{"13":1,"32":3},"major|0|dominant|9|minor":{"49":2,"62":1,"66":1,"71":5},"dominant|7|major|5|dominant":{"42":8},"major|7|dominant|10|major":{"42":6,"44":1},"dominant|10|major|7|major":{"2":4,"30":1,"44":1},"dominant|5|dominant|7|major":{"18":1,"44":1,"48":1},"dominant|10|major|7|dominant":{"30":1,"44":5},"minor|8|major|5|major":{"12":14,"30":4,"42":1,"67":5},"major|2|major|4|minor":{"31":4},"major|2|minor|8|minor":{"0":2,"7":1,"25":5,"42":3},"minor|8|minor|4|minor":{"49":5},"minor|4|minor|8|minor":{"42":5},"major|7|major|7|minor":{"12":1,"18":4,"30":8,"57":2,"60":10},"major|5|major|2|suspended":{"0":9},"major|2|suspended|0|major":{"30":9},"suspended|0|major|9|minor":{"43":4,"48":1,"57":1},"minor|10|major|0|suspended":{"0":4},"major|4|major|10|minor":{"12":1,"30":8},"major|4|minor|1|major":{"67":7},"major|11|minor|10|major":{"30":4},"major|5|dominant|2|major":{"13":3,"55":3,"62":2},"dominant|2|major|10|dominant":{"12":2,"39":1},"major|4|minor|6|major":{"42":4},"minor|6|major|7|major":{"12":4},"major|2|major|0|other":{"30":2,"60":2},"other|5|major|4|minor":{"31":1,"36":2},"other|10|major|2|major":{"30":4,"60":1},"minor|1|major|9|major":{"30":2,"60":2,"66":2},"major|9|major|10|major":{"12":7,"30":9,"60":3},"minor|3|dominant|5|major":{"1":6,"12":2,"30":4,"42":3,"66":3},"minor|3|major|7|dominant":{"13":2,"25":3},"major|7|dominant|4|minor":{"20":3},"dominant|4|minor|3|dominant":{"30":3},"major|5|major|2|dominant":{"13":2,"18":1,"30":8,"32":6},"major|2|dominant|5|dominant":{"30":1,"43":5},"minor|5|dominant|5|minor":{"31":3,"48":1},"dominant|5|major|9|minor":{"30":2,"31":1,"32":3,"34":11,"43":2},"major|4|suspended|0|major":{"31":4},"suspended|0|major|5|minor":{"31":2,"43":2},"major|9|minor|5|dominant":{"18":2,"30":5,"32":3,"60":2},"minor|5|dominant|3|major":{"12":1,"42":2},"dominant|3|major|7|major":{"2":1,"14":1,"30":1,"67":2},"minor|5|major|5|minor":{"30":6,"31":5,"47":2,"48":7},"major|5|major|4|suspended":{"0":3},"minor|2|minor|8|dominant":{"25":4},"minor|8|dominant|4|minor":{"32":4,"50":7,"61":3},"dominant|4|minor|8|dominant":{"25":7},"dominant|4|minor|5|dominant":{"30":4},"major|2|major|0|minor":{"3":2,"30":2},"major|0|minor|5|major":{"42":2,"43":2},"minor|2|minor|5|major":{"30":4},"minor|7|major|2|major":{"6":1,"18":3},"major|2|major|5|suspended":{"0":3},"major|2|dominant|3|major":{"42":4},"major|7|major|2|dominant":{"18":2,"22":1},"major|7|dominant|5|dominant":{"44":4},"dominant|7|dominant|7|suspended":{"0":5},"dominant|7|suspended|0|major":{"64":5},"suspended|0|major|10|suspended":{"0":5},"major|10|suspended|0|major":{"44":5},"suspended|0|major|7|dominant":{"0":5},"dominant|0|major|10|major":{"12":1,"30":5},"major|10|major|5|major":{"12":7,"30":6,"42":5,"54":3,"55":1},"minor|11|other|1|minor":{"48":5},"other|1|minor|8|major":{"55":1,"66":4},"minor|5|major|8|diminished_family":{"6":6},"major|8|diminished_family|1|major":{"69":6},"diminished_family|1|major|11|diminished_family":{"6":6},"major|11|diminished_family|1|major":{"30":2,"31":4},"diminished_family|1|major|5|minor":{"20":3,"71":1},"major|5|minor|3|dominant":{"30":5},"dominant|5|major|11|major":{"31":3},"major|5|minor|11|other":{"7":4},"minor|7|dominant|5|minor":{"18":1,"31":10,"34":3,"44":3},"dominant|5|minor|5|minor":{"12":4,"14":1,"30":1,"32":3,"43":8,"60":8},"major|5|minor|7|dominant":{"31":4},"major|2|minor|7|dominant":{"31":6},"major|2|minor|3|dominant":{"30":6},"minor|5|major|3|minor":{"42":3},"major|3|minor|7|major":{"42":3},"minor|7|minor|7|major":{"31":8},"major|7|major|4|dominant":{"31":8},"major|4|dominant|5|minor":{"30":2,"31":6},"minor|7|minor|7|dominant":{"31":4},"dominant|5|minor|5|major":{"30":6,"42":1},"major|7|minor|2|major":{"6":1,"31":2},"major|7|minor|5|minor":{"12":4,"48":1},"major|7|dominant|7|dominant":{"20":1,"60":3,"62":1},"dominant|7|dominant|10|major":{"44":3},"dominant|10|dominant|2|dominant":{"60":1,"62":2},"minor|2|dominant|5|minor":{"31":2,"48":2},"dominant|5|minor|10|major":{"30":3},"minor|3|major|6|minor":{"32":4},"major|6|minor|5|dominant":{"43":4},"minor|5|dominant|7|minor":{"30":3,"32":6},"dominant|7|minor|5|dominant":{"31":3,"32":1,"43":1,"60":1},"minor|5|minor|5|dominant":{"0":1,"30":6,"34":5},"minor|5|minor|2|dominant":{"30":1,"31":2},"major|10|dominant|5|major":{"56":3},"dominant|5|major|9|dominant":{"32":7},"major|9|dominant|5|dominant":{"32":8},"dominant|5|major|9|major":{"30":4,"32":5,"42":1},"major|9|major|7|major":{"30":5},"minor|11|other|10|diminished_family":{"66":5,"68":8},"other|10|diminished_family|11|major":{"13":2,"25":2},"minor|8|major|5|dominant":{"12":6},"dominant|2|major|9|minor":{"48":3},"dominant|2|major|2|minor":{"44":3,"50":2,"57":1},"dominant|5|minor|7|dominant":{"31":3},"dominant|5|minor|5|suspended":{"0":3},"minor|5|suspended|0|major":{"30":10,"32":12},"major|5|suspended|7|major":{"12":2,"34":7},"suspended|7|major|5|suspended":{"42":7},"major|5|major|5|suspended":{"42":2,"55":2},"minor|0|diminished_family|10|major":{"4":2,"12":2},"major|10|major|6|minor":{"6":3},"major|6|minor|1|major":{"55":3},"minor|1|major|9|minor":{"30":3,"43":1},"major|5|major|0|suspended":{"0":3,"13":4},"dominant|3|dominant|7|major":{"30":1,"32":1,"42":1},"dominant|2|dominant|3|dominant":{"42":2,"44":4},"dominant|3|dominant|7|dominant":{"14":4},"dominant|7|dominant|2|dominant":{"20":4},"major|10|major|10|major":{"42":4,"60":4,"66":4,"68":4},"dominant|9|minor|8|minor":{"42":1,"48":2},"dominant|9|minor|11|other":{"24":3,"26":3},"minor|11|other|4|dominant":{"55":3},"other|4|dominant|9|minor":{"48":1,"66":2},"dominant|9|minor|11|major":{"24":2,"26":1},"other|4|major|0|dominant":{"55":3},"major|7|other|5|minor":{"0":5,"32":1},"other|5|minor|0|major":{"44":2,"47":3},"minor|0|major|7|other":{"31":3},"major|5|major|7|other":{"13":3,"30":1,"31":2},"minor|10|major|4|minor":{"30":1,"31":3,"61":4},"minor|7|minor|7|minor":{"30":3,"32":1},"minor|2|minor|5|dominant":{"43":3},"minor|5|dominant|10|major":{"43":1,"69":2},"major|5|minor|7|other":{"18":5},"minor|7|other|3|major":{"25":10},"other|3|major|4|minor":{"30":5,"42":5},"minor|5|major|0|other":{"31":5},"major|0|other|5|minor":{"47":5},"other|5|minor|7|other":{"18":5},"major|4|minor|7|major":{"31":5},"dominant|5|major|10|diminished_family":{"38":3},"major|10|diminished_family|6|dominant":{"32":3},"diminished_family|6|dominant|5|dominant":{"30":3},"major|2|major|7|other":{"30":4},"major|7|other|5|major":{"30":1,"43":4},"other|5|major|7|minor":{"18":4},"major|11|minor|8|major":{"12":1,"30":1,"41":2,"42":1},"major|7|major|1|major":{"6":2,"42":1},"major|7|major|8|major":{"42":7},"major|8|major|7|major":{"30":4,"42":10,"55":1},"minor|9|diminished_family|1|major":{"12":2,"25":1},"minor|2|major|2|major":{"42":8,"43":1},"major|2|minor|0|major":{"30":4,"31":1},"major|3|diminished_family|9|major":{"21":8},"diminished_family|9|major|3|diminished_family":{"54":8},"major|0|dominant|7|major":{"18":4},"dominant|7|major|3|major":{"12":1,"13":1,"42":3},"major|9|minor|11|major":{"12":3},"minor|11|major|2|major":{"12":3},"major|8|major|6|major":{"6":3},"major|6|major|1|major":{"12":4},"major|10|major|11|dominant":{"34":2,"60":3},"major|11|dominant|10|major":{"60":3},"dominant|10|major|10|major":{"54":3},"minor|8|major|3|major":{"24":4,"56":1},"major|3|major|4|major":{"6":2,"30":9,"55":4},"major|4|minor|0|diminished_family":{"35":1,"36":2},"major|4|minor|8|dominant":{"30":10,"60":1},"major|9|minor|5|suspended":{"0":17},"major|0|minor|9|diminished_family":{"66":6},"minor|9|diminished_family|11|major":{"42":5,"70":6},"diminished_family|11|major|11|suspended":{"0":6},"major|11|suspended|0|major":{"4":3,"60":3},"suspended|0|major|10|major":{"24":3,"30":3},"minor|10|major|7|dominant":{"0":4},"major|0|minor|7|dominant":{"30":4},"major|0|minor|0|major":{"1":9},"minor|0|major|0|minor":{"0":6,"30":1,"42":2},"minor|7|major|10|major":{"42":3},"dominant|4|minor|10|minor":{"30":3},"major|5|dominant|9|dominant":{"20":3,"32":1},"dominant|9|dominant|3|dominant":{"12":3,"56":3},"dominant|3|dominant|9|dominant":{"20":3},"dominant|3|dominant|2|major":{"13":2,"62":1},"dominant|10|dominant|11|dominant":{"68":3},"dominant|11|dominant|5|dominant":{"62":3},"dominant|5|dominant|10|dominant":{"14":1,"68":2},"major|2|major|9|major":{"18":3,"60":3},"major|3|major|2|minor":{"43":1,"49":3},"minor|2|major|8|major":{"42":4},"major|4|minor|5|dominant":{"30":4},"major|10|major|2|dominant":{"60":4},"major|2|dominant|10|major":{"14":8},"dominant|10|major|2|dominant":{"25":2,"30":2,"60":4},"minor|5|dominant|5|dominant":{"30":3,"60":1},"major|11|major|6|major":{"12":10},"major|6|major|2|major":{"30":10},"major|7|other|2|minor":{"49":3},"other|2|minor|8|minor":{"42":3},"major|5|major|1|diminished_family":{"6":5},"major|1|diminished_family|1|major":{"2":1,"9":4},"diminished_family|1|major|1|diminished_family":{"7":4},"diminished_family|1|minor|11|other":{"66":4},"minor|11|other|11|major":{"69":4},"other|11|major|11|diminished_family":{"66":4},"major|11|diminished_family|11|major":{"1":4},"diminished_family|11|major|0|minor":{"56":4},"minor|9|dominant|5|suspended":{"30":4},"dominant|5|suspended|5|major":{"13":3,"30":3,"60":2},"suspended|5|major|5|major":{"56":3},"major|9|dominant|5|suspended":{"30":3},"suspended|5|major|2|minor":{"60":4},"major|5|major|2|diminished_family":{"9":4},"major|2|diminished_family|1|diminished_family":{"9":4},"diminished_family|1|diminished_family|1|diminished_family":{"6":4},"diminished_family|1|diminished_family|1|major":{"42":4},"diminished_family|1|major|7|major":{"30":3,"31":1},"major|7|major|5|minor":{"42":3},"suspended|0|major|5|dominant":{"30":12},"major|7|dominant|7|major":{"60":3},"major|10|major|7|dominant":{"30":11},"minor|7|minor|8|dominant":{"30":3},"minor|8|dominant|5|major":{"3":5,"7":1,"12":3,"54":4},"dominant|5|major|11|minor":{"31":10},"major|11|minor|5|minor":{"30":1,"31":10},"major|1|major|4|major":{"30":3},"major|9|minor|10|minor":{"12":5},"minor|10|minor|2|major":{"50":5},"minor|2|major|8|dominant":{"1":5},"major|8|dominant|0|minor":{"42":5},"dominant|0|minor|7|major":{"55":5},"minor|9|diminished_family|8|dominant":{"30":4,"60":1},"major|9|minor|9|diminished_family":{"50":4,"66":1},"diminished_family|8|dominant|5|major":{"30":4},"suspended|0|major|0|dominant":{"30":1,"31":2,"43":1},"major|11|major|9|major":{"30":7},"major|5|minor|1|major":{"12":7},"major|8|major|1|major":{"30":7},"major|3|major|10|major":{"24":4},"major|5|minor|9|diminished_family":{"66":4},"diminished_family|11|major|7|major":{"55":3,"56":1},"minor|5|major|0|suspended":{"0":3},"minor|5|major|8|major":{"12":5,"67":2},"other|10|diminished_family|11|dominant":{"42":8},"diminished_family|11|dominant|7|major":{"13":4,"55":4},"dominant|7|major|9|minor":{"71":4},"minor|10|minor|2|minor":{"61":6},"minor|0|major|5|minor":{"18":3,"30":1},"minor|7|major|10|dominant":{"25":3,"43":1},"major|10|dominant|4|minor":{"60":3},"dominant|4|minor|10|major":{"60":3},"major|9|major|4|minor":{"50":3},"major|0|suspended|2|minor":{"71":4},"suspended|2|minor|11|other":{"38":4},"minor|11|other|6|dominant":{"18":4},"other|6|dominant|3|major":{"60":4},"dominant|3|major|10|major":{"36":2,"54":2},"dominant|5|dominant|7|minor":{"30":5},"major|9|minor|3|dominant":{"30":3},"minor|2|dominant|6|dominant":{"71":5},"dominant|6|dominant|11|other":{"1":3,"31":2},"dominant|11|other|0|minor":{"18":3},"other|0|minor|3|major":{"13":3},"minor|3|major|2|minor":{"18":4},"major|2|major|1|other":{"7":4},"major|1|other|1|minor":{"0":3,"31":1},"other|1|minor|0|major":{"31":3},"major|10|major|4|other":{"11":4},"major|4|other|1|other":{"11":4},"other|1|other|1|other":{"2":4},"other|1|other|0|dominant":{"31":1,"61":3},"other|0|dominant|10|minor":{"14":3},"dominant|10|minor|2|dominant":{"38":2,"53":1},"dominant|11|other|5|minor":{"14":16},"other|5|minor|2|dominant":{"38":2,"53":14},"minor|2|dominant|8|other":{"71":15},"dominant|8|other|11|other":{"68":15},"other|11|other|11|dominant":{"66":1,"71":14},"other|11|dominant|11|other":{"31":14},"minor|10|major|7|suspended":{"2":6},"major|7|suspended|0|dominant":{"30":5,"31":1},"suspended|0|dominant|5|major":{"30":3,"42":2},"minor|2|diminished_family|5|major":{"6":5},"diminished_family|5|major|1|major":{"25":5},"major|1|major|4|minor":{"50":5},"dominant|5|major|0|diminished_family":{"24":1,"67":3},"major|0|diminished_family|11|minor":{"15":3},"diminished_family|11|minor|2|diminished_family":{"30":3},"minor|5|dominant|5|suspended":{"0":5},"dominant|5|suspended|0|major":{"30":5},"major|5|major|6|diminished_family":{"30":3,"32":2,"36":2},"major|6|diminished_family|5|major":{"31":3},"diminished_family|5|major|5|minor":{"31":2,"60":1},"major|2|major|1|major":{"24":2,"54":1},"major|9|major|6|major":{"54":3},"major|6|major|9|major":{"6":1,"36":2},"minor|5|major|0|dominant":{"30":4},"minor|2|major|2|diminished_family":{"62":3},"major|2|diminished_family|10|dominant":{"31":3},"diminished_family|10|dominant|5|minor":{"71":3},"dominant|5|minor|11|other":{"63":3},"dominant|0|diminished_family|2|diminished_family":{"60":1,"62":3},"diminished_family|10|diminished_family|0|dominant":{"0":1,"3":2},"diminished_family|2|diminished_family|10|dominant":{"3":1,"15":2}}}},"support":{"sequences":180,"events":11461,"contexts_kept":768,"contexts_pruned":457},"heldout_bits":{"order":{"0":4.319,"1":4.048,"2":3.715,"3":3.619},"train":144,"test":36}},"jazz":{"model":{"base":[0.044139,0.059029,0.046816,0.005056,0.003673,0.000979,0.00784,0.00969,0.007786,0.012079,0.000296,9e-06,0.007678,0.023484,0.010786,0.005649,0.000799,9e-06,0.002739,0.006511,0.004841,0.002775,0.000458,9e-06,0.001733,0.00899,0.006277,0.002721,0.000153,9e-06,0.11505,0.092544,0.236987,0.003781,0.005685,2.7e-05,0.003547,0.012294,0.008684,0.006313,0.000117,9e-06,0.009995,0.023394,0.016838,0.00229,0.001985,2.7e-05,0.004535,0.003386,0.005128,0.000386,0.000207,9e-06,0.002254,0.025621,0.014162,0.010283,0.000171,9e-06,0.008684,0.009025,0.007229,0.000656,0.000494,9e-06,0.00969,0.02828,0.03568,0.010175,0.001284,6.3e-05],"orders":{"1":{"minor":{"0":18,"1":2039,"2":105,"3":36,"4":3,"6":168,"7":76,"8":124,"9":123,"10":2,"12":16,"13":323,"14":236,"15":245,"16":6,"18":50,"19":204,"20":85,"22":11,"24":10,"25":60,"26":17,"27":14,"28":2,"30":82,"31":1152,"32":8435,"33":20,"34":177,"36":11,"37":27,"38":109,"39":10,"40":2,"42":223,"43":160,"44":307,"45":20,"46":10,"48":153,"49":93,"50":187,"51":3,"52":4,"54":2,"55":80,"56":54,"57":388,"60":214,"61":307,"62":74,"63":1,"64":7,"66":49,"67":298,"68":282,"69":241,"70":3,"71":3},"suspended":{"0":4,"1":4,"2":214,"3":4,"4":192,"6":5,"7":2,"9":3,"10":1,"12":12,"13":7,"14":1,"16":4,"18":1,"19":1,"20":3,"22":8,"24":1,"25":3,"26":5,"27":2,"28":2,"30":190,"31":17,"32":6,"33":3,"34":8,"36":1,"37":3,"38":2,"39":2,"42":5,"43":6,"44":1,"45":2,"46":3,"48":10,"49":2,"50":1,"54":3,"55":8,"56":3,"57":6,"58":2,"60":17,"61":9,"62":4,"63":6,"64":7,"66":3,"67":3,"68":10,"69":3,"70":7},"dominant":{"0":37,"1":787,"2":1869,"3":66,"4":5,"5":5,"6":125,"7":57,"8":215,"9":150,"10":3,"12":304,"13":108,"14":141,"15":30,"16":3,"18":59,"19":74,"20":77,"21":4,"22":2,"24":55,"25":138,"26":42,"27":38,"28":2,"30":5718,"31":3814,"32":2296,"33":137,"34":105,"35":1,"36":32,"37":495,"38":137,"39":101,"40":2,"42":138,"43":738,"44":197,"45":90,"48":53,"49":69,"50":36,"51":7,"52":4,"54":16,"55":478,"56":170,"57":146,"58":3,"60":95,"61":71,"62":196,"63":12,"64":9,"66":333,"67":539,"68":1289,"69":76,"70":38},"major":{"0":2317,"1":449,"2":403,"3":57,"4":4,"5":49,"6":115,"7":108,"8":59,"9":382,"10":3,"12":91,"13":849,"14":218,"15":35,"16":31,"18":37,"19":78,"20":100,"21":146,"22":4,"24":27,"25":288,"26":266,"27":97,"28":2,"30":402,"31":157,"32":643,"33":3,"34":15,"36":10,"37":150,"38":169,"39":234,"40":2,"42":179,"43":391,"44":424,"45":13,"46":93,"47":1,"48":36,"49":11,"50":53,"51":9,"52":3,"54":41,"55":859,"56":551,"57":29,"58":3,"60":135,"61":78,"62":118,"63":6,"64":3,"66":110,"67":325,"68":303,"69":225,"70":22},"diminished_family":{"0":39,"1":7,"2":15,"3":118,"6":23,"7":296,"8":35,"9":14,"10":7,"12":4,"13":16,"14":4,"15":4,"18":5,"19":5,"20":1,"21":4,"24":2,"25":11,"26":19,"30":5,"31":12,"32":1812,"33":47,"34":11,"36":143,"37":9,"38":66,"39":4,"42":11,"43":7,"44":8,"45":2,"46":4,"49":13,"50":8,"51":2,"54":63,"56":10,"57":3,"58":1,"60":22,"61":37,"62":10,"63":11,"64":1,"66":44,"67":409,"68":102,"69":21,"70":1},"other":{"0":42,"13":4,"20":3,"24":1,"30":8,"32":2,"55":1}},"2":{"major|11|minor":{"1":18,"3":1,"6":41,"7":2,"8":4,"13":2,"22":4,"28":1,"31":19,"32":142,"34":2,"38":3,"42":2,"43":1,"44":7,"46":1,"48":4,"49":2,"50":5,"55":1,"61":41,"62":1,"63":1,"66":8,"67":3,"68":12,"69":12},"minor|5|minor":{"1":64,"2":6,"3":1,"4":3,"6":2,"7":2,"8":3,"9":8,"12":2,"13":12,"14":26,"15":3,"18":2,"19":7,"20":5,"25":2,"30":5,"31":174,"32":740,"33":1,"34":23,"37":5,"38":1,"43":45,"44":6,"48":11,"49":2,"50":8,"51":3,"52":1,"55":4,"56":2,"57":18,"60":7,"61":4,"66":1,"67":4,"68":7,"69":4},"minor|7|minor":{"1":34,"2":3,"3":1,"6":7,"8":1,"9":3,"13":3,"14":6,"15":12,"16":1,"19":3,"31":31,"32":21,"37":1,"38":2,"43":2,"44":4,"45":1,"48":3,"50":1,"55":1,"57":4,"60":2,"61":7,"62":5,"67":1,"68":2,"69":1},"minor|3|suspended":{"4":1,"13":1,"16":1,"19":1,"30":5,"48":1,"55":1},"suspended|2|suspended":{"16":2,"31":1,"61":1},"suspended|5|minor":{"1":6,"2":2,"8":2,"32":4,"44":2,"61":1},"minor|10|minor":{"1":15,"9":3,"12":2,"13":65,"14":9,"15":1,"18":2,"19":4,"20":1,"24":1,"31":2,"32":95,"34":4,"42":3,"43":1,"48":1,"57":4,"60":54,"61":8,"62":3,"67":9,"68":6,"69":18},"minor|5|dominant":{"0":1,"1":441,"2":213,"3":8,"4":2,"5":3,"6":20,"7":14,"8":14,"9":54,"12":113,"13":51,"14":20,"15":12,"18":19,"19":20,"20":44,"21":2,"22":1,"24":6,"25":33,"26":4,"27":27,"30":3700,"31":1047,"32":409,"33":32,"34":35,"36":12,"37":316,"38":28,"39":20,"42":7,"43":575,"44":16,"45":12,"48":21,"49":43,"50":3,"51":1,"52":1,"54":1,"55":366,"56":48,"57":89,"58":1,"60":30,"61":23,"62":23,"63":6,"64":5,"66":31,"67":58,"68":45,"69":24,"70":2},"dominant|5|major":{"0":1074,"1":204,"2":214,"3":27,"4":2,"5":15,"6":15,"7":57,"8":9,"9":216,"12":7,"13":471,"14":51,"15":12,"18":3,"19":32,"20":68,"21":78,"24":4,"25":118,"26":133,"27":54,"30":147,"31":71,"32":460,"33":1,"34":4,"37":70,"38":103,"39":114,"42":18,"43":179,"44":276,"45":1,"46":33,"48":2,"49":4,"50":19,"51":2,"55":545,"56":316,"57":18,"58":1,"60":25,"61":42,"62":67,"66":3,"67":54,"68":133,"69":126,"70":3},"major|6|diminished_family":{"2":1,"3":1,"7":2,"19":1,"26":1,"31":1,"32":179,"33":2,"34":2,"36":3,"37":2,"38":2,"49":3,"50":1,"60":1,"64":1,"66":9,"67":9,"68":12,"69":4},"dominant|7|dominant":{"1":8,"2":72,"8":4,"12":3,"13":3,"14":2,"19":1,"25":8,"27":2,"31":4,"32":70,"34":3,"37":1,"43":6,"44":3,"50":1,"52":2,"56":5,"60":1,"62":11,"68":6},"dominant|0|dominant":{"0":5,"1":109,"2":445,"3":18,"5":1,"6":11,"7":11,"8":16,"9":1,"12":22,"13":12,"14":27,"15":3,"18":21,"19":13,"20":2,"24":11,"25":6,"26":3,"28":1,"30":263,"31":151,"32":318,"33":2,"34":12,"36":4,"37":9,"38":7,"39":10,"42":18,"43":36,"44":67,"45":4,"48":6,"49":6,"50":4,"51":2,"54":1,"55":28,"56":21,"57":13,"60":25,"61":4,"62":23,"66":17,"67":10,"68":67,"69":1},"dominant|5|dominant":{"0":4,"1":106,"2":420,"3":5,"4":1,"6":4,"7":5,"8":29,"9":47,"12":17,"13":7,"14":12,"18":1,"19":5,"20":14,"25":10,"26":5,"27":4,"30":414,"31":153,"32":610,"33":1,"34":14,"36":4,"37":21,"38":33,"39":12,"42":5,"43":53,"44":75,"45":2,"48":4,"49":3,"50":5,"51":1,"55":19,"56":30,"57":4,"60":8,"61":6,"62":14,"66":20,"67":9,"68":90,"69":6},"dominant|10|dominant":{"0":1,"2":21,"3":1,"7":2,"8":4,"13":4,"14":29,"25":4,"26":3,"30":3,"31":1,"32":9,"37":8,"43":5,"44":9,"55":1,"60":5,"62":8,"66":10,"67":6,"68":59,"70":7},"dominant|2|dominant":{"1":1,"2":27,"6":1,"7":3,"8":4,"14":10,"15":1,"20":4,"25":1,"30":10,"31":20,"32":21,"43":2,"45":1,"50":9,"56":1,"58":2,"62":26,"66":1,"67":1},"dominant|2|minor":{"0":3,"1":22,"2":1,"6":1,"7":2,"9":5,"15":1,"31":5,"32":41,"36":1,"38":1,"43":2,"44":7,"46":2,"49":3,"50":3,"68":8},"dominant|6|dominant":{"2":3,"3":1,"6":3,"30":5,"31":6,"32":22,"37":3,"40":1,"42":3,"50":2,"62":3,"66":21,"67":8,"68":54,"70":3},"dominant|11|dominant":{"1":18,"2":87,"3":7,"4":1,"6":5,"8":72,"9":10,"13":1,"14":6,"15":2,"18":4,"19":1,"20":2,"24":1,"25":2,"26":3,"27":1,"30":161,"31":216,"32":196,"33":4,"34":7,"36":4,"37":10,"38":23,"39":4,"42":1,"43":11,"44":8,"45":3,"48":1,"49":2,"54":2,"55":6,"56":10,"57":4,"60":1,"61":6,"62":9,"63":2,"66":31,"67":25,"68":322,"69":4,"70":5},"suspended|7|suspended":{"4":3,"64":1},"suspended|0|suspended":{"0":3,"1":1,"2":10,"3":1,"4":111,"6":1,"7":2,"10":1,"12":3,"13":1,"22":5,"25":1,"26":5,"30":16,"31":1,"34":4,"42":1,"43":1,"46":2,"48":4,"56":1,"57":2,"58":2,"60":1,"61":5,"64":3,"69":2,"70":2},"suspended|5|suspended":{"4":4,"6":3,"62":1},"suspended|10|suspended":{"4":3,"46":1,"64":1,"68":1,"70":1},"minor|0|minor":{"0":2,"1":712,"2":18,"3":11,"6":15,"7":5,"8":8,"9":11,"10":2,"12":9,"13":17,"14":41,"15":44,"16":1,"18":19,"19":45,"20":14,"24":2,"25":16,"26":4,"27":4,"30":11,"31":94,"32":250,"33":3,"34":16,"36":5,"37":5,"38":13,"40":1,"42":22,"43":37,"44":31,"45":7,"46":1,"48":60,"49":20,"50":66,"52":2,"55":22,"56":13,"57":220,"60":26,"61":45,"62":8,"64":5,"66":12,"67":15,"68":15,"69":2},"minor|8|dominant":{"2":22,"7":2,"8":1,"9":2,"12":14,"24":1,"25":20,"26":1,"30":6,"32":3,"37":10,"38":2,"39":7,"42":3,"43":6,"54":1,"55":3,"56":4,"62":6,"63":1,"67":6,"68":69,"70":1},"dominant|5|minor":{"0":4,"1":678,"2":60,"3":17,"6":21,"7":10,"8":32,"9":11,"12":2,"13":39,"14":71,"15":149,"16":2,"18":5,"19":104,"20":43,"22":4,"24":6,"25":8,"26":4,"27":7,"30":8,"31":111,"32":1766,"33":6,"34":47,"36":1,"37":2,"38":51,"39":6,"43":18,"44":178,"45":9,"48":22,"49":19,"50":62,"52":1,"55":11,"56":16,"57":93,"60":4,"61":46,"62":31,"64":1,"66":7,"67":12,"68":54,"69":13,"70":2},"dominant|7|minor":{"1":30,"7":1,"8":1,"9":2,"13":10,"14":1,"15":4,"19":3,"20":1,"26":1,"31":1,"32":665,"34":3,"38":2,"43":2,"44":13,"49":2,"50":6,"57":2,"60":6,"61":1,"67":1,"68":5},"minor|11|dominant":{"2":8,"7":6,"14":1,"19":2,"24":7,"25":1,"26":5,"30":17,"31":11,"32":4,"33":1,"37":9,"40":1,"43":1,"45":1,"48":1,"60":1,"62":2,"66":70,"67":93,"68":35,"69":5},"dominant|11|minor":{"1":41,"2":1,"7":3,"8":37,"13":6,"14":3,"15":9,"20":2,"22":1,"30":2,"31":18,"32":282,"34":2,"37":2,"38":3,"39":1,"43":4,"44":6,"46":2,"48":2,"50":7,"56":3,"57":3,"61":18,"62":8,"67":12,"68":33,"69":41},"major|5|major":{"0":34,"1":3,"2":6,"6":2,"7":9,"8":2,"9":26,"10":1,"12":15,"13":4,"14":11,"16":2,"24":3,"26":1,"30":35,"31":1,"32":4,"36":3,"37":14,"38":5,"39":34,"40":1,"42":66,"43":1,"44":2,"45":3,"46":3,"49":1,"54":6,"55":9,"56":3,"60":2,"62":1,"66":16,"67":45,"68":8,"69":16},"diminished_family|5|dominant":{"1":14,"2":50,"3":15,"6":16,"7":6,"8":5,"9":3,"13":3,"14":4,"15":3,"19":7,"25":4,"26":1,"27":1,"30":196,"31":1104,"32":107,"33":71,"34":7,"36":5,"37":4,"38":10,"39":2,"43":1,"44":1,"45":63,"48":11,"49":9,"50":4,"55":13,"56":6,"57":14,"60":3,"61":14,"62":6,"64":1,"66":8,"67":2,"68":4,"69":1},"dominant|4|diminished_family":{"3":3,"8":1,"32":28,"36":1,"43":1,"68":5},"dominant|0|minor":{"1":23,"2":2,"7":3,"9":2,"13":5,"14":14,"15":1,"19":3,"20":2,"31":6,"32":638,"33":4,"34":15,"37":1,"38":10,"42":1,"43":8,"44":18,"48":1,"49":2,"50":2,"55":2,"56":4,"57":3,"60":5,"61":3,"67":1,"68":12,"69":4},"dominant|4|minor":{"1":11,"2":3,"6":1,"15":2,"26":2,"31":3,"32":76,"34":13,"38":1,"39":2,"44":3,"50":9,"55":1,"57":3,"60":3,"61":1,"62":1,"67":1,"68":4},"dominant|9|major":{"14":1,"20":1,"30":1,"42":1,"44":5,"48":1,"56":1,"57":1,"67":1,"68":1,"70":2},"major|9|diminished_family":{"18":3,"31":1,"32":17,"60":3,"61":3,"67":1,"68":1},"dominant|1|dominant":{"2":6,"6":4,"8":23,"12":2,"14":1,"15":4,"19":1,"24":1,"25":1,"26":6,"30":12,"31":3,"32":3,"37":5,"39":4,"42":2,"45":1,"50":3,"56":5,"66":1,"68":124},"minor|7|dominant":{"1":2,"2":26,"3":1,"6":3,"8":4,"15":3,"19":4,"30":8,"31":214,"32":17,"33":2,"45":1,"48":3,"50":2,"62":5,"68":5},"dominant|3|minor":{"1":11,"8":12,"14":2,"32":29,"34":1,"42":5,"56":4,"60":3,"67":3,"68":4,"69":3},"minor|11|minor":{"1":16,"3":2,"6":2,"7":3,"9":1,"13":1,"19":2,"22":1,"25":1,"31":15,"32":150,"38":2,"42":2,"43":1,"44":1,"45":2,"46":1,"61":3,"67":56,"68":15,"69":25},"minor|0|dominant":{"1":8,"2":11,"24":1,"30":5,"31":53,"32":17,"34":1,"38":2,"42":3,"57":2,"60":1,"61":1,"68":1},"minor|2|diminished_family":{"3":4,"6":7,"13":1,"31":2,"32":224,"36":1,"38":3,"61":7,"66":2},"dominant|9|dominant":{"1":3,"2":20,"6":4,"8":3,"9":3,"20":2,"30":5,"31":63,"32":44,"34":1,"38":2,"43":1,"44":1,"49":3,"56":8,"62":1,"66":3,"68":3},"dominant|9|minor":{"1":14,"6":1,"7":3,"13":2,"20":1,"22":1,"31":73,"32":323,"37":1,"38":1,"49":1,"50":2,"61":6,"67":12,"68":17,"69":30},"major|0|major":{"0":633,"1":158,"2":70,"3":10,"5":9,"6":13,"7":15,"8":6,"9":51,"12":4,"13":136,"14":66,"15":7,"18":10,"19":23,"20":1,"21":24,"24":10,"25":89,"26":38,"27":20,"30":65,"31":28,"32":75,"33":2,"36":1,"37":31,"38":8,"39":40,"42":31,"43":98,"44":52,"45":6,"46":5,"48":11,"49":2,"50":14,"52":2,"54":10,"55":86,"56":58,"60":15,"61":10,"62":9,"66":11,"67":46,"68":44,"69":38,"70":7},"major|0|minor":{"1":40,"8":2,"13":1,"14":8,"15":2,"19":2,"20":2,"25":4,"27":1,"30":2,"31":3,"32":238,"34":2,"38":3,"42":77,"43":2,"49":2,"55":3,"56":4,"60":1,"61":7,"67":38,"68":7,"69":5,"70":1},"major|1|diminished_family":{"3":7,"7":155,"8":14,"9":2,"10":4,"18":1,"21":1,"30":1,"32":59,"33":1,"36":105,"37":4,"38":9,"49":4,"57":1,"61":11,"63":3,"66":2,"67":3},"minor|1|minor":{"1":2,"7":9,"13":3,"14":6,"25":1,"32":29,"49":3,"50":1,"55":3,"60":2,"61":5,"67":10,"68":4},"minor|3|dominant":{"1":1,"2":5,"8":1,"22":1,"26":3,"30":34,"31":3,"32":3,"38":1,"39":7,"44":1,"62":1,"68":22,"69":2},"dominant|1|diminished_family":{"6":4,"7":51,"8":5,"10":2,"14":1,"21":1,"32":12,"36":25,"37":1,"38":21,"49":1,"54":14,"63":3,"67":10,"68":1},"diminished_family|6|dominant":{"2":15,"25":4,"31":2,"32":4,"39":8,"43":4,"44":1,"50":1,"52":1,"56":7,"68":17,"70":2},"diminished_family|1|minor":{"1":12,"2":2,"8":6,"9":21,"15":7,"19":3,"20":1,"30":1,"31":17,"32":223,"38":4,"44":6,"48":8,"49":2,"50":1,"56":1,"57":1,"60":1,"61":3,"69":4},"minor|8|minor":{"1":15,"8":1,"13":3,"14":1,"20":1,"25":12,"26":2,"30":1,"31":2,"32":25,"34":3,"42":11,"48":1,"55":4,"56":2,"60":2,"67":5,"68":3},"minor|9|minor":{"1":6,"6":1,"8":1,"19":2,"32":53,"34":1,"36":1,"38":1,"43":1,"50":3,"55":4,"66":3,"67":3},"minor|6|minor":{"1":6,"14":1,"19":1,"25":1,"28":1,"31":1,"32":16,"43":1,"67":1},"minor|2|dominant":{"1":2,"2":19,"4":1,"6":2,"7":2,"8":1,"9":1,"13":3,"18":6,"30":20,"31":95,"32":53,"33":3,"34":1,"36":1,"38":2,"43":2,"44":1,"45":2,"48":1,"55":8,"57":2,"61":1,"66":4,"68":8},"minor|7|diminished_family":{"0":2,"21":1,"32":17},"minor|3|minor":{"1":16,"14":9,"16":2,"19":6,"20":1,"25":4,"31":1,"32":106,"37":1,"42":23,"43":3,"44":2,"54":1,"55":2,"56":1,"60":1,"67":22,"68":6},"dominant|6|diminished_family":{"7":7,"8":2,"32":65,"36":1,"38":15,"67":8,"68":3,"69":1,"70":1},"major|11|dominant":{"0":1,"1":1,"2":29,"6":7,"7":2,"8":2,"14":2,"24":1,"26":1,"30":36,"31":81,"32":32,"33":5,"34":4,"37":1,"38":5,"43":3,"49":2,"55":5,"56":1,"60":1,"61":10,"62":5,"63":1,"66":16,"67":1,"68":41,"69":2},"dominant|3|dominant":{"1":1,"2":2,"8":1,"14":4,"15":1,"24":3,"30":2,"31":1,"32":7,"37":4,"39":2,"42":2,"62":2,"67":2,"68":43},"dominant|7|major":{"0":22,"1":2,"2":4,"8":1,"9":7,"13":11,"14":1,"20":1,"25":12,"26":4,"27":6,"30":1,"32":34,"39":5,"43":1,"44":4,"46":2,"50":2,"51":1,"54":2,"55":9,"56":3,"62":9,"67":1,"68":1,"69":1},"major|3|dominant":{"1":6,"2":1,"6":1,"21":1,"24":2,"30":44,"31":9,"32":2,"37":1,"42":2,"43":2,"60":1,"62":3,"66":1,"67":13,"68":11},"major|1|dominant":{"1":1,"2":5,"32":3,"36":1,"37":5,"49":1,"54":1,"56":1,"62":1,"66":33,"67":1,"68":2,"70":1},"dominant|1|minor":{"1":11,"6":1,"13":1,"14":1,"31":2,"32":37,"68":3,"69":1},"minor|8|major":{"0":39,"2":3,"9":5,"14":4,"16":2,"19":1,"25":17,"26":5,"30":15,"32":2,"39":3,"42":3,"43":2,"48":2,"49":1,"50":1,"55":6,"56":1,"60":2,"66":3,"67":29,"68":7,"70":2},"minor|1|major":{"0":22,"1":8,"2":5,"6":1,"7":3,"9":6,"13":5,"14":20,"16":6,"18":2,"25":1,"26":3,"30":1,"37":5,"38":2,"39":1,"42":9,"43":1,"48":1,"54":1,"55":4,"67":66,"69":1},"major|10|dominant":{"2":6,"12":24,"14":2,"24":4,"25":3,"30":17,"37":2,"38":1,"39":1,"42":1,"51":2,"56":1,"62":13,"66":1,"67":5,"68":35},"major|11|major":{"0":26,"1":7,"2":1,"6":20,"13":1,"18":2,"19":2,"25":1,"26":2,"31":5,"32":1,"38":3,"43":1,"44":2,"46":1,"48":1,"54":1,"55":5,"56":3,"60":1,"61":1,"62":1,"66":8,"67":3,"68":4,"69":3},"minor|11|major":{"0":8,"2":1,"7":4,"9":2,"12":1,"20":1,"24":2,"30":1,"37":3,"38":1,"42":2,"48":1,"63":1,"66":11,"67":7,"68":4,"70":1},"major|2|major":{"0":1,"2":3,"6":3,"12":1,"13":14,"18":9,"19":1,"26":2,"30":16,"38":3,"42":1,"43":3,"44":1,"48":1,"54":5,"55":5,"60":23,"67":1,"68":1,"69":1},"major|4|dominant":{"2":37,"3":3,"6":25,"7":1,"8":3,"20":1,"30":8,"31":128,"32":34,"37":1,"43":4,"60":1,"61":2,"66":2,"68":8},"major|4|minor":{"1":32,"6":5,"7":2,"8":1,"15":2,"19":1,"20":2,"31":13,"32":179,"40":1,"42":1,"43":2,"44":5,"45":1,"48":5,"55":1,"57":7,"61":6,"66":1,"67":4,"68":2,"69":20},"minor|1|dominant":{"1":1,"2":7,"8":1,"9":1,"12":1,"14":7,"25":5,"30":9,"32":18,"34":2,"37":2,"38":2,"56":1,"57":3,"66":1,"67":59,"68":1},"dominant|11|major":{"0":63,"1":11,"2":7,"6":2,"7":3,"8":25,"9":14,"12":1,"13":16,"14":8,"15":8,"16":3,"18":4,"20":5,"25":3,"26":1,"27":2,"30":10,"31":3,"32":7,"34":2,"37":5,"38":16,"39":5,"40":1,"42":3,"43":4,"44":5,"49":1,"50":1,"54":1,"55":15,"56":11,"60":1,"61":2,"62":5,"66":9,"67":17,"68":22,"69":6,"70":3},"major|11|diminished_family":{"3":5,"6":1,"26":1,"31":1,"32":218,"61":2,"68":4,"69":1},"dominant|1|major":{"0":25,"1":5,"2":2,"5":1,"7":6,"8":4,"9":11,"13":2,"14":6,"16":1,"21":1,"25":2,"26":11,"27":2,"30":4,"32":7,"34":1,"38":3,"39":2,"42":4,"43":3,"48":1,"50":2,"55":6,"56":3,"58":2,"60":3,"61":2,"67":2,"68":5,"69":2},"major|5|suspended":{"2":3,"4":1,"12":3,"30":3,"32":1,"37":1,"39":1,"55":2},"suspended|5|dominant":{"28":1,"31":1,"32":2,"34":1,"38":1},"suspended|11|dominant":{"31":4,"43":1,"67":2,"68":3},"major|2|minor":{"0":1,"1":36,"6":1,"7":7,"9":42,"12":1,"13":137,"14":1,"15":2,"18":1,"19":1,"27":1,"31":8,"32":521,"34":13,"48":7,"56":1,"60":70,"61":2,"62":4,"66":1,"68":2,"69":1},"major|7|minor":{"0":1,"1":22,"2":1,"6":1,"13":1,"14":3,"19":1,"26":1,"30":46,"32":299,"34":1,"42":3,"44":1,"48":1,"55":4,"57":1,"61":2,"68":4},"minor|5|major":{"0":9,"1":6,"2":3,"7":2,"13":2,"19":3,"30":7,"34":2,"43":38,"44":1,"48":1,"55":2,"56":3,"57":3,"60":3},"major|8|major":{"0":7,"2":3,"5":1,"6":1,"7":1,"12":4,"24":2,"30":1,"34":1,"39":1,"44":1,"48":6,"54":3,"55":1,"66":1,"68":3,"69":1},"major|1|major":{"0":16,"2":4,"6":26,"7":4,"8":1,"12":1,"13":1,"25":1,"26":1,"30":5,"36":1,"37":2,"42":2,"43":3,"44":1,"48":2,"54":3,"55":5,"56":1,"60":2,"61":4,"62":1,"66":24,"67":2},"major|7|dominant":{"1":15,"2":21,"13":5,"14":1,"20":2,"30":266,"31":5,"32":22,"43":8,"44":3,"54":1,"55":5,"57":7,"60":4,"61":1,"62":3,"67":1},"dominant|6|minor":{"1":8,"3":1,"7":3,"8":1,"14":3,"19":3,"31":33,"32":376,"34":1,"37":4,"38":5,"48":2,"50":3,"62":2,"67":22,"68":16,"69":17},"minor|7|major":{"0":16,"1":3,"2":14,"6":1,"12":2,"13":12,"14":9,"15":1,"18":3,"19":6,"20":2,"21":14,"22":2,"25":1,"26":5,"30":2,"31":18,"32":1,"34":1,"37":2,"38":3,"39":5,"43":12,"44":14,"46":1,"50":2,"55":22,"56":21,"60":4,"62":2,"67":3,"68":9,"69":5},"minor|2|suspended":{"2":4,"4":1,"60":1},"major|9|dominant":{"1":3,"2":45,"6":2,"8":1,"13":3,"18":5,"30":3,"31":348,"32":100,"33":4,"34":1,"43":3,"48":3,"57":3,"60":3,"62":1,"66":4,"68":9},"minor|9|diminished_family":{"1":2,"2":1,"3":10,"6":2,"7":1,"12":2,"14":1,"15":1,"30":1,"32":226,"33":41,"34":1,"36":3,"39":1,"45":1,"49":5,"50":1,"61":6,"66":17,"67":23,"68":47},"dominant|5|suspended":{"0":1,"2":53,"3":2,"4":12,"14":1,"30":19,"31":5,"32":1,"38":1,"42":1,"43":2,"56":1,"60":1,"62":1,"64":1,"66":2,"68":1},"major|7|major":{"0":37,"1":1,"2":11,"3":1,"4":1,"6":3,"9":4,"13":20,"14":2,"15":1,"16":1,"18":1,"20":2,"21":2,"26":7,"30":29,"31":1,"32":1,"38":3,"39":2,"42":2,"43":3,"44":10,"45":1,"46":1,"52":1,"55":8,"56":5,"60":8,"61":3,"67":1,"69":7,"70":2},"minor|3|major":{"0":7,"1":3,"3":5,"7":2,"9":1,"10":1,"12":1,"13":1,"21":2,"32":3,"34":3,"36":1,"37":2,"42":1,"43":2,"46":1,"55":7,"56":8,"67":2},"major|0|suspended":{"2":1,"12":1,"48":1,"67":1},"suspended|11|minor":{"32":1,"57":1,"67":1},"major|9|minor":{"1":39,"2":1,"3":2,"6":3,"8":3,"9":6,"13":6,"14":9,"15":3,"18":20,"19":2,"27":1,"30":2,"31":472,"32":148,"33":6,"34":8,"36":2,"37":2,"38":1,"42":4,"43":19,"44":3,"48":19,"49":9,"50":2,"55":11,"56":1,"57":20,"60":5,"61":6,"62":2,"66":1,"67":4,"68":21,"69":2},"minor|7|suspended":{"2":2,"4":1,"31":4,"56":1,"68":1},"suspended|0|dominant":{"0":1,"1":17,"2":10,"6":3,"10":3,"13":3,"14":2,"16":2,"25":1,"27":2,"30":96,"31":25,"32":8,"33":4,"34":10,"37":2,"38":1,"43":1,"44":1,"48":1,"54":1,"55":4,"57":1,"63":2,"64":3,"66":3,"68":2,"69":4,"70":1},"minor|6|dominant":{"0":2,"2":2,"9":3,"19":2,"25":4,"30":1,"32":6,"37":2,"60":3,"67":14,"68":61,"70":10},"minor|10|dominant":{"0":5,"1":1,"2":6,"6":4,"13":3,"20":1,"30":11,"31":2,"32":4,"38":1,"60":1,"61":2,"62":17,"67":1,"68":12,"69":4},"dominant|11|diminished_family":{"2":3,"3":1,"7":1,"32":56,"38":1,"44":2,"50":2,"61":1,"66":2,"67":6,"68":3},"major|0|dominant":{"0":15,"1":2,"2":29,"6":2,"8":2,"9":2,"13":6,"18":2,"24":2,"25":2,"30":231,"31":19,"32":31,"37":1,"38":2,"39":4,"42":1,"43":2,"44":2,"48":1,"50":1,"55":8,"56":8,"62":1,"66":2,"67":7,"68":18,"69":4},"dominant|3|major":{"0":1,"1":2,"2":1,"6":5,"7":1,"8":1,"9":11,"13":8,"14":5,"20":3,"39":1,"42":1,"44":2,"45":2,"51":1,"55":4,"56":1,"57":1,"67":3,"68":4},"dominant|4|major":{"0":10,"2":1,"6":3,"8":1,"13":6,"14":1,"20":2,"25":7,"26":1,"32":3,"38":2,"39":1,"43":5,"44":2,"46":1,"50":1,"55":2,"56":4,"69":1},"major|2|dominant":{"1":23,"2":63,"9":10,"13":1,"14":3,"20":1,"30":59,"31":2,"32":35,"34":3,"35":1,"36":1,"38":2,"43":3,"55":12,"56":3,"57":3,"60":2,"62":1,"69":1},"major|10|major":{"0":15,"6":3,"9":2,"12":37,"16":4,"24":1,"25":1,"30":6,"36":1,"37":7,"42":3,"60":18,"61":1,"62":2,"66":9,"67":12,"68":12,"70":2},"major|4|major":{"0":8,"1":1,"4":1,"6":3,"8":1,"9":1,"14":1,"18":1,"24":1,"26":1,"30":1,"44":3,"55":2,"66":1,"68":1,"69":1},"minor|4|minor":{"1":9,"7":1,"19":3,"25":3,"31":1,"32":17,"37":1,"43":2,"49":15,"50":1,"54":1,"55":1,"66":2,"68":2},"minor|10|major":{"0":24,"1":2,"2":7,"3":2,"8":1,"9":4,"13":61,"14":1,"15":2,"16":2,"26":7,"30":12,"31":11,"32":4,"37":2,"38":6,"39":1,"43":7,"44":8,"50":3,"55":4,"56":3,"60":14,"61":1,"62":2,"66":4,"67":4,"68":18,"69":2},"minor|5|suspended":{"1":3,"2":56,"3":1,"4":6,"12":2,"13":1,"18":1,"20":1,"22":2,"27":2,"30":73,"33":3,"42":1,"43":2,"45":2,"54":1,"55":3,"57":1,"60":2,"62":1,"63":6},"suspended|5|major":{"0":30,"2":5,"5":1,"9":1,"12":4,"13":18,"14":2,"15":2,"20":4,"21":3,"24":1,"25":5,"26":8,"27":1,"28":1,"30":7,"31":2,"32":6,"34":1,"37":1,"38":5,"39":3,"43":6,"44":3,"46":35,"48":1,"55":20,"56":6,"57":2,"60":1,"61":1,"62":3,"68":1,"69":1},"major|5|minor":{"1":16,"9":4,"13":1,"14":2,"25":3,"32":79,"34":1,"39":1,"42":41,"43":1,"44":2,"60":6,"61":1,"62":1,"66":1,"67":1,"68":1},"dominant|2|major":{"0":41,"1":1,"2":10,"3":1,"5":3,"6":3,"8":2,"13":21,"14":10,"19":5,"20":1,"21":13,"25":17,"26":11,"27":4,"30":2,"31":7,"32":11,"37":2,"39":5,"42":1,"43":6,"44":8,"46":4,"48":1,"49":1,"50":6,"55":38,"56":37,"60":3,"61":3,"62":12,"67":3,"68":5,"69":9},"major|10|minor":{"1":4,"8":2,"32":53,"43":1,"50":1,"60":13,"71":3},"major|1|minor":{"1":5,"6":1,"8":1,"9":1,"19":2,"31":1,"32":77,"34":5,"55":1,"60":1,"62":5,"66":3,"67":2,"68":3},"major|3|major":{"0":7,"1":1,"3":2,"12":4,"13":2,"18":2,"20":2,"24":1,"30":5,"38":1,"42":1,"54":3,"55":1,"61":1,"66":2,"68":3},"dominant|8|minor":{"26":1,"32":58,"42":3,"67":3,"68":2,"69":3},"dominant|8|dominant":{"2":8,"18":1,"19":3,"24":1,"30":7,"32":3,"66":1,"67":5,"68":7},"suspended|7|major":{"0":1,"8":1,"20":2,"54":1},"major|5|dominant":{"0":2,"2":56,"7":3,"9":10,"12":107,"13":2,"14":7,"16":1,"20":4,"25":17,"26":7,"27":1,"30":13,"31":8,"32":10,"37":70,"38":5,"39":10,"42":86,"43":1,"44":3,"54":3,"56":9,"60":3,"61":1,"62":1,"66":9,"67":152,"68":31,"69":16},"minor|1|diminished_family":{"3":6,"6":1,"7":40,"8":8,"9":2,"25":3,"26":2,"32":2,"36":3,"37":2,"38":2,"51":1,"54":44,"56":8,"67":6},"diminished_family|9|major":{"0":10,"1":1,"2":1,"8":1,"9":1,"13":9,"14":4,"21":2,"25":1,"26":5,"30":8,"31":1,"32":3,"43":4,"44":1,"46":2,"55":7,"56":2,"62":1},"dominant|5|diminished_family":{"0":11,"1":3,"3":3,"32":116,"34":3,"44":2,"57":2,"68":3},"suspended|11|major":{"20":1,"22":1,"66":1},"major|3|suspended":{"32":1,"42":2,"67":1},"major|10|suspended":{"2":1,"32":1,"48":1},"minor|9|dominant":{"1":1,"2":3,"3":1,"6":3,"13":1,"15":1,"19":3,"21":1,"30":5,"31":5,"32":13,"33":6,"66":1,"67":2,"68":8},"minor|2|minor":{"0":6,"1":10,"2":2,"6":63,"7":15,"8":5,"13":3,"14":1,"15":1,"19":3,"20":6,"31":26,"32":76,"36":1,"38":2,"44":1,"48":3,"49":9,"55":1,"61":90,"66":4,"67":2,"68":3,"69":13},"diminished_family|7|minor":{"31":1,"32":6},"dominant|10|minor":{"1":6,"14":4,"18":1,"20":3,"32":40,"42":4,"43":4,"44":2,"48":1,"55":1,"56":1,"57":1,"62":1,"66":1,"67":5},"major|6|dominant":{"2":11,"3":4,"6":4,"8":5,"19":12,"24":2,"30":19,"31":16,"32":25,"33":2,"34":1,"38":1,"54":4,"62":3,"66":33,"67":8,"68":19},"minor|8|suspended":{"4":2,"12":1,"38":1},"suspended|2|major":{"0":3,"28":1,"32":2,"36":1,"42":1,"43":2,"61":1,"64":1},"minor|6|major":{"0":5,"30":1,"38":1,"55":1,"60":2,"68":1},"minor|11|diminished_family":{"3":7,"7":20,"9":2,"13":1,"24":2,"26":4,"32":30,"38":1,"39":2,"66":2,"67":160,"68":10,"69":3},"diminished_family|11|diminished_family":{"3":1,"25":1,"32":9,"34":1,"42":1,"62":2,"69":6},"diminished_family|5|suspended":{"2":9,"30":1,"34":1},"diminished_family|6|major":{"0":8,"2":8,"5":1,"9":1,"13":9,"14":5,"25":2,"26":2,"27":2,"30":7,"31":1,"32":4,"38":1,"39":2,"43":3,"44":17,"46":2,"50":2,"51":3,"55":12,"56":44,"60":2,"61":2,"63":1,"67":1,"69":2},"minor|11|suspended":{"2":1,"4":2},"minor|4|suspended":{"2":2,"30":1},"suspended|2|minor":{"1":5,"14":1,"68":1},"suspended|3|suspended":{"4":5,"28":2,"44":1},"suspended|11|diminished_family":{"3":1,"32":1,"68":1},"diminished_family|1|dominant":{"2":4,"5":1,"6":1,"8":11,"9":3,"14":1,"30":6,"32":3,"43":3,"56":1,"57":1,"68":1},"major|8|minor":{"1":1,"25":2,"32":6,"57":1,"67":1},"minor|10|suspended":{"4":5,"22":1,"62":1},"minor|0|major":{"0":8,"6":2,"19":2,"30":2,"43":1,"57":1,"60":1,"63":1},"diminished_family|3|diminished_family":{"32":2,"33":1,"45":1},"diminished_family|5|diminished_family":{"3":1,"32":46,"39":1},"major|3|diminished_family":{"3":10,"26":8,"32":2,"54":1,"67":128,"69":1},"diminished_family|11|minor":{"0":1,"1":21,"7":1,"9":1,"13":3,"14":4,"15":2,"19":2,"25":3,"32":293,"34":12,"38":2,"42":17,"43":3,"44":7,"48":1,"57":2,"60":1,"67":31,"68":5,"69":13},"major|6|minor":{"1":8,"6":1,"8":1,"14":2,"31":6,"32":123,"34":2,"61":1,"62":2,"66":4,"67":2,"68":3},"dominant|8|suspended":{"4":2,"31":2},"major|9|major":{"0":13,"2":1,"6":4,"8":1,"13":1,"24":1,"31":5,"32":2,"42":1,"48":1,"54":3,"56":1,"62":2,"67":4},"dominant|4|dominant":{"1":1,"2":15,"3":1,"8":5,"25":3,"32":7,"38":3,"44":1,"62":5,"68":1},"major|8|suspended":{"2":1,"4":2},"dominant|10|suspended":{"2":5,"4":3,"48":1},"suspended|8|major":{"0":1,"8":1,"12":1,"14":1,"24":1,"30":1,"60":1,"61":2},"major|1|suspended":{"2":1,"4":1,"67":1},"dominant|8|major":{"0":5,"1":12,"9":8,"13":2,"14":1,"26":3,"30":1,"32":2,"39":1,"55":8,"56":2,"60":3,"67":2,"68":3},"major|7|suspended":{"2":7,"4":5,"24":1,"25":2,"30":54,"32":2,"50":1,"55":2,"57":3,"60":1,"69":1},"diminished_family|11|dominant":{"2":3,"24":1,"25":9,"32":2,"37":1,"39":2,"42":4,"43":2,"60":1,"66":2,"67":46,"68":24,"69":2,"70":5},"diminished_family|0|diminished_family":{"1":2,"2":1,"3":24,"7":6,"8":2,"9":3,"12":2,"13":3,"18":1,"25":1,"31":1,"32":34,"33":2,"34":1,"36":1,"38":1,"42":1,"44":1,"54":2,"58":1,"60":2,"66":6,"67":18,"68":2,"69":2},"diminished_family|11|major":{"0":6,"1":1,"9":3,"14":3,"25":6,"32":1,"39":4,"42":10,"67":6,"68":2},"dominant|10|major":{"0":23,"1":5,"2":2,"6":3,"9":2,"12":4,"13":4,"14":4,"20":2,"25":1,"26":4,"30":4,"31":2,"32":3,"42":14,"44":2,"46":1,"51":1,"55":6,"56":3,"61":1,"62":1,"67":1,"68":2},"major|4|diminished_family":{"3":1,"6":4,"32":86,"38":1,"61":5,"68":2},"major|8|dominant":{"2":16,"24":11,"30":6,"31":1,"32":2,"37":3,"44":3,"66":1,"68":11,"70":1},"dominant|6|major":{"0":5,"7":1,"20":1,"26":1,"32":2,"37":2,"55":3,"56":3,"66":5,"67":3,"68":3},"dominant|0|diminished_family":{"2":7,"3":2,"9":1,"14":2,"32":49,"38":1,"62":4},"diminished_family|10|major":{"2":2,"8":1,"13":5,"15":2,"19":3,"26":1,"27":3,"37":1,"38":3,"46":1,"57":1},"major|2|diminished_family":{"9":1,"13":3,"32":21,"34":1,"60":8,"63":2},"dominant|11|suspended":{"2":16,"4":1,"9":1,"16":1,"20":2,"30":4,"31":3,"34":3,"60":1,"66":1,"68":5},"suspended|4|minor":{"32":3},"major|6|major":{"0":1,"12":2,"16":1,"30":3,"68":3},"major|11|suspended":{"2":10,"4":4,"30":1,"48":1,"49":2,"54":1,"61":3,"70":2},"suspended|10|minor":{"1":4,"46":3,"50":1,"67":1},"dominant|9|suspended":{"4":2,"70":2},"minor|4|dominant":{"2":1,"8":1,"30":7,"32":5,"34":1,"37":2},"minor|6|diminished_family":{"7":1,"26":1,"32":3,"67":3,"68":2},"diminished_family|0|major":{"0":6,"1":1,"2":2,"3":9,"5":1,"21":1,"25":1,"26":6,"27":2,"30":2,"44":1,"51":1,"55":2,"67":3},"major|0|diminished_family":{"0":16,"3":12,"13":8,"15":3,"31":5,"32":4,"42":5,"43":1,"44":3,"46":1,"50":1,"69":1},"major|10|diminished_family":{"31":1,"32":4,"56":1,"67":1},"diminished_family|5|minor":{"1":1,"14":2,"24":1,"32":4,"38":1,"42":3},"minor|4|major":{"25":2,"36":2,"37":1,"42":1,"49":1,"63":3},"suspended|1|major":{"0":2,"32":3},"diminished_family|9|dominant":{"2":1,"30":6,"31":3},"major|2|suspended":{"2":5,"6":1,"13":4,"30":10,"43":1,"54":1,"60":10},"major|8|diminished_family":{"7":6,"67":3},"major|4|suspended":{"2":2,"48":1},"suspended|7|minor":{"13":1,"19":1,"32":3,"34":1},"major|7|diminished_family":{"0":4,"32":5,"43":4},"diminished_family|10|minor":{"1":2,"31":9,"32":17,"44":1,"50":3,"56":1,"57":4,"64":1,"69":1},"dominant|0|major":{"0":8,"2":4,"5":13,"6":1,"12":2,"13":1,"32":2,"39":2,"44":2,"48":1,"55":1,"56":1,"61":1},"dominant|9|diminished_family":{"3":2,"8":1,"20":1,"32":114,"34":1,"38":4,"51":1,"61":2,"67":18,"68":3,"69":1},"suspended|0|diminished_family":{"2":2,"3":1,"32":2},"dominant|7|diminished_family":{"3":4,"6":1,"32":85,"66":3},"diminished_family|1|major":{"1":5,"6":1,"9":3,"26":3,"31":1,"42":2,"44":1,"54":1,"55":4,"69":2},"dominant|2|diminished_family":{"3":1,"7":1,"19":3,"32":22,"66":1,"68":2},"minor|2|major":{"0":3,"10":1,"13":3,"55":8,"66":1},"diminished_family|8|dominant":{"1":1,"12":1,"32":1,"38":1,"66":2,"68":2},"diminished_family|4|minor":{"1":2,"30":2,"32":3,"49":2,"55":2},"diminished_family|1|suspended":{"2":6,"30":1},"major|3|minor":{"9":2,"26":2,"31":1,"32":56,"42":1,"67":10,"69":8},"major|0|other":{"0":42,"13":4,"30":2,"32":1,"55":1},"other|0|major":{"0":21,"1":2,"2":4,"5":4,"9":2,"13":3,"27":1,"43":2,"56":7,"66":1},"other|2|minor":{"32":4},"minor|0|diminished_family":{"3":6,"32":18,"38":3,"46":1,"50":2,"60":6,"62":1},"diminished_family|3|major":{"0":1,"55":1,"57":2},"minor|5|diminished_family":{"3":3,"8":1,"30":3,"32":12,"34":1},"diminished_family|5|major":{"2":1,"43":3},"diminished_family|6|minor":{"2":3,"32":5,"48":1},"diminished_family|2|minor":{"1":3,"7":3,"32":11},"minor|4|diminished_family":{"7":3,"32":11},"diminished_family|8|minor":{"14":4,"32":9,"44":1},"diminished_family|3|minor":{"1":1,"32":3,"34":1},"diminished_family|1|diminished_family":{"6":2,"8":1,"9":2,"10":1,"32":6,"50":1,"56":1},"suspended|10|dominant":{"2":1,"50":1,"66":1,"67":1},"suspended|10|major":{"0":1,"1":2,"16":9,"54":1,"60":1,"67":2},"suspended|9|diminished_family":{"32":6},"diminished_family|7|suspended":{"2":2,"31":1,"39":1},"diminished_family|2|major":{"0":2,"48":2},"diminished_family|10|diminished_family":{"0":6,"32":6},"suspended|11|suspended":{"2":1,"4":2,"12":2,"37":2},"suspended|4|dominant":{"31":2,"68":3},"dominant|0|suspended":{"2":2,"4":2,"30":1},"diminished_family|0|dominant":{"2":2,"3":1,"31":1,"32":5,"43":2,"62":2,"66":3},"dominant|8|diminished_family":{"26":2,"32":2,"62":1,"67":2},"dominant|0|other":{"30":4,"32":1},"other|5|major":{"0":2,"14":1,"21":2,"47":1,"68":3},"minor|11|other":{"20":3},"other|3|dominant":{"31":3},"diminished_family|7|major":{"0":2,"1":2,"2":2,"21":4,"67":1},"diminished_family|4|dominant":{"2":5,"30":2,"37":1,"38":1,"39":8,"51":1,"68":1},"minor|8|diminished_family":{"38":2,"67":1},"diminished_family|2|dominant":{"32":2,"37":1,"68":1},"diminished_family|9|diminished_family":{"32":3},"diminished_family|7|dominant":{"2":1,"30":3,"31":2,"32":2},"dominant|3|diminished_family":{"32":2,"60":1,"67":1},"diminished_family|2|diminished_family":{"32":1,"63":3},"suspended|9|dominant":{"2":1,"31":1,"32":1},"dominant|10|diminished_family":{"32":1,"42":2,"60":1,"62":2,"67":7},"diminished_family|10|dominant":{"2":5,"30":2,"34":1,"68":2},"suspended|6|minor":{"32":3},"suspended|0|minor":{"32":4},"suspended|5|diminished_family":{"46":2,"67":1},"suspended|9|minor":{"7":1,"31":3,"32":2,"37":2},"suspended|0|major":{"0":3,"2":1},"major|9|suspended":{"2":1,"9":2},"major|5|diminished_family":{"42":2,"68":1},"suspended|1|diminished_family":{"9":1,"54":2},"diminished_family|6|diminished_family":{"19":1,"32":1,"43":1,"69":1},"dominant|1|suspended":{"2":1,"4":2},"dominant|2|suspended":{"2":2,"30":1},"minor|0|suspended":{"2":3},"diminished_family|0|minor":{"32":7},"suspended|3|dominant":{"8":2,"68":1},"suspended|10|diminished_family":{"25":6}},"3":{"dominant|5|major|11|minor":{"1":1,"6":2,"31":2,"32":39,"61":9,"63":1,"68":1},"major|11|minor|5|minor":{"1":1,"6":2,"8":1,"14":4,"15":1,"31":6,"32":4},"minor|5|minor|5|minor":{"1":5,"13":7,"14":2,"19":4,"25":1,"31":13,"32":121,"34":5,"43":1,"48":1,"50":2,"57":5,"60":5,"67":1,"69":2},"minor|5|minor|7|minor":{"1":1,"14":2,"15":10,"31":16,"32":4,"38":2,"44":2,"50":1,"57":1,"60":1,"61":1,"62":2,"68":1},"minor|10|minor|5|dominant":{"30":64,"31":8,"32":8,"37":1,"38":3,"43":4,"49":3,"55":2,"61":1,"62":1,"67":1},"minor|5|dominant|5|major":{"0":657,"1":126,"2":140,"3":17,"4":1,"5":11,"6":12,"7":51,"8":5,"9":121,"13":345,"14":21,"15":7,"18":2,"19":23,"20":25,"21":47,"24":1,"25":83,"26":73,"27":39,"30":107,"31":58,"32":304,"33":1,"34":4,"37":62,"38":42,"39":80,"42":3,"43":131,"44":127,"45":1,"46":13,"49":3,"50":6,"55":415,"56":223,"57":12,"60":19,"61":26,"62":43,"66":2,"67":35,"68":57,"69":99,"70":1},"dominant|5|major|6|diminished_family":{"7":2,"26":1,"32":88,"33":2,"36":1,"37":2,"49":3,"66":1,"68":10,"69":4},"dominant|5|dominant|7|dominant":{"1":1,"2":30,"13":1,"14":1,"27":1,"31":2,"32":52,"34":2,"43":4,"68":1},"dominant|7|dominant|0|dominant":{"1":1,"2":8,"8":1,"13":6,"32":38,"38":1,"44":12,"68":1},"dominant|0|dominant|5|dominant":{"1":9,"2":213,"3":1,"8":10,"9":20,"14":3,"20":4,"27":1,"30":7,"31":2,"32":24,"36":1,"38":6,"43":6,"44":6,"55":2,"56":1,"57":1,"62":2,"67":1,"68":1},"dominant|5|dominant|0|dominant":{"1":28,"2":53,"6":1,"8":3,"13":2,"14":9,"18":1,"19":2,"20":1,"30":67,"31":34,"32":126,"34":2,"36":2,"38":1,"42":3,"43":9,"44":37,"49":3,"50":2,"51":1,"55":4,"56":9,"57":3,"60":4,"62":2,"66":2,"68":2},"dominant|0|dominant|7|dominant":{"2":32,"8":4,"13":1,"14":1,"19":1,"25":6,"27":1,"31":1,"32":4,"37":1,"44":1,"52":2,"56":5,"62":8,"68":1},"dominant|7|dominant|10|dominant":{"14":2,"32":1,"44":7,"68":1},"dominant|10|dominant|7|dominant":{"1":1,"2":5,"44":2,"62":1},"dominant|5|dominant|5|dominant":{"0":1,"1":13,"2":16,"3":1,"6":3,"7":3,"8":3,"9":5,"12":7,"13":1,"14":6,"18":1,"19":1,"20":1,"25":10,"27":2,"30":225,"31":19,"32":194,"34":1,"37":16,"38":2,"39":3,"42":2,"43":9,"44":11,"55":12,"56":6,"61":3,"66":10,"68":20},"dominant|5|dominant|2|dominant":{"2":3,"30":1,"32":4,"43":1,"56":1,"58":2},"dominant|2|dominant|0|dominant":{"0":1,"2":6,"3":4,"30":1,"31":3,"32":3,"44":1,"57":1,"62":1,"68":6},"dominant|0|dominant|0|dominant":{"0":1,"1":4,"2":291,"5":1,"7":1,"8":1,"14":5,"19":2,"25":1,"30":40,"31":9,"32":35,"39":1,"42":2,"43":8,"44":4,"48":2,"51":1,"55":9,"56":3,"57":2,"60":10,"61":1,"62":14,"66":2,"67":1,"68":12},"dominant|0|dominant|2|minor":{"1":1,"2":1,"32":8,"44":1,"68":1},"dominant|2|minor|5|dominant":{"1":4,"27":3,"30":1,"31":5,"32":19,"43":2,"45":1,"49":3,"55":1,"60":1,"68":2},"minor|5|dominant|5|dominant":{"0":1,"1":38,"2":68,"4":1,"8":6,"9":10,"13":4,"14":1,"19":1,"20":2,"26":4,"27":1,"30":81,"31":1,"32":80,"33":1,"34":6,"37":2,"38":10,"39":3,"43":23,"44":5,"45":1,"50":1,"55":2,"56":20,"57":1,"60":1,"62":7,"66":1,"67":3,"68":21},"dominant|0|dominant|6|dominant":{"2":1,"32":3,"68":3},"dominant|6|dominant|11|dominant":{"1":1,"2":5,"14":1,"30":14,"31":7,"32":11,"34":4,"44":1,"45":1,"62":3,"68":7},"dominant|11|dominant|7|dominant":{"1":1,"2":1,"13":1,"32":1,"68":4},"suspended|0|suspended|5|suspended":{"4":3,"62":1},"suspended|5|suspended|0|suspended":{"4":2,"46":1},"minor|0|minor|0|minor":{"0":1,"1":448,"2":4,"3":1,"6":6,"7":2,"8":4,"10":2,"12":3,"13":5,"14":10,"15":12,"18":6,"19":3,"20":3,"25":1,"26":3,"27":2,"30":4,"31":35,"32":76,"36":4,"38":1,"42":2,"43":9,"44":13,"45":2,"48":11,"49":6,"50":10,"52":2,"57":20,"60":8,"61":16,"62":3,"66":4,"67":5,"68":1},"minor|0|minor|5|minor":{"1":41,"2":3,"13":4,"14":6,"19":2,"20":2,"31":6,"32":25,"43":8,"48":1,"52":1,"60":1},"minor|5|minor|0|minor":{"1":17,"9":3,"13":1,"14":1,"20":2,"31":3,"32":14,"34":1,"43":4,"48":2,"50":1,"55":1,"57":9,"60":2,"64":1,"68":1},"minor|0|minor|7|minor":{"1":24,"6":1,"8":1,"9":3,"14":2,"15":1,"32":4,"45":1,"57":2},"minor|7|minor|0|minor":{"1":9,"6":1,"13":1,"14":3,"15":2,"19":2,"25":2,"26":1,"31":3,"32":1,"43":1,"48":1,"50":3,"56":1,"68":1},"minor|0|minor|8|dominant":{"2":19,"12":1,"24":1,"25":3,"30":1,"37":1,"39":2,"42":3,"54":1,"67":3,"68":34},"minor|8|dominant|11|dominant":{"2":2,"8":3,"30":7,"31":41,"32":6,"44":1,"45":1,"62":1,"66":2,"68":6,"69":1},"dominant|11|dominant|5|minor":{"1":39,"2":4,"6":3,"8":9,"9":1,"12":1,"13":1,"14":3,"15":16,"18":1,"19":3,"20":4,"31":10,"32":56,"34":6,"36":1,"38":3,"43":1,"44":11,"49":1,"50":8,"55":1,"56":3,"57":12,"61":7,"62":5,"69":1},"minor|0|minor|5|dominant":{"1":19,"2":83,"9":9,"12":2,"13":1,"19":4,"20":5,"27":1,"30":68,"31":4,"32":16,"33":2,"43":18,"44":1,"55":10,"57":2,"60":5,"61":1,"64":2,"68":1},"minor|5|dominant|0|dominant":{"1":25,"2":32,"6":3,"7":4,"8":3,"9":1,"14":2,"18":2,"20":1,"26":2,"30":65,"31":18,"32":20,"33":1,"38":1,"43":8,"45":1,"48":1,"50":1,"55":6,"56":3,"57":3,"60":3,"61":3,"66":4,"68":1},"dominant|0|dominant|7|minor":{"1":8,"13":1,"15":2,"32":20,"43":1,"44":2,"50":1,"61":1},"dominant|7|minor|0|minor":{"1":13,"8":1,"31":3,"32":6,"48":3,"50":1,"57":1,"68":1},"minor|0|minor|11|dominant":{"2":5,"14":1,"26":3,"30":1,"66":3,"67":2,"68":1},"dominant|0|dominant|5|minor":{"1":88,"2":2,"3":2,"6":1,"8":1,"9":1,"14":1,"15":1,"19":6,"31":4,"32":22,"34":1,"38":2,"44":8,"45":1,"48":1,"49":1,"50":1,"56":1,"57":3,"61":1,"62":1,"67":2,"69":1},"dominant|5|minor|5|dominant":{"0":1,"1":150,"2":19,"3":1,"6":3,"7":2,"8":1,"9":14,"12":2,"13":14,"14":3,"15":1,"18":5,"20":13,"25":1,"27":2,"30":889,"31":123,"32":88,"33":5,"34":17,"36":1,"37":17,"38":5,"39":9,"43":116,"44":1,"45":1,"48":1,"49":4,"55":121,"56":16,"57":32,"60":8,"61":5,"62":4,"66":2,"67":10,"68":7,"69":2},"dominant|5|major|5|major":{"0":5,"1":1,"2":2,"7":5,"9":6,"13":1,"14":1,"30":4,"31":1,"36":3,"37":11,"39":25,"42":29,"43":1,"45":3,"49":1,"55":2,"56":2,"67":34,"68":3,"69":7},"major|5|major|6|diminished_family":{"2":1,"32":31,"34":1,"38":2},"major|6|diminished_family|5|dominant":{"3":1,"6":4,"8":1,"19":2,"30":20,"31":127,"32":4,"33":16,"39":1,"45":1,"66":1,"67":1},"diminished_family|5|dominant|5|minor":{"0":1,"1":289,"2":23,"3":13,"6":10,"7":4,"8":9,"9":2,"12":1,"13":8,"14":19,"15":113,"19":44,"20":11,"22":1,"24":3,"25":2,"27":5,"30":1,"31":47,"32":275,"33":4,"34":2,"37":1,"38":15,"39":1,"43":3,"44":45,"45":8,"48":10,"49":6,"50":24,"55":3,"56":4,"57":40,"60":1,"61":6,"62":5,"64":1,"66":1,"67":7,"68":29,"69":8,"70":1},"dominant|11|dominant|5|dominant":{"1":16,"2":13,"8":3,"9":2,"13":2,"19":2,"20":3,"30":7,"31":17,"32":68,"34":2,"38":3,"39":3,"44":13,"56":1,"60":4,"62":4,"66":4,"68":26,"69":2},"dominant|5|dominant|11|dominant":{"2":1,"6":1,"13":1,"24":1,"25":1,"30":13,"31":13,"32":15,"36":2,"37":1,"55":1,"62":2,"66":4,"68":31},"dominant|11|dominant|0|dominant":{"2":6,"3":3,"7":1,"8":2,"15":2,"18":1,"30":8,"31":8,"32":11,"34":5,"37":1,"38":2,"44":5,"57":2,"66":3,"67":1,"68":23},"dominant|4|diminished_family|5|dominant":{"1":1,"6":3,"7":2,"30":1,"31":16,"32":1,"33":3,"45":1},"diminished_family|5|dominant|0|minor":{"1":2,"32":11,"33":1},"dominant|0|minor|5|dominant":{"1":30,"2":15,"3":2,"6":1,"7":2,"8":2,"9":2,"13":7,"14":3,"15":2,"18":4,"19":1,"20":3,"22":1,"24":2,"27":6,"30":413,"31":14,"32":19,"34":1,"36":2,"37":7,"38":1,"43":51,"44":3,"45":1,"50":2,"55":17,"56":4,"57":11,"60":1,"62":4,"67":1,"68":6,"69":1},"minor|8|dominant|0|dominant":{"2":1,"12":2,"24":1,"25":3,"31":1,"37":5,"38":2,"39":3,"68":3},"dominant|0|dominant|4|minor":{"1":3,"32":3},"dominant|4|minor|0|minor":{"1":3,"38":3,"50":2,"57":2},"major|9|diminished_family|5|dominant":{"1":1,"30":10,"31":1,"32":2,"45":1,"55":2},"dominant|7|dominant|4|minor":{"26":2,"32":5,"67":1},"dominant|4|minor|5|dominant":{"6":1,"14":1,"18":4,"25":4,"27":2,"30":38,"31":12,"32":2,"36":2,"37":3,"38":1,"55":3,"68":3},"minor|5|dominant|5|minor":{"0":2,"1":73,"2":1,"3":2,"7":3,"8":4,"9":1,"13":16,"14":12,"15":11,"18":1,"19":33,"20":2,"25":4,"26":4,"30":2,"31":6,"32":774,"33":2,"34":17,"38":14,"43":4,"44":25,"49":1,"50":11,"55":1,"56":1,"57":5,"60":1,"61":5,"62":4,"66":3,"67":2,"68":4,"69":1},"dominant|7|dominant|1|dominant":{"68":4},"dominant|1|dominant|11|dominant":{"1":4,"2":2,"8":58,"9":4,"18":1,"30":8,"31":23,"32":8,"38":5,"44":1,"49":1,"56":3,"68":12},"dominant|5|dominant|0|minor":{"9":2,"19":1,"31":1,"32":88,"34":4,"42":1,"43":2,"44":2,"55":2,"60":1,"67":1,"68":1},"dominant|0|minor|7|dominant":{"2":1,"19":1,"31":13,"32":1,"68":2},"minor|7|dominant|3|minor":{"32":1,"60":3,"67":1},"dominant|3|minor|11|minor":{"32":3},"minor|11|minor|5|dominant":{"1":2,"6":1,"13":1,"30":44,"31":50,"32":5,"33":5,"37":27,"39":1,"43":5,"48":1,"55":5,"66":3},"dominant|5|dominant|2|minor":{"32":7},"minor|0|minor|0|dominant":{"2":4,"31":12,"32":2,"61":1},"minor|0|dominant|5|minor":{"1":12,"8":1,"14":2,"15":1,"20":1,"32":18,"34":1,"38":1,"43":1,"44":8,"56":1,"57":3,"61":1,"62":2},"dominant|5|minor|0|minor":{"0":1,"1":133,"2":12,"3":7,"6":1,"7":2,"8":2,"9":4,"13":1,"14":15,"15":29,"18":4,"19":29,"20":4,"25":5,"27":2,"30":3,"31":26,"32":86,"34":5,"38":9,"42":7,"43":7,"44":13,"45":5,"46":1,"48":18,"49":8,"50":38,"55":10,"56":7,"57":123,"60":5,"61":17,"62":2,"64":1,"66":1,"67":1,"68":2},"dominant|5|minor|2|diminished_family":{"3":1,"6":1,"32":140,"38":3,"61":4},"dominant|7|dominant|9|dominant":{"31":1,"32":1,"66":3},"dominant|9|dominant|5|minor":{"1":6,"31":2,"32":31,"34":2,"38":3,"44":9,"48":1,"49":4,"56":1,"57":1,"68":3},"minor|5|dominant|9|minor":{"1":2,"6":1,"7":3,"31":55,"32":270,"37":1,"38":1,"50":2,"67":4,"68":11,"69":25},"dominant|9|minor|5|dominant":{"2":1,"13":3,"14":1,"15":3,"30":10,"31":232,"32":15,"33":11,"34":3,"37":2,"43":5,"48":6,"49":5,"55":14,"57":8,"61":1,"62":1,"68":2},"minor|7|minor|5|dominant":{"1":3,"2":2,"30":2,"31":5,"32":1,"34":1,"43":4,"68":3},"dominant|5|major|0|major":{"0":151,"1":101,"2":30,"3":5,"5":1,"6":6,"7":9,"8":2,"9":35,"12":1,"13":70,"14":29,"15":4,"18":2,"19":9,"20":1,"21":14,"24":5,"25":31,"26":23,"27":14,"30":35,"31":14,"32":46,"36":1,"37":17,"39":20,"42":5,"43":66,"44":31,"45":6,"48":7,"49":1,"50":5,"54":2,"55":45,"56":28,"60":2,"61":1,"62":5,"67":21,"68":19,"69":25,"70":2},"major|0|major|0|minor":{"1":35,"14":2,"15":2,"19":1,"20":1,"31":2,"32":115,"34":2,"42":4,"68":2,"69":1},"major|0|minor|5|dominant":{"1":5,"2":9,"8":1,"9":1,"12":52,"27":1,"30":98,"31":6,"32":4,"37":24,"38":1,"39":1,"42":5,"43":9,"55":7,"56":1,"61":1,"67":12,"68":1,"69":1,"70":1},"dominant|5|major|0|minor":{"1":2,"8":2,"13":1,"14":2,"20":1,"27":1,"32":99,"38":3,"42":51,"43":2,"55":3,"56":4,"60":1,"67":25,"68":4,"69":3},"dominant|5|major|1|diminished_family":{"3":1,"7":104,"8":2,"9":2,"10":2,"18":1,"21":1,"32":20,"33":1,"36":65,"37":4,"38":4,"61":5,"63":3,"66":1},"dominant|5|dominant|9|dominant":{"9":3,"31":17,"32":5,"56":3,"68":1},"minor|7|dominant|0|dominant":{"0":3,"1":1,"2":4,"3":4,"18":1,"19":4,"30":1,"31":7,"32":1},"dominant|0|dominant|0|minor":{"1":3,"7":1,"15":1,"19":1,"32":92,"34":1,"44":4,"48":1,"68":5,"69":1},"dominant|0|minor|1|minor":{"32":2,"61":1},"minor|1|minor|10|minor":{"32":3,"60":1,"61":1},"minor|10|minor|10|minor":{"20":1,"31":1,"60":1,"61":1,"67":2,"68":1,"69":1},"dominant|5|dominant|1|diminished_family":{"8":4,"10":2,"14":1,"21":1,"32":1,"36":14,"38":19,"49":1,"54":1,"63":3},"dominant|1|diminished_family|6|dominant":{"2":8,"25":4,"32":2,"56":6,"68":1},"diminished_family|6|dominant|4|minor":{"32":4},"minor|5|dominant|1|diminished_family":{"6":4,"7":37,"32":2,"54":11,"68":1},"dominant|1|diminished_family|1|minor":{"1":7,"2":1,"31":8,"32":26,"48":3,"49":2,"61":3,"69":1},"minor|8|minor|9|minor":{"19":1,"43":1,"50":2},"minor|2|dominant|5|minor":{"1":24,"2":5,"6":1,"14":7,"19":1,"20":3,"22":3,"31":8,"32":18,"39":3,"43":2,"44":3,"49":2,"50":3,"55":1,"57":3,"61":6,"68":3},"dominant|5|minor|8|minor":{"25":2,"32":8,"42":6,"60":2},"minor|8|minor|5|dominant":{"12":2,"30":8,"31":1,"32":1,"37":6,"38":2,"39":2,"43":2,"67":1},"minor|5|dominant|11|minor":{"1":9,"7":3,"8":3,"13":3,"32":26,"34":2,"37":2,"38":1,"43":1,"61":6,"62":1,"67":1},"dominant|11|minor|7|minor":{"1":2,"14":1,"60":1},"dominant|7|dominant|7|minor":{"32":6},"dominant|7|minor|5|dominant":{"1":50,"2":12,"3":2,"6":2,"9":4,"12":2,"14":2,"18":1,"19":1,"20":5,"26":1,"27":6,"30":256,"31":12,"32":42,"37":5,"38":1,"42":2,"43":194,"44":3,"49":2,"50":1,"55":20,"56":3,"57":11,"60":2,"61":3,"64":1,"66":2,"67":4,"68":1,"69":5},"minor|2|diminished_family|5|dominant":{"1":1,"2":2,"3":2,"6":1,"8":1,"15":1,"30":6,"31":182,"32":4,"38":3,"45":9,"49":1,"50":3,"55":1,"57":2,"61":6,"66":4,"68":1},"dominant|5|minor|7|diminished_family":{"32":9},"minor|7|diminished_family|5|dominant":{"31":18},"minor|0|minor|3|minor":{"1":16,"14":1,"32":30},"minor|3|minor|5|dominant":{"2":1,"12":26,"25":12,"30":20,"37":27,"38":2,"39":3,"43":1,"67":16},"minor|5|dominant|6|diminished_family":{"7":1,"32":15,"67":1,"68":2,"70":1},"dominant|6|diminished_family|5|dominant":{"3":1,"9":1,"14":4,"15":1,"30":4,"31":51,"37":3},"dominant|5|minor|11|dominant":{"24":5,"26":1,"30":3,"31":3,"37":1,"66":6,"67":32,"68":1,"69":2},"minor|11|dominant|11|minor":{"1":1,"8":2,"32":61,"43":1,"44":3,"68":26},"dominant|11|minor|5|dominant":{"1":30,"2":2,"7":2,"9":13,"13":1,"14":2,"25":3,"30":66,"31":108,"32":23,"33":1,"34":2,"37":6,"43":4,"48":2,"49":1,"55":5,"57":3,"61":1,"68":1,"69":1},"dominant|5|major|11|dominant":{"6":2,"24":1,"30":14,"31":52,"32":19,"33":4,"34":4,"43":2,"49":2,"55":3,"61":3,"62":3,"63":1,"66":6,"67":1,"68":13,"69":1},"major|11|dominant|5|minor":{"0":1,"1":12,"2":1,"6":1,"8":5,"14":2,"18":1,"20":4,"24":2,"31":6,"32":35,"37":1,"38":1,"43":2,"44":2,"48":1,"50":1,"56":2,"57":1,"62":1,"67":1,"68":1},"dominant|5|minor|2|dominant":{"1":1,"2":1,"30":2,"31":31,"32":27,"38":1,"55":3,"57":2,"68":4},"dominant|5|minor|5|minor":{"1":4,"9":4,"14":9,"20":3,"31":13,"32":53,"34":1,"38":1,"43":12,"44":1,"48":2,"49":1,"56":1,"57":4,"61":1,"66":1},"minor|5|minor|2|dominant":{"6":1,"31":25,"45":2,"61":1},"dominant|5|minor|8|dominant":{"2":3,"7":2,"12":7,"25":7,"30":1,"37":6,"39":3,"43":4,"55":1,"56":3,"67":3,"68":21,"70":1},"minor|8|dominant|9|dominant":{"2":1,"20":1,"30":1,"44":1},"major|3|dominant|11|minor":{"13":1,"32":12,"57":1},"major|0|major|1|dominant":{"1":1,"2":4,"66":1,"68":1},"dominant|0|dominant|1|minor":{"1":8,"32":4},"dominant|1|minor|0|minor":{"1":1,"24":2,"57":4,"68":4},"minor|3|minor|0|minor":{"1":2,"14":3,"18":2,"19":2,"42":1,"55":1,"67":3,"68":2},"minor|0|minor|8|major":{"0":37,"9":4,"14":3,"19":1,"25":1,"30":1,"32":1,"39":2,"42":1,"49":1,"55":1,"60":1,"67":8,"68":1},"minor|8|major|0|major":{"0":7,"25":17,"32":1,"55":4,"68":9},"major|0|major|0|major":{"0":388,"1":37,"2":22,"3":1,"6":3,"7":1,"8":1,"9":10,"13":33,"14":7,"18":1,"19":3,"21":9,"25":10,"26":7,"27":2,"30":12,"31":4,"32":18,"37":3,"38":3,"39":1,"42":6,"43":14,"44":7,"50":6,"54":1,"55":10,"56":17,"60":3,"61":4,"62":2,"66":3,"67":11,"68":6,"69":7},"major|0|major|11|dominant":{"2":25,"8":2,"30":1,"31":3,"32":4,"38":1,"61":3,"68":5},"major|11|dominant|0|dominant":{"2":3,"6":2,"18":8,"30":3,"31":6,"32":1,"66":2},"minor|3|minor|3|minor":{"19":2,"31":1,"54":1,"68":3},"dominant|5|minor|9|minor":{"32":6,"55":1,"66":1,"67":3},"minor|9|minor|9|minor":{"1":1,"6":1,"55":2},"minor|1|major|0|minor":{"19":1,"32":2,"67":5},"major|10|dominant|10|dominant":{"37":3,"68":10,"70":3},"dominant|10|dominant|11|dominant":{"2":4,"15":1,"30":13,"31":18,"32":12,"34":3,"38":2,"68":5},"dominant|11|dominant|5|major":{"0":47,"1":3,"2":5,"3":1,"9":3,"13":13,"15":1,"19":1,"20":2,"21":6,"24":1,"26":8,"27":1,"30":1,"31":1,"32":9,"38":1,"43":3,"44":7,"55":10,"56":10,"62":10,"68":13,"69":1},"dominant|5|major|10|dominant":{"12":15,"14":1,"24":4,"30":11,"37":1,"39":1,"62":12,"66":1,"67":2,"68":19},"major|11|major|11|major":{"0":2,"6":1,"54":1,"66":2,"68":3},"major|11|major|11|dominant":{"31":4},"minor|5|dominant|6|dominant":{"2":2,"31":1,"32":7,"37":2,"66":4,"67":1,"68":12},"dominant|6|dominant|5|dominant":{"2":2,"31":10,"32":7,"34":1,"66":1,"68":1},"dominant|5|dominant|7|major":{"8":1,"9":1,"30":1,"32":1,"55":1},"minor|0|minor|11|major":{"0":7,"12":1,"20":1,"48":1,"66":2,"68":1},"dominant|7|major|0|major":{"0":4,"2":1,"25":6,"32":2,"39":2,"43":3,"44":1,"55":2,"56":1},"major|0|major|4|minor":{"1":22,"8":1,"19":1,"20":2,"32":58,"44":2,"61":1,"69":7},"major|4|minor|0|minor":{"1":6,"2":1,"8":1,"14":1,"32":1,"48":16,"57":2,"60":1,"61":2},"minor|0|minor|1|dominant":{"2":5,"38":2,"67":1},"minor|1|dominant|11|minor":{"1":5,"2":1,"8":28,"15":6,"32":6,"43":1,"46":2,"61":7,"62":4,"69":1},"dominant|11|minor|1|dominant":{"1":1,"9":1,"12":1,"25":2,"30":2,"37":1,"66":1,"67":28},"diminished_family|5|dominant|11|major":{"0":5,"2":2,"13":1},"dominant|11|major|0|major":{"0":8,"1":5,"3":2,"6":1,"7":3,"8":3,"13":3,"14":1,"25":2,"30":2,"31":2,"37":4,"39":2,"43":1,"48":1,"49":1,"50":1,"55":5,"66":3,"68":2,"69":3},"major|0|major|11|diminished_family":{"3":4,"6":1,"32":39},"major|11|diminished_family|5|dominant":{"1":2,"2":1,"6":1,"8":2,"19":1,"30":4,"31":172,"32":10,"33":4,"38":2,"45":3,"48":1},"diminished_family|5|dominant|1|major":{"0":3,"2":1,"13":2,"27":2,"30":1,"32":2,"34":1,"38":1,"39":1,"55":1,"60":1,"67":1},"major|0|major|2|minor":{"1":22,"9":3,"13":3,"31":4,"32":110,"34":3,"60":1,"62":3},"major|2|minor|5|dominant":{"1":12,"2":10,"3":2,"12":1,"13":2,"14":1,"27":1,"30":254,"31":3,"32":3,"33":1,"37":1,"43":25,"44":3,"55":17,"56":6,"57":1,"61":1,"62":3},"major|0|major|7|minor":{"1":16,"2":1,"32":84},"major|7|minor|5|dominant":{"1":2,"2":2,"13":1,"24":1,"30":246,"31":7,"32":5,"36":1,"37":4,"38":1,"39":1,"43":21,"55":3,"56":1,"60":1,"67":2},"minor|5|dominant|4|minor":{"1":1,"2":3,"6":1,"32":17,"34":7,"38":1,"68":3},"major|7|minor|0|minor":{"1":1,"30":3,"31":3,"32":5,"33":2,"34":1,"43":1,"57":3,"61":3},"minor|7|minor|5|minor":{"1":4,"4":3,"8":2,"13":1,"14":2,"30":1,"32":4,"43":15,"55":1},"minor|5|minor|5|major":{"13":1,"43":1,"44":1,"60":2},"minor|5|major|7|minor":{"0":1,"6":1,"30":31,"48":1,"68":3},"major|7|minor|5|major":{"0":2,"1":6,"2":1,"7":2,"30":4,"43":27,"48":1,"55":2,"56":3,"60":1},"major|7|dominant|5|dominant":{"2":5,"26":1,"30":11,"37":1,"43":2,"44":1,"61":1,"68":1},"dominant|5|dominant|6|minor":{"31":1,"32":18,"62":1,"67":1},"dominant|6|minor|11|minor":{"19":1,"25":1,"32":9,"42":1,"67":10},"minor|7|major|7|minor":{"14":2,"19":1,"26":1,"30":1,"32":7},"minor|3|minor|7|minor":{"1":2,"16":1},"dominant|0|dominant|10|dominant":{"2":10,"14":4,"32":1,"60":3,"68":4,"70":2},"dominant|10|dominant|0|dominant":{"2":9,"6":1,"8":1,"14":1,"15":1,"31":2,"32":1,"48":2,"55":1,"62":1,"68":1,"69":1},"dominant|0|dominant|2|dominant":{"2":21,"8":1,"32":4,"62":1},"dominant|0|dominant|11|dominant":{"2":33,"8":4,"27":1,"30":2,"31":4,"32":9,"54":1,"56":7,"68":9},"dominant|11|dominant|11|dominant":{"1":3,"2":10,"3":4,"4":1,"6":1,"8":3,"9":6,"18":3,"20":2,"26":2,"30":41,"31":25,"32":44,"33":1,"37":4,"39":2,"43":1,"49":1,"55":1,"57":2,"62":1,"63":1,"66":10,"67":8,"68":140,"69":1,"70":3},"major|11|minor|0|minor":{"1":5,"6":4,"18":3,"20":1,"34":2,"57":1,"60":1,"64":1},"minor|0|minor|3|dominant":{"2":5,"22":1,"30":2,"68":6},"minor|3|dominant|0|dominant":{"2":1,"30":3,"67":1},"dominant|0|dominant|11|minor":{"1":5,"31":2,"32":1,"38":1,"50":1},"dominant|11|minor|8|dominant":{"25":4,"26":1,"68":2},"minor|8|dominant|4|minor":{"1":5,"32":3,"34":3,"44":1,"50":6,"57":3,"62":1},"dominant|4|minor|8|dominant":{"25":4,"63":1,"68":4},"major|5|major|11|minor":{"6":1,"22":4,"31":4,"32":28,"34":1,"55":1,"62":1,"68":5,"69":8},"major|11|minor|5|dominant":{"1":5,"2":5,"6":4,"15":1,"18":2,"30":31,"31":68,"32":13,"37":3,"38":1,"43":1,"45":1,"49":1,"57":2,"61":1,"62":2,"68":1},"dominant|5|major|9|dominant":{"1":1,"2":3,"6":2,"13":3,"18":2,"30":1,"31":252,"32":30,"33":1,"43":1,"48":2,"57":3,"60":2,"66":1},"major|9|dominant|5|minor":{"1":12,"2":2,"7":1,"13":6,"14":5,"19":8,"20":1,"30":1,"32":323,"34":10,"38":1,"44":1,"50":2,"56":2,"57":3,"60":2},"dominant|5|minor|3|minor":{"14":2,"16":2,"19":3,"20":1,"32":58,"42":16,"44":1,"55":2,"67":18,"68":1},"minor|3|minor|11|minor":{"1":3,"31":1,"32":7,"67":1,"69":10},"dominant|10|dominant|2|dominant":{"2":1,"7":3,"8":3,"14":5,"62":22},"dominant|2|dominant|10|dominant":{"0":1,"2":1,"14":16,"31":1,"44":2,"55":1,"67":1,"68":3},"minor|0|minor|9|diminished_family":{"1":2,"3":10,"6":2,"12":2,"30":1,"32":126,"36":1,"39":1,"45":1,"49":4,"50":1,"61":6,"66":17,"67":17,"68":33},"minor|9|diminished_family|5|dominant":{"1":1,"2":2,"3":4,"6":3,"19":2,"25":4,"30":28,"31":142,"32":26,"33":4,"34":1,"36":2,"38":1,"48":1,"49":2,"61":4,"66":1},"minor|8|major|11|dominant":{"31":3,"61":2,"68":3},"diminished_family|5|dominant|5|suspended":{"2":5,"4":1,"64":1},"major|0|major|1|diminished_family":{"3":6,"7":23,"32":14,"36":9,"38":2,"67":2},"major|1|diminished_family|5|dominant":{"2":1,"3":3,"30":10,"31":34,"32":1,"33":4,"45":1,"55":1,"64":1,"68":1},"minor|5|dominant|11|major":{"0":7,"1":5,"8":1,"9":1,"13":2,"15":1,"31":1,"32":2,"37":3,"42":1,"55":3,"56":1,"67":2},"dominant|11|major|7|major":{"13":1,"30":1,"55":1},"major|7|major|2|minor":{"1":2,"13":4,"18":1,"31":1,"32":7,"60":4,"61":2},"dominant|5|minor|3|dominant":{"26":3,"30":23,"31":3,"32":3,"38":1,"39":6,"68":3,"69":1},"minor|3|dominant|5|dominant":{"12":1,"68":2},"major|2|minor|0|minor":{"1":12,"14":1,"31":4,"32":6,"34":3,"40":1,"43":1,"55":1,"57":1,"60":3,"61":1},"dominant|0|dominant|5|major":{"0":107,"1":4,"2":12,"6":1,"8":1,"9":7,"13":18,"14":5,"15":1,"21":2,"25":5,"26":5,"30":4,"31":2,"32":13,"38":9,"39":4,"43":11,"44":9,"46":1,"50":2,"55":12,"56":16,"60":1,"61":1,"62":2,"67":1,"68":2,"69":2},"major|0|major|9|minor":{"1":29,"2":1,"9":4,"13":2,"14":2,"18":2,"31":8,"32":19,"34":5,"43":2,"49":1,"50":1,"57":1,"67":1,"68":10,"69":2},"major|9|minor|0|minor":{"1":5,"13":1,"18":2,"31":4,"32":1,"34":3,"43":1,"50":3,"55":2,"56":2,"57":9,"60":3,"61":2,"68":1},"dominant|5|minor|7|dominant":{"1":2,"2":3,"8":3,"19":3,"30":2,"31":141,"32":7,"33":1,"45":1,"48":3,"50":2},"minor|7|dominant|5|minor":{"1":47,"2":12,"6":1,"8":1,"14":2,"15":3,"18":1,"19":5,"20":3,"27":2,"30":3,"31":6,"32":85,"38":1,"39":1,"44":34,"50":1,"57":5,"61":7,"68":3,"69":2},"suspended|0|dominant|5|minor":{"1":5,"6":2,"13":1,"14":1,"19":1,"20":1,"32":3,"34":6,"38":2,"43":1,"44":1,"49":1},"dominant|5|minor|6|dominant":{"9":1,"32":2,"37":1,"60":3,"67":7,"68":36,"70":2},"minor|6|dominant|11|minor":{"1":5,"20":1,"32":7,"62":1},"dominant|11|minor|10|dominant":{"30":1,"62":4,"68":2,"69":1},"minor|10|dominant|11|diminished_family":{"32":4},"dominant|11|diminished_family|5|dominant":{"3":1,"7":2,"30":2,"31":41,"33":7,"45":3},"minor|8|minor|7|major":{"2":2,"12":1,"13":3,"26":1,"39":1,"62":1,"68":1},"minor|7|major|0|dominant":{"2":1,"30":9,"55":1,"68":3},"major|0|dominant|9|minor":{"1":2,"31":3,"32":1,"49":1,"61":1},"major|0|dominant|5|major":{"0":13,"1":42,"2":1,"3":3,"9":46,"12":2,"13":5,"14":10,"26":3,"32":55,"38":8,"39":2,"42":8,"44":4,"46":1,"55":11,"56":3,"57":3,"67":1,"68":18,"69":1},"major|9|dominant|3|major":{"2":1,"14":1,"20":1,"51":1,"56":1},"dominant|3|major|3|dominant":{"24":1,"68":2},"major|9|minor|8|minor":{"8":1,"20":1,"32":5,"42":2},"major|0|major|7|dominant":{"1":1,"2":18,"13":1,"30":30,"32":4,"43":1,"44":3,"62":1},"major|7|dominant|0|dominant":{"2":2,"30":12,"32":1,"43":3,"57":1,"60":2},"dominant|5|major|0|dominant":{"0":6,"1":1,"2":5,"13":3,"24":1,"25":1,"30":147,"31":11,"32":16,"39":3,"43":1,"44":2,"55":3,"56":3,"62":1,"67":1,"68":8,"69":1},"major|0|minor|7|major":{"0":4,"2":5,"13":5,"14":6,"15":1,"18":2,"21":7,"26":2,"38":2,"39":3,"43":5,"44":9,"46":1,"55":8,"56":12,"62":1,"67":2,"68":1,"69":2},"minor|7|major|2|dominant":{"1":3,"2":1,"32":5},"major|2|dominant|5|dominant":{"2":6,"30":22,"32":1,"38":1,"55":1,"56":1,"60":1},"dominant|5|dominant|5|major":{"0":82,"1":13,"2":19,"3":1,"5":2,"9":19,"12":3,"13":32,"14":4,"19":3,"20":2,"21":19,"25":7,"26":9,"30":11,"31":2,"32":22,"38":14,"39":8,"42":1,"43":10,"44":31,"46":4,"50":2,"55":26,"56":28,"57":2,"60":2,"61":1,"62":2,"67":6,"68":10,"69":6,"70":1},"minor|0|minor|7|dominant":{"2":19,"8":1,"15":2,"30":1,"31":10,"32":1,"68":1},"minor|0|dominant|5|dominant":{"1":2,"2":3,"30":1,"32":7,"43":3,"56":1},"dominant|9|dominant|5|dominant":{"2":2,"30":10,"31":12,"32":15,"34":1,"37":1,"57":1,"66":1,"69":1},"major|1|major|11|major":{"0":2,"6":17,"60":1,"66":2,"69":2},"major|10|major|11|minor":{"6":2,"32":2,"42":2,"46":1,"50":1,"61":2,"67":3},"major|11|minor|1|major":{"0":9,"9":1,"13":3,"30":1,"38":1,"54":1,"67":25},"minor|1|major|11|minor":{"1":1,"6":19,"31":3,"32":7,"43":1,"44":5,"48":4,"50":4,"61":20,"68":1,"69":2},"major|11|minor|10|minor":{"1":3,"13":8,"14":4,"19":2,"32":8,"34":2,"43":1,"60":8,"61":2,"62":1,"68":2},"minor|10|minor|11|minor":{"6":1,"32":8},"minor|11|major|11|minor":{"6":1,"13":2,"31":1,"32":1,"66":2},"major|4|dominant|1|major":{"1":2,"9":7,"14":1,"26":7,"32":4,"42":3,"68":2,"69":2},"dominant|1|major|0|minor":{"1":1,"32":1,"42":3},"major|0|minor|0|minor":{"1":9,"6":1,"13":2,"14":3,"19":1,"25":3,"31":6,"32":3,"42":9,"50":1,"57":1,"67":1},"minor|0|minor|4|minor":{"1":2,"25":3,"32":5,"37":1,"49":2,"55":1,"66":2},"minor|9|minor|0|minor":{"14":1,"18":1,"31":2,"48":1,"55":1},"minor|0|minor|9|minor":{"1":3,"19":1,"32":18},"major|2|minor|5|suspended":{"2":3,"4":1,"30":4},"minor|5|suspended|0|suspended":{"2":2,"4":2,"22":1,"30":1},"suspended|0|suspended|5|major":{"0":7,"9":1,"13":2,"20":2,"46":3,"60":1},"suspended|5|major|0|major":{"0":3,"2":8,"6":1,"13":2,"30":2,"31":1,"39":3,"43":1,"46":4,"55":1,"56":2},"major|0|major|9|dominant":{"1":1,"2":33,"8":1,"31":13,"32":8,"34":1,"43":2},"major|0|major|5|minor":{"1":8,"25":2,"32":15,"42":6,"62":1},"major|5|minor|5|dominant":{"1":1,"7":2,"9":2,"12":13,"14":3,"30":41,"31":1,"37":9,"55":2,"58":1,"63":6,"66":1,"69":2},"minor|5|dominant|2|major":{"0":19,"1":1,"2":2,"5":3,"8":1,"13":6,"14":2,"19":5,"21":7,"25":7,"26":1,"30":1,"31":7,"32":2,"37":1,"39":2,"43":3,"44":2,"49":1,"55":11,"56":16,"62":5,"67":1,"68":1,"69":7},"dominant|2|major|0|major":{"0":1,"13":2,"14":8,"15":3,"19":4,"25":3,"26":1,"27":2,"32":3,"39":2,"43":1,"50":1,"55":1,"56":2,"61":1,"62":1,"67":2,"69":2},"major|0|major|10|minor":{"1":3,"32":4,"71":3},"major|10|minor|5|dominant":{"1":1,"2":1,"4":1,"30":33,"33":2,"37":6,"43":1,"44":1,"49":1,"55":2,"61":1,"68":1,"69":2},"major|0|major|1|minor":{"1":3,"19":2,"32":8,"34":1,"67":1},"major|1|minor|5|dominant":{"1":4,"2":1,"3":1,"20":1,"30":43,"31":9,"33":1,"34":1,"36":1,"37":7,"43":2,"49":4,"55":1,"66":2},"minor|5|dominant|0|minor":{"1":8,"2":1,"7":1,"13":5,"14":6,"19":1,"20":2,"31":3,"32":368,"34":7,"37":1,"38":6,"43":3,"44":11,"49":2,"50":2,"56":4,"57":3,"60":1,"61":3,"68":4},"dominant|5|major|3|major":{"30":3},"major|3|major|5|major":{"30":3,"60":1,"67":1},"major|4|minor|5|dominant":{"1":9,"2":1,"7":1,"30":11,"31":95,"32":19,"33":3,"37":4,"38":1,"43":12,"48":4,"49":2,"55":3,"60":2,"68":1},"minor|5|dominant|8|minor":{"32":42,"68":2},"dominant|8|minor|5|dominant":{"1":2,"8":2,"20":1,"30":22,"31":1,"34":1,"37":10,"39":1,"43":4,"49":3,"55":1,"61":4,"62":2,"67":1,"68":1},"minor|5|dominant|7|minor":{"1":20,"7":1,"9":2,"14":1,"15":2,"19":3,"20":1,"31":1,"32":539,"34":2,"38":2,"43":1,"44":8,"50":5,"57":2,"60":5,"67":1,"68":3},"minor|5|dominant|6|minor":{"1":4,"3":1,"7":3,"8":1,"14":3,"19":3,"31":16,"32":245,"34":1,"37":3,"38":4,"50":3,"67":13,"68":5,"69":13},"dominant|6|minor|5|dominant":{"1":6,"2":1,"7":5,"8":6,"13":3,"15":1,"20":4,"27":2,"30":77,"31":104,"32":24,"34":1,"36":1,"37":79,"38":5,"39":1,"43":10,"44":1,"49":8,"55":15,"56":1,"62":2,"64":2,"66":8,"67":5,"68":2,"69":2},"dominant|5|major|2|minor":{"1":2,"7":4,"9":36,"13":77,"15":1,"19":1,"32":332,"34":4,"48":1,"60":9,"62":1,"68":2},"dominant|11|major|1|diminished_family":{"7":5,"8":1,"32":4,"36":1,"61":3},"diminished_family|5|dominant|5|major":{"0":46,"1":3,"2":7,"4":1,"6":1,"7":2,"9":4,"13":13,"15":1,"19":1,"20":1,"25":6,"27":3,"30":4,"31":2,"32":12,"37":1,"38":5,"39":5,"43":11,"44":7,"46":1,"50":3,"55":23,"56":10,"57":1,"61":8,"66":1,"67":3,"68":1,"69":11},"dominant|5|major|1|minor":{"9":1,"32":53,"55":1,"68":2},"dominant|5|major|9|minor":{"1":7,"3":1,"8":3,"14":4,"15":2,"18":9,"19":1,"27":1,"30":2,"31":377,"32":68,"33":5,"36":2,"37":2,"38":1,"43":9,"44":3,"48":8,"49":5,"50":1,"55":7,"56":1,"57":8,"60":4,"61":6,"67":2,"68":6},"major|9|minor|9|diminished_family":{"32":16,"67":4,"68":1},"major|11|dominant|11|dominant":{"30":1,"32":2,"37":2,"38":3,"43":1,"66":1,"67":2,"68":29},"major|1|dominant|0|dominant":{"7":1,"50":1,"66":2,"68":1},"dominant|0|dominant|8|dominant":{"2":1,"18":1,"68":2},"major|1|dominant|6|minor":{"32":6},"minor|5|dominant|5|suspended":{"2":17,"4":2,"14":1,"30":12,"43":2,"62":1},"dominant|5|suspended|0|suspended":{"2":5,"4":3,"30":2,"48":2},"suspended|0|suspended|0|suspended":{"0":3,"2":1,"4":78,"7":2,"12":2,"22":4,"25":1,"26":5,"30":6,"31":1,"34":2,"42":1,"56":1,"58":2,"61":1,"64":3,"69":1,"70":2},"dominant|11|dominant|9|dominant":{"30":1,"31":9},"minor|3|dominant|5|major":{"0":5,"1":1,"3":2,"9":3,"12":2,"26":4,"30":3,"32":2,"39":3,"42":2,"51":1,"67":2,"68":5},"dominant|5|major|5|dominant":{"2":7,"7":3,"9":8,"12":90,"13":1,"14":3,"20":3,"25":14,"26":7,"30":10,"31":8,"32":5,"37":58,"38":4,"39":7,"42":60,"43":1,"44":2,"54":3,"56":8,"60":3,"62":1,"66":5,"67":118,"68":16,"69":12},"major|5|dominant|1|diminished_family":{"8":1,"32":3,"36":6,"67":1},"dominant|1|diminished_family|5|dominant":{"2":1,"6":2,"31":7,"66":2},"major|0|major|5|dominant":{"2":47,"9":2,"12":6,"16":1,"25":3,"27":1,"37":2,"38":1,"39":1,"42":1,"67":12,"68":5,"69":1},"major|5|dominant|0|dominant":{"2":2,"12":20,"14":2,"25":1,"28":1,"30":1,"37":2,"42":11,"43":3,"44":2,"55":4,"56":3,"67":4},"dominant|7|dominant|2|minor":{"9":2,"44":1},"dominant|2|minor|1|diminished_family":{"9":2,"54":1,"56":2},"minor|1|diminished_family|9|major":{"0":6,"1":1,"2":1,"8":1,"9":1,"13":9,"14":2,"21":1,"25":1,"26":4,"30":4,"31":1,"32":3,"43":4,"55":3,"56":1,"62":1},"dominant|5|dominant|3|dominant":{"24":3,"32":4,"68":7},"dominant|3|dominant|11|dominant":{"1":1,"2":1,"30":1,"31":19,"32":10,"43":2,"55":2,"57":1,"68":7},"minor|0|minor|2|diminished_family":{"32":48,"61":1},"minor|0|minor|10|minor":{"1":11,"32":30,"57":3,"60":1,"61":1,"62":1},"dominant|5|major|10|minor":{"32":34,"43":1,"60":7},"dominant|5|dominant|7|minor":{"13":5,"32":44,"49":2,"68":2},"diminished_family|5|dominant|5|diminished_family":{"3":1,"32":69,"44":1,"57":2,"68":1},"dominant|5|diminished_family|5|dominant":{"1":2,"2":3,"9":1,"30":41,"31":24,"32":10,"33":13,"38":1,"45":4,"55":2,"56":6,"61":1,"62":6,"67":1,"69":1},"diminished_family|5|dominant|5|dominant":{"1":16,"2":17,"3":2,"7":1,"8":3,"20":4,"30":2,"31":14,"32":35,"34":1,"37":1,"43":7,"45":1,"50":3,"68":1},"major|1|diminished_family|6|dominant":{"2":4,"39":1,"43":1,"44":1,"56":1,"70":1},"major|0|dominant|5|minor":{"1":10,"20":1,"24":1,"25":1,"32":4,"38":1,"50":2,"57":1},"dominant|5|minor|4|minor":{"32":7,"54":1},"dominant|5|minor|8|major":{"9":1,"14":1,"25":7,"26":1,"30":2,"55":1,"60":1,"67":7,"68":1},"minor|8|major|4|minor":{"1":7,"32":1,"40":1,"48":5,"55":1,"61":2},"dominant|5|dominant|5|minor":{"1":25,"2":4,"7":1,"13":4,"14":11,"15":3,"16":2,"20":2,"30":1,"31":8,"32":45,"34":1,"38":5,"44":12,"48":3,"49":1,"50":5,"56":1,"57":6,"61":2,"62":4,"68":7},"minor|0|minor|2|dominant":{"2":16,"4":1,"30":2,"31":5,"32":11,"33":3,"36":1,"66":2,"68":2},"minor|2|dominant|5|dominant":{"2":5,"3":1,"6":1,"8":3,"30":3,"31":32,"32":9,"48":3},"minor|10|minor|0|minor":{"1":5,"13":6,"32":1,"55":1,"66":1},"major|5|dominant|11|minor":{"1":2,"8":1,"31":11,"32":98,"44":1,"57":2,"67":7,"68":2,"69":37},"dominant|11|minor|5|minor":{"31":13,"32":1,"56":1,"57":1,"67":2},"minor|9|dominant|5|dominant":{"2":1,"30":6,"31":2,"32":4,"55":1},"minor|5|dominant|2|dominant":{"2":1,"25":1,"31":12,"32":1,"45":1,"62":3},"minor|2|minor|1|major":{"0":3,"1":1,"6":1,"7":2,"9":3,"13":2,"14":16,"16":6,"26":2,"37":2,"55":4,"67":25},"minor|0|minor|2|minor":{"1":6,"6":5,"7":1,"19":1,"32":3,"61":1},"minor|10|minor|10|major":{"0":2,"1":1,"2":5,"3":1,"9":3,"13":14,"16":2,"26":4,"32":4,"38":3,"43":2,"50":2,"55":2,"60":2,"62":2,"68":6},"minor|10|major|0|major":{"0":4,"13":7,"21":1,"25":1,"30":2,"39":1,"60":5,"68":1},"major|0|major|10|major":{"0":12,"12":2,"30":1,"60":1},"major|10|major|2|major":{"13":8,"26":1,"30":2,"38":3,"43":3,"44":1,"60":21,"68":1,"69":1},"major|2|major|2|minor":{"48":6,"60":7},"major|2|minor|10|major":{"0":2,"2":1,"13":36,"14":1,"15":2,"30":5,"31":4,"37":1,"39":1,"43":5,"44":2,"50":1,"60":8,"67":1,"68":1,"69":2},"major|10|dominant|11|minor":{"1":3,"14":1,"32":2},"minor|5|dominant|3|minor":{"14":1,"32":12,"42":2,"68":2,"69":3},"dominant|3|minor|5|dominant":{"1":2,"12":2,"25":1,"30":11,"31":4,"37":2,"43":3,"55":2,"57":2},"dominant|2|major|10|dominant":{"12":4,"25":1,"67":1,"68":6},"major|10|dominant|4|minor":{"31":2,"32":1},"major|2|minor|2|minor":{"2":2,"6":26,"7":7,"8":1,"15":1,"20":4,"31":19,"32":46,"44":1,"48":3,"61":31,"66":2,"68":2,"69":12},"minor|2|minor|5|dominant":{"1":1,"2":2,"30":4,"31":49,"32":4,"34":1,"37":2,"44":3,"48":2,"49":2,"57":3,"68":1},"diminished_family|7|minor|5|dominant":{"30":5,"31":1},"minor|1|major|0|major":{"0":3,"25":1,"37":2,"39":1,"42":11,"55":1,"66":1,"67":1,"68":1},"major|0|major|11|minor":{"1":10,"6":3,"8":2,"31":1,"32":30,"34":1,"38":1,"69":2},"major|11|minor|6|dominant":{"2":1,"67":1,"68":1},"minor|6|dominant|11|dominant":{"1":3,"2":5,"14":1,"30":17,"31":4,"32":12,"43":1,"55":1,"61":3,"62":2,"68":12},"dominant|11|dominant|10|minor":{"1":1,"14":1,"32":2,"42":1,"55":1},"dominant|10|minor|5|dominant":{"1":6,"12":6,"13":2,"25":7,"30":7,"31":5,"36":1,"37":3,"68":3},"minor|5|suspended|5|major":{"0":7,"2":1,"5":1,"13":8,"14":2,"15":2,"20":1,"25":2,"26":7,"30":1,"32":3,"37":1,"38":1,"39":2,"43":3,"44":2,"46":7,"55":16,"56":2,"61":1,"62":1,"69":1},"suspended|5|major|10|dominant":{"14":1,"62":1,"68":1},"major|10|dominant|11|dominant":{"2":2,"31":14,"32":8,"33":3,"38":4,"43":3,"57":1,"68":5},"dominant|5|minor|5|suspended":{"2":21,"3":1,"30":19,"63":4},"suspended|5|major|6|dominant":{"66":5},"major|6|dominant|11|major":{"0":4,"7":2,"8":1,"12":1,"13":1,"16":3,"30":2,"32":1,"34":2,"38":1,"39":3,"43":1,"67":10,"68":2,"69":3},"dominant|11|major|11|minor":{"32":13,"44":2,"61":2},"minor|7|minor|8|major":{"30":2,"67":1},"minor|8|major|11|minor":{"1":1,"3":1,"6":12,"7":1,"28":1,"31":1,"32":3,"38":1,"61":5,"68":3},"dominant|5|minor|11|minor":{"1":2,"6":1,"67":8,"68":1},"minor|11|minor|11|minor":{"1":2,"9":1,"32":48,"67":3,"68":3},"dominant|5|minor|0|dominant":{"1":3,"2":5,"30":3,"31":34,"32":12,"38":2,"57":1},"minor|9|minor|5|dominant":{"1":3,"6":1,"8":2,"13":2,"15":1,"19":1,"26":1,"30":20,"31":13,"32":1,"36":1,"43":1,"45":4,"49":1,"69":1},"minor|11|major|11|dominant":{"31":2,"56":1,"61":1},"major|3|dominant|11|dominant":{"1":2,"30":3,"31":1,"38":1,"68":4},"major|5|major|11|major":{"0":5,"19":1,"26":1,"31":4,"44":2,"55":1,"56":1,"61":1},"dominant|9|minor|11|diminished_family":{"7":1,"67":28,"69":1},"minor|11|diminished_family|11|diminished_family":{"32":2,"34":1},"diminished_family|5|suspended|0|dominant":{"1":1,"10":1,"25":1,"30":2,"31":4},"minor|5|dominant|1|major":{"0":6,"9":1,"14":3,"26":2,"30":3,"39":1,"42":1,"43":3},"dominant|1|major|1|diminished_family":{"8":7,"32":1,"36":3},"major|1|diminished_family|6|major":{"0":7,"2":7,"9":1,"13":7,"14":5,"25":1,"26":2,"27":1,"30":4,"31":1,"32":1,"43":1,"44":10,"50":1,"51":2,"55":12,"56":38,"60":1,"63":1,"69":2},"diminished_family|6|major|9|minor":{"31":8,"55":1,"57":1,"62":2},"major|9|minor|9|minor":{"8":1,"32":9,"66":1},"major|5|dominant|5|minor":{"32":7,"70":1},"minor|0|minor|11|minor":{"1":8,"32":5,"68":2,"69":1},"minor|11|minor|0|minor":{"1":2,"12":3,"32":1,"37":2,"48":1,"60":1,"62":1,"66":3,"67":2},"dominant|5|minor|3|suspended":{"13":1,"19":1,"30":1},"minor|5|suspended|0|dominant":{"1":2,"2":1,"13":1,"27":1,"30":34,"31":5,"32":1,"33":3,"34":3,"38":1,"63":2,"69":4},"suspended|0|dominant|5|major":{"0":18,"1":1,"2":2,"5":1,"6":1,"9":1,"13":12,"18":1,"21":2,"26":2,"27":3,"30":3,"31":2,"32":6,"37":2,"38":1,"43":1,"44":4,"46":12,"50":2,"55":7,"56":6,"58":1,"62":1,"68":4},"minor|0|minor|9|dominant":{"2":2,"13":1,"30":3,"32":2,"66":1,"68":3},"minor|9|dominant|11|dominant":{"39":1,"66":1,"67":2,"68":4},"dominant|11|dominant|6|diminished_family":{"8":2,"32":2},"suspended|0|suspended|3|suspended":{"4":5},"suspended|3|suspended|0|suspended":{"4":4,"61":1},"dominant|1|diminished_family|1|dominant":{"8":4,"30":1},"diminished_family|1|dominant|5|major":{"0":2,"2":1,"13":1,"55":1},"major|0|major|2|dominant":{"2":54,"9":3,"30":4,"32":12,"34":2,"38":1,"43":1},"major|11|dominant|1|major":{"0":4,"9":1,"25":1,"68":2},"major|1|diminished_family|1|dominant":{"9":3,"14":1,"30":4,"32":3,"43":3,"56":1},"dominant|2|dominant|5|minor":{"1":3,"6":2,"13":2,"20":4,"32":7,"34":1,"44":1},"minor|0|minor|6|minor":{"1":6,"25":1},"minor|4|minor|0|minor":{"49":1,"50":1,"57":5,"64":1,"66":1},"minor|0|minor|8|minor":{"1":7,"30":1,"31":2,"32":6,"67":4},"minor|5|major|0|major":{"2":1,"31":1,"38":1,"43":6},"major|5|minor|0|minor":{"1":3,"9":1,"12":1,"20":2,"42":3,"48":2,"56":2,"67":1},"minor|0|minor|10|suspended":{"4":4,"22":1},"dominant|7|dominant|0|minor":{"1":1,"32":4,"60":3},"major|10|major|11|major":{"0":3,"25":1,"38":3,"55":1,"66":2},"dominant|5|minor|0|major":{"30":2,"57":1,"60":1},"diminished_family|5|diminished_family|5|dominant":{"2":1,"19":1,"30":8,"31":34,"32":2},"major|0|major|3|diminished_family":{"3":10,"26":3,"32":1,"67":15},"major|3|diminished_family|11|minor":{"1":2,"14":1,"19":1,"32":125,"38":1,"43":3,"44":6,"48":1,"68":1,"69":1},"diminished_family|11|minor|7|dominant":{"31":6,"32":1},"major|0|major|6|minor":{"1":8,"6":1,"14":2,"32":22,"61":1,"67":2},"major|6|minor|5|dominant":{"1":3,"4":1,"6":5,"9":1,"13":1,"19":3,"20":1,"30":63,"31":22,"32":3,"36":2,"37":3,"43":8,"49":1,"55":4,"66":3},"minor|10|major|2|minor":{"1":2,"13":11,"27":1,"32":6,"56":1,"60":39,"66":1},"minor|9|dominant|5|minor":{"7":1,"9":1,"31":1,"32":2},"dominant|5|minor|1|minor":{"7":1,"32":5,"60":1,"67":3},"minor|1|minor|5|dominant":{"15":3,"30":13,"31":1,"37":10,"51":1,"67":1,"69":1},"dominant|5|minor|9|dominant":{"2":1,"6":3,"15":1,"31":1,"32":4,"33":5,"68":1},"dominant|5|minor|1|diminished_family":{"7":6,"37":1,"38":1,"51":1,"54":2},"major|11|minor|8|dominant":{"8":1,"32":2,"38":2},"dominant|1|dominant|5|dominant":{"2":1,"7":1,"68":1},"dominant|5|dominant|1|minor":{"6":1,"32":4},"major|9|major|0|major":{"0":5,"2":1,"6":1,"18":2,"19":1,"26":1,"39":1,"55":1},"major|9|minor|2|minor":{"6":1,"31":2,"32":2,"55":1,"67":1},"dominant|5|minor|2|minor":{"1":1,"6":12,"7":4,"13":1,"31":2,"32":13,"61":6},"minor|2|minor|2|minor":{"1":1,"13":1,"69":1},"minor|2|minor|0|minor":{"1":4,"19":1,"57":2,"61":4},"minor|5|dominant|4|dominant":{"2":3,"62":1},"dominant|4|dominant|10|dominant":{"14":5},"dominant|10|dominant|11|minor":{"32":5,"38":1},"major|2|major|9|minor":{"31":3,"42":1,"66":1},"major|9|minor|7|major":{"0":3,"6":1},"major|1|major|1|major":{"0":4,"2":4,"6":8,"8":1,"36":1,"42":1,"60":1,"62":1,"66":2},"major|1|major|0|major":{"0":2,"1":1,"26":1,"32":2,"43":1,"52":1,"55":2,"66":2,"67":1},"suspended|0|dominant|10|suspended":{"2":2,"48":1},"dominant|8|major|10|major":{"12":2,"30":1},"major|10|major|5|major":{"0":1,"13":1,"54":1,"66":2,"67":1},"major|5|major|0|major":{"0":6,"7":1,"9":2,"13":2,"14":1,"18":1,"30":4,"32":1,"38":2,"42":7,"46":1,"55":1,"60":3,"67":1},"major|0|major|7|suspended":{"2":2,"4":3,"24":1},"major|9|minor|2|diminished_family":{"32":2,"36":1},"minor|5|dominant|3|major":{"1":1,"6":3,"9":3,"14":4,"39":1,"55":2,"57":1,"67":1,"68":3},"dominant|3|major|11|minor":{"31":1,"61":2},"minor|5|minor|2|diminished_family":{"3":2,"32":1},"minor|9|diminished_family|11|dominant":{"2":2,"25":9,"32":2,"39":2,"42":4,"60":1,"67":11,"68":16,"69":2},"diminished_family|11|dominant|11|dominant":{"8":1,"15":1,"31":13,"32":3,"37":1,"61":2,"68":2},"dominant|5|minor|9|diminished_family":{"14":1,"15":1,"32":50,"33":27,"34":1,"36":1,"49":1,"68":11},"dominant|10|minor|0|minor":{"14":1,"32":1,"57":4},"dominant|11|dominant|1|dominant":{"8":1,"12":2,"25":1,"26":3,"30":1,"32":1,"42":2,"50":3,"56":2,"68":55},"dominant|0|dominant|1|dominant":{"2":3,"8":2,"26":1,"68":9},"dominant|5|major|8|minor":{"32":3,"67":1},"major|8|minor|5|dominant":{"12":1,"30":4,"31":1},"dominant|5|major|5|minor":{"9":3,"13":1,"32":44,"42":17,"44":2,"61":1,"66":1,"67":1,"68":1},"minor|2|dominant|0|dominant":{"1":1,"3":2,"6":1,"13":1,"30":3,"31":2,"32":6,"43":1,"45":1,"68":1},"dominant|11|minor|0|minor":{"1":8,"14":1,"19":1,"20":2,"25":3,"32":5,"43":4,"44":2,"48":1,"49":1,"57":10,"69":1},"major|6|dominant|5|dominant":{"2":5,"31":6,"32":10,"34":2,"36":3,"68":1},"minor|8|major|5|major":{"7":1,"9":3,"37":1,"38":2,"39":4,"54":2,"55":2},"major|5|major|6|dominant":{"19":1,"32":2},"major|4|dominant|5|minor":{"1":20,"2":3,"8":1,"9":5,"13":1,"14":3,"18":1,"19":1,"20":6,"25":1,"31":5,"32":34,"38":1,"39":1,"43":3,"44":16,"48":3,"49":1,"50":2,"55":4,"57":6,"61":2,"62":9,"66":3,"68":2},"dominant|5|minor|10|minor":{"12":2,"13":5,"32":21,"34":2,"60":5,"61":2,"62":1,"67":1,"69":7},"minor|10|major|6|dominant":{"2":1,"32":3,"54":2},"major|6|dominant|0|dominant":{"30":8,"31":1,"32":2},"minor|5|minor|5|dominant":{"1":34,"2":16,"9":6,"13":3,"14":4,"18":3,"19":3,"20":8,"25":4,"27":2,"30":427,"31":15,"32":27,"33":1,"34":5,"43":23,"48":4,"54":1,"55":75,"56":12,"57":7,"60":9,"67":1,"68":1},"minor|5|dominant|1|minor":{"32":14},"dominant|1|minor|5|dominant":{"19":2,"26":2,"30":12,"37":7,"38":1,"43":1,"49":2,"52":1,"66":2,"67":1,"68":6},"dominant|10|dominant|5|dominant":{"2":2,"12":2,"30":1,"32":1,"43":1,"44":1,"67":1},"diminished_family|0|diminished_family|0|diminished_family":{"1":1,"3":17,"31":1,"32":2,"38":1,"66":1,"69":2},"diminished_family|0|diminished_family|11|major":{"0":3,"39":1,"67":1,"68":1},"diminished_family|11|major|0|major":{"0":1,"25":1,"55":3,"70":1},"major|10|major|0|major":{"0":3,"7":1,"19":2,"25":1,"26":1,"30":2,"48":1,"66":1,"67":3},"major|0|major|3|major":{"0":7,"30":2,"54":1,"55":1},"major|3|major|9|major":{"6":1,"32":2},"major|9|major|1|major":{"6":1,"12":1,"54":2},"major|1|major|9|major":{"6":2,"8":1},"dominant|0|dominant|11|major":{"0":10,"8":1,"13":3,"49":1,"55":1},"minor|0|minor|1|major":{"0":9,"2":5,"38":1},"major|6|minor|0|minor":{"1":1,"33":1,"36":1,"44":1,"49":1,"64":1},"minor|0|minor|6|major":{"0":4,"68":1},"minor|6|major|0|major":{"0":3,"37":1,"70":1},"major|0|major|0|dominant":{"0":5,"2":20,"8":1,"9":1,"13":1,"24":1,"30":28,"31":2,"32":2,"38":1,"56":5,"68":5,"69":1},"major|0|dominant|5|dominant":{"1":2,"2":6,"8":1,"9":10,"12":1,"30":3,"32":5,"42":1,"44":1,"68":3},"dominant|5|dominant|2|major":{"0":1,"13":2,"14":1,"21":3,"32":6,"56":1,"60":2,"68":1},"dominant|2|major|2|dominant":{"1":2,"2":1,"31":1,"32":5,"60":1},"dominant|5|dominant|10|major":{"0":2,"2":1,"13":3,"32":1,"44":1},"dominant|10|major|0|major":{"1":7,"2":2,"14":8,"26":1,"42":1,"67":3},"major|2|dominant|0|dominant":{"1":34,"2":1,"14":8,"18":8,"30":1,"32":8,"56":2,"57":1},"major|9|dominant|5|dominant":{"1":7,"2":17,"19":1,"30":2,"32":72,"38":1,"60":2,"68":1},"minor|7|major|9|dominant":{"31":12,"32":7,"62":1,"68":1},"minor|5|dominant|9|dominant":{"2":8,"6":1,"8":1,"30":2,"31":10,"32":21,"38":2,"43":1,"62":1,"68":1},"dominant|9|dominant|1|major":{"1":3,"9":1},"major|4|dominant|5|dominant":{"1":1,"2":17,"30":2,"31":3,"32":9,"44":1,"48":1,"49":3,"50":1,"57":1},"dominant|1|major|10|major":{"61":1,"62":1,"67":1},"dominant|5|major|11|diminished_family":{"31":1,"32":120,"68":4,"69":1},"dominant|11|dominant|11|major":{"0":5,"2":3,"7":1,"9":3,"14":4,"25":1,"30":1,"40":1,"55":1,"56":4,"66":1,"68":4},"dominant|11|major|1|minor":{"32":3},"minor|2|minor|1|minor":{"7":1,"13":2,"14":4,"32":4,"67":4},"dominant|11|minor|2|minor":{"6":2,"7":2,"13":1,"32":1},"minor|1|major|1|minor":{"6":1,"32":1,"67":1},"dominant|5|minor|7|minor":{"2":2,"6":4,"14":1,"31":6,"32":3,"44":1,"68":1},"dominant|0|dominant|10|minor":{"1":1,"32":1,"42":2},"major|0|major|5|major":{"0":16,"1":1,"8":2,"9":12,"12":5,"13":1,"14":6,"16":2,"32":1,"42":11,"55":4,"67":5},"major|0|major|6|dominant":{"2":2,"30":1,"31":5,"66":1},"dominant|5|major|4|diminished_family":{"6":4,"32":44,"61":4,"68":2},"major|4|diminished_family|5|dominant":{"1":1,"2":3,"13":2,"30":1,"31":52,"32":12,"33":5,"45":4,"57":1},"major|0|major|8|major":{"0":7,"2":1,"39":1,"44":1,"68":3},"major|8|major|0|major":{"13":1,"24":1,"44":2,"50":1,"54":1,"60":1},"major|0|major|8|dominant":{"2":8,"24":4,"37":1,"68":3},"major|8|dominant|0|dominant":{"8":1,"24":9,"31":1,"36":1,"49":3,"68":1},"dominant|0|dominant|6|major":{"0":2,"68":2},"dominant|6|major|0|major":{"32":2,"52":1,"54":1},"major|0|major|9|major":{"0":9,"54":1},"major|0|major|4|dominant":{"2":16,"6":2,"8":2,"31":12,"32":5,"60":1,"68":1},"major|4|dominant|0|dominant":{"2":1,"6":1,"8":1,"30":3,"31":4,"32":25,"36":1,"68":1},"suspended|0|suspended|8|major":{"0":1,"14":1,"61":2},"dominant|5|major|6|minor":{"8":1,"32":66,"68":3},"major|9|minor|7|dominant":{"31":1,"32":2},"minor|7|dominant|5|dominant":{"2":5,"31":2,"32":9,"44":1},"dominant|5|dominant|0|diminished_family":{"3":1,"32":4},"dominant|0|diminished_family|5|dominant":{"13":1,"15":1,"30":6,"31":27,"32":8,"34":2,"43":1,"45":1,"57":1,"60":1},"diminished_family|6|dominant|11|dominant":{"2":1,"30":2,"31":4,"32":5,"38":3,"45":1,"68":1},"major|2|diminished_family|10|major":{"2":1,"15":2,"19":3,"38":2,"46":1},"diminished_family|10|major|6|dominant":{"66":1,"68":2},"dominant|11|major|6|dominant":{"19":9,"31":2,"32":1,"66":3,"68":1},"major|6|dominant|5|minor":{"1":3,"8":1,"31":4,"32":7,"61":2},"minor|11|dominant|11|major":{"0":16,"1":2,"2":1,"6":1,"8":3,"9":7,"13":5,"14":3,"15":3,"25":1,"27":1,"30":1,"31":1,"32":2,"38":1,"39":2,"42":1,"43":3,"44":2,"55":1,"56":1,"61":1,"62":1,"68":3,"69":2},"dominant|6|minor|5|minor":{"1":2,"30":1,"31":16,"32":2,"37":5,"43":1,"48":1,"57":2,"68":3},"major|2|minor|1|diminished_family":{"6":1,"7":18,"8":1,"25":3,"26":2,"54":20,"56":3},"major|7|dominant|5|major":{"0":51,"1":2,"2":11,"5":1,"7":1,"8":1,"9":4,"13":19,"14":8,"19":3,"20":2,"24":1,"25":9,"26":14,"27":7,"30":4,"31":2,"32":8,"38":4,"39":3,"42":4,"43":6,"44":58,"46":1,"49":1,"50":2,"55":19,"56":8,"60":1,"61":1,"62":3,"67":6,"68":1,"69":2},"dominant|5|major|7|minor":{"1":2,"14":1,"30":8,"32":164,"42":2,"57":1,"68":1},"dominant|5|major|9|diminished_family":{"31":1,"32":14,"60":3},"major|9|minor|5|minor":{"1":1,"9":3,"14":1,"18":2,"19":1,"30":2,"31":1,"32":505,"34":9,"44":3,"55":1,"57":5},"dominant|5|major|7|dominant":{"1":12,"2":2,"13":3,"14":1,"20":2,"30":169,"31":4,"32":12,"43":3,"54":1,"55":4,"57":7,"60":1,"61":1,"62":1,"67":1},"major|7|dominant|10|dominant":{"14":1,"60":1,"68":1},"major|5|dominant|7|major":{"0":5,"1":2,"2":2,"9":4,"13":6,"14":1,"25":9,"26":4,"27":6,"32":30,"39":2,"43":1,"44":4,"50":2,"55":6,"56":3,"62":3,"67":1,"68":1,"69":1},"minor|0|minor|10|dominant":{"2":5,"20":1,"62":2,"68":1},"minor|10|dominant|0|dominant":{"1":1,"13":1,"30":1,"32":1,"62":2},"dominant|10|dominant|11|suspended":{"31":2,"68":5},"dominant|11|suspended|5|minor":{"1":2,"32":1},"suspended|5|minor|0|minor":{"1":2,"57":2,"62":1},"dominant|2|minor|0|minor":{"1":3,"18":1,"32":4,"37":1,"44":1,"48":4,"50":3,"55":1,"57":2,"62":1,"69":1},"minor|10|dominant|10|dominant":{"7":1,"68":16},"dominant|0|dominant|9|minor":{"1":9,"31":4,"32":11,"68":4},"dominant|9|minor|0|minor":{"1":4,"19":2,"32":1,"43":4,"55":1,"57":2},"major|11|dominant|11|major":{"0":1,"61":1,"66":1,"67":4,"68":9},"dominant|11|major|11|dominant":{"1":1,"2":3,"30":4,"31":2,"32":1,"62":1,"66":4,"68":5},"dominant|5|minor|1|major":{"1":6,"7":1,"18":2,"26":1,"67":10},"major|0|major|7|major":{"0":12,"2":1,"3":1,"6":1,"13":1,"20":1,"30":6,"39":1,"42":2,"43":1,"44":4},"major|7|major|0|major":{"0":10,"2":1,"13":1,"14":6,"30":4,"39":6,"42":1,"43":1,"44":4,"54":1,"56":1},"minor|1|major|1|diminished_family":{"10":2,"30":1,"32":1,"66":1,"67":1},"major|3|dominant|5|major":{"1":2,"2":1,"13":1,"20":25,"25":1,"26":2,"31":1,"37":5,"43":1,"44":1,"55":1,"68":4,"70":1},"dominant|5|major|3|dominant":{"1":4,"24":1,"30":42,"31":6,"32":2,"37":1,"43":2,"60":1,"67":8,"68":1},"major|9|dominant|0|dominant":{"1":7,"2":3,"30":1,"31":14,"32":16,"34":1,"43":1,"60":1,"68":1},"major|10|minor|10|major":{"31":3,"60":1,"66":3,"68":7},"minor|10|major|11|dominant":{"2":1,"7":1,"30":4,"31":5,"32":2,"33":1,"37":1,"61":1},"major|11|dominant|5|major":{"0":10,"1":1,"7":1,"9":1,"13":1,"25":1,"30":1,"38":1,"39":5,"44":4,"48":1,"55":4,"56":1,"61":3,"68":2},"suspended|0|suspended|2|major":{"0":2,"61":1},"suspended|4|minor|5|dominant":{"30":1,"31":2},"minor|2|minor|10|minor":{"9":3,"13":48,"14":3,"18":2,"19":2,"32":4,"60":30},"minor|10|minor|2|minor":{"1":2,"6":8,"19":2,"49":6,"61":49},"major|2|major|5|major":{"0":2,"2":4,"12":1,"30":6,"46":3,"54":1},"major|5|major|2|major":{"13":6,"18":1,"30":7,"60":1},"major|2|major|3|major":{"1":1,"3":2,"12":4,"42":1,"66":1},"major|3|major|2|major":{"6":1,"18":2,"30":1},"major|5|major|9|major":{"0":2,"6":1,"31":1,"42":1,"48":1},"major|11|dominant|5|dominant":{"0":2,"2":10,"31":10,"32":9,"43":1},"dominant|11|major|0|dominant":{"30":1,"32":1,"37":1,"66":1,"68":1,"69":2},"dominant|6|minor|6|dominant":{"25":4,"32":1},"minor|6|dominant|5|dominant":{"30":3,"31":3,"66":1},"dominant|5|dominant|11|major":{"0":1,"6":1,"13":1,"20":2,"38":9,"42":1,"50":1,"56":1,"60":1,"66":1,"68":1},"major|7|major|5|major":{"0":2,"1":1,"7":1,"12":3,"14":2,"39":5,"42":14,"44":1},"dominant|11|major|5|dominant":{"37":2,"42":3,"67":2},"major|5|dominant|6|minor":{"31":12,"32":42,"48":2,"67":2,"68":10,"69":2},"minor|1|major|2|dominant":{"9":3,"14":3,"30":10,"31":1,"36":1,"43":1,"57":1},"major|2|dominant|5|minor":{"2":2,"31":1},"dominant|5|dominant|9|minor":{"1":1,"13":1,"20":1,"31":2,"32":12,"61":1,"68":1},"minor|1|minor|2|minor":{"14":1,"38":2},"dominant|5|dominant|10|minor":{"14":2,"32":2,"62":1,"67":1},"dominant|10|minor|11|minor":{"31":3,"32":1,"67":1},"minor|11|minor|5|minor":{"31":8,"32":2,"48":1,"51":2,"57":1,"68":1},"major|6|dominant|9|major":{"42":1,"68":1,"70":2},"major|11|suspended|10|minor":{"46":3},"suspended|10|minor|7|suspended":{"2":1,"4":1,"68":1},"dominant|5|major|1|major":{"0":2,"6":2,"30":1,"60":1,"66":7,"67":1},"major|11|major|1|major":{"0":2,"6":1,"42":1,"43":1,"54":1,"61":4,"66":10},"suspended|11|dominant|5|minor":{"38":1,"50":1,"52":1,"61":1},"minor|5|minor|8|major":{"25":2,"26":1,"30":5,"39":1,"67":2},"major|5|major|1|minor":{"31":1,"32":7,"68":1},"minor|5|minor|11|minor":{"43":1,"44":1,"67":2},"dominant|11|major|7|minor":{"30":1,"32":3},"dominant|11|major|11|major":{"13":1,"43":1,"46":1,"56":2,"62":1,"66":1},"minor|2|dominant|5|major":{"0":5,"2":2,"13":3,"21":2,"25":1,"26":1,"27":1,"44":3,"55":1,"68":1},"minor|8|minor|0|minor":{"1":3,"25":1,"32":7,"43":3,"49":1},"dominant|5|major|4|minor":{"1":1,"6":5,"7":2,"15":2,"31":12,"32":85,"57":1,"61":2,"66":1,"69":7},"dominant|6|minor|0|minor":{"15":1,"19":1,"31":1,"32":4,"57":1},"diminished_family|6|dominant|7|minor":{"32":3,"44":1},"dominant|7|minor|7|dominant":{"15":1,"31":11,"62":1},"major|0|major|4|diminished_family":{"3":1,"32":20,"61":1},"minor|3|dominant|11|dominant":{"2":1,"3":1,"19":1,"30":1,"31":12,"32":4,"61":1,"68":1},"dominant|11|major|2|minor":{"13":5,"31":3,"32":6,"60":2},"suspended|0|suspended|10|minor":{"1":4,"67":1},"major|9|minor|10|minor":{"32":6,"60":1},"major|0|minor|11|minor":{"31":8,"32":22,"38":2,"61":3,"69":4},"minor|5|dominant|5|diminished_family":{"0":6,"1":3,"32":23},"minor|5|dominant|4|diminished_family":{"3":3,"32":19,"36":1,"68":4},"dominant|0|minor|3|minor":{"14":2,"42":1},"minor|3|minor|7|major":{"1":1,"19":5,"21":2,"30":2,"32":1,"39":1,"43":1,"55":7,"68":1,"69":1},"minor|5|dominant|11|dominant":{"1":3,"2":9,"8":2,"30":3,"31":1,"32":5,"36":2,"42":1,"44":1,"54":1,"55":1,"66":6,"67":4,"68":6},"major|5|minor|7|major":{"0":3,"2":1,"12":1,"13":2,"14":1,"18":1,"26":2,"31":14,"37":2,"43":3,"44":1,"55":1,"56":2,"60":2,"68":1,"69":1},"minor|7|major|5|minor":{"1":3,"32":1,"39":1,"42":14,"43":1},"dominant|5|suspended|0|dominant":{"1":6,"14":2,"30":26,"31":2,"32":4,"34":6,"55":3,"57":1,"64":1},"minor|7|major|4|dominant":{"6":1,"31":2,"32":1},"dominant|1|major|5|dominant":{"12":3,"37":3,"67":1},"major|5|dominant|2|major":{"0":4,"2":8,"13":8,"14":6,"20":1,"21":3,"25":8,"26":8,"27":2,"32":3,"39":3,"42":1,"43":2,"44":4,"46":3,"48":1,"55":21,"56":14,"60":1,"61":2,"62":2,"68":3,"69":2},"minor|11|dominant|4|dominant":{"3":1,"25":3,"68":1},"dominant|4|dominant|4|minor":{"32":3},"dominant|0|dominant|6|minor":{"1":1,"31":2,"32":5,"69":1},"major|0|diminished_family|0|major":{"0":2,"1":1,"2":1,"3":3,"21":1,"26":1,"27":2,"30":1,"51":1,"55":1,"67":3},"diminished_family|0|major|0|diminished_family":{"0":6,"31":3,"50":1},"major|5|major|7|major":{"0":8,"2":5,"6":2,"9":1,"13":6,"14":2,"21":2,"26":4,"30":14,"32":1,"38":3,"39":1,"43":1,"44":5,"45":1,"55":5,"60":5,"69":2},"major|7|major|1|major":{"25":1,"30":1,"48":1},"minor|7|major|11|minor":{"32":1,"66":2},"dominant|5|minor|11|major":{"37":3,"63":1,"66":2,"67":1},"major|0|major|2|major":{"6":2,"19":1,"67":1},"major|11|minor|11|major":{"0":1,"9":2,"42":1,"66":1,"68":3,"70":1},"minor|1|minor|1|minor":{"7":2,"32":4,"61":1,"67":1,"68":1},"minor|1|minor|11|minor":{"7":3,"32":4,"67":1,"68":2},"minor|1|diminished_family|9|dominant":{"30":5,"31":3},"diminished_family|9|dominant|5|minor":{"19":2,"43":1},"dominant|5|dominant|6|diminished_family":{"7":2,"32":6,"36":1,"38":2,"67":1},"major|9|dominant|11|dominant":{"31":1,"32":4,"44":3,"68":2},"dominant|11|major|3|dominant":{"62":3,"68":2},"dominant|11|major|9|dominant":{"31":5,"66":3,"68":3},"dominant|11|dominant|6|dominant":{"32":4,"42":1,"66":5,"67":1,"68":12},"dominant|6|dominant|11|major":{"0":1,"9":1,"14":1,"15":2,"25":1,"27":1,"37":2,"38":1,"55":6,"56":1,"62":1,"67":1,"69":1},"dominant|1|major|9|minor":{"14":1,"31":2,"48":3},"major|9|minor|2|dominant":{"7":2,"8":1,"13":3,"30":1,"32":1,"48":1},"dominant|1|dominant|6|diminished_family":{"32":4},"major|2|suspended|5|major":{"0":2,"21":3,"38":2,"39":1,"56":2},"major|7|major|7|dominant":{"2":1,"30":3,"32":1,"60":3},"dominant|5|major|4|dominant":{"2":15,"3":3,"6":14,"7":1,"30":6,"31":60,"32":18,"43":1,"61":1,"66":1,"68":7},"suspended|5|major|6|diminished_family":{"32":2,"36":1},"major|6|diminished_family|6|major":{"38":1,"39":2,"51":1},"diminished_family|6|major|8|diminished_family":{"7":3},"major|8|diminished_family|1|minor":{"31":1,"32":3,"50":1,"57":1},"minor|9|diminished_family|6|major":{"46":2,"56":1},"minor|7|minor|1|major":{"14":3,"37":3,"42":2},"minor|1|major|7|major":{"16":1,"31":1,"46":1,"56":3,"61":3},"major|7|suspended|5|major":{"0":6,"2":4,"12":4,"13":3,"20":1,"24":1,"25":3,"26":1,"28":1,"30":1,"31":2,"32":1,"34":1,"38":2,"43":2,"46":23,"48":1,"55":1,"62":1},"suspended|5|major|2|major":{"18":1,"55":3},"minor|10|minor|5|suspended":{"12":1,"27":2,"30":1},"dominant|7|dominant|5|dominant":{"1":1,"30":15,"31":4,"32":9,"38":1,"42":2,"44":33,"55":1,"61":1,"68":1},"dominant|5|major|7|major":{"0":1,"2":3,"9":3,"13":6,"30":3,"44":1,"55":1},"minor|2|minor|5|minor":{"1":1,"15":2,"31":9,"32":7,"34":3,"44":2,"60":1},"minor|5|minor|10|major":{"13":1,"30":1,"31":4,"60":1},"major|0|dominant|0|dominant":{"30":24,"32":1,"43":1,"44":1,"62":2,"68":1},"major|0|major|11|major":{"0":9,"6":2},"major|11|major|0|major":{"0":6,"1":2,"6":1,"14":4,"18":2,"19":1,"25":1,"37":1,"55":3,"56":2,"60":1},"major|0|major|1|major":{"0":6,"6":1,"7":4,"48":1,"66":2,"67":1},"dominant|5|dominant|3|minor":{"14":1,"32":1,"56":1,"67":2},"dominant|5|minor|10|dominant":{"1":1,"2":1,"30":5,"32":1,"61":2,"62":11,"68":7,"69":3},"minor|10|dominant|11|dominant":{"3":2,"30":6,"32":2,"68":2},"dominant|11|dominant|11|minor":{"1":1,"13":1,"20":1,"32":11,"50":3,"56":3,"61":2,"68":2,"69":1},"dominant|5|dominant|4|diminished_family":{"8":1,"32":3},"major|3|major|0|major":{"9":1,"18":2,"24":3,"54":1},"major|0|major|4|major":{"0":5,"6":1,"8":1,"14":1,"55":2},"major|4|major|0|major":{"12":2,"25":1,"30":1,"44":1,"48":1},"dominant|0|dominant|4|major":{"0":2,"13":3,"20":2,"32":1,"46":1,"56":1,"69":1},"dominant|4|major|0|major":{"25":2,"33":1,"44":3,"55":1,"56":2},"dominant|5|major|3|diminished_family":{"32":1,"54":1,"67":76},"diminished_family|11|minor|5|dominant":{"1":18,"2":4,"12":4,"13":3,"19":2,"20":1,"24":1,"30":180,"31":11,"32":6,"37":8,"43":21,"55":7,"56":1,"57":7,"60":1,"61":3,"62":4,"69":6},"dominant|5|major|8|dominant":{"2":4,"24":4,"30":3,"31":1,"32":1,"37":2,"68":4},"major|8|dominant|4|major":{"0":1,"2":1,"13":3,"25":3,"39":1,"50":1},"diminished_family|9|major|0|major":{"0":2,"13":2,"19":2,"25":1,"62":1,"68":1},"minor|0|minor|6|dominant":{"2":1,"67":4,"68":4,"70":4},"dominant|5|minor|1|dominant":{"14":4,"30":2,"37":1,"67":22,"68":1},"dominant|7|minor|8|dominant":{"12":3,"39":2,"56":1},"dominant|9|dominant|0|dominant":{"1":3,"2":3,"6":2,"13":1,"30":1,"31":6,"32":3,"34":1},"diminished_family|6|major|2|minor":{"13":2,"32":7},"major|5|major|1|diminished_family":{"7":1,"32":7,"36":13,"38":1,"49":1,"61":3},"major|2|minor|8|major":{"56":1,"67":6},"major|0|major|7|diminished_family":{"32":4,"43":2},"major|7|diminished_family|5|dominant":{"30":1,"31":4},"major|0|major|10|dominant":{"2":5,"56":1,"68":4},"major|10|dominant|0|dominant":{"2":1,"25":1,"39":1,"68":3},"dominant|0|dominant|0|diminished_family":{"2":1,"32":13,"62":4},"minor|7|major|3|diminished_family":{"67":14},"minor|0|minor|1|minor":{"1":2,"55":1,"68":3},"dominant|2|major|9|dominant":{"31":17,"32":19,"33":1},"dominant|2|dominant|5|dominant":{"1":1,"2":2,"30":1,"32":6,"38":6,"39":1,"62":1,"66":2,"68":1},"dominant|1|diminished_family|6|major":{"0":1,"2":1,"13":2,"25":1,"27":1,"30":1,"32":1,"43":2,"44":7,"50":1,"56":5,"61":2},"diminished_family|6|major|9|dominant":{"18":3,"31":19,"32":20,"33":1,"68":1},"dominant|0|dominant|6|diminished_family":{"32":7,"67":3},"diminished_family|5|dominant|6|minor":{"32":4},"minor|5|dominant|1|dominant":{"6":2,"30":1,"37":4,"56":2,"68":5},"minor|5|dominant|3|dominant":{"8":1,"15":1,"30":1,"37":4,"39":2,"62":2,"67":2,"68":31},"dominant|0|dominant|9|dominant":{"1":3,"2":6,"6":3,"31":5,"32":3,"34":1},"minor|9|diminished_family|0|diminished_family":{"3":2,"32":5,"66":1,"67":2},"diminished_family|0|diminished_family|5|dominant":{"2":27,"30":1,"31":4,"34":1,"45":2},"diminished_family|5|dominant|0|dominant":{"1":2,"2":1,"3":4,"19":5,"30":6,"31":23,"32":4,"33":1,"45":2,"48":1},"minor|2|dominant|11|dominant":{"67":7,"68":2},"minor|7|minor|2|dominant":{"2":1,"31":1,"32":3,"38":1},"minor|9|diminished_family|10|minor":{"32":1,"56":1,"57":4},"minor|9|dominant|5|diminished_family":{"32":4,"68":2},"minor|10|minor|10|dominant":{"30":1,"38":1,"67":1},"minor|10|dominant|5|major":{"0":1,"9":3,"26":1,"30":1,"32":1,"55":3},"major|5|major|0|dominant":{"8":1,"30":4,"68":1},"minor|1|major|4|dominant":{"31":1,"32":2},"suspended|0|suspended|10|suspended":{"4":3},"suspended|10|suspended|0|suspended":{"4":3},"suspended|10|minor|0|minor":{"1":1,"25":1,"60":2},"dominant|1|major|4|dominant":{"6":3,"30":1,"31":6,"66":1},"major|4|dominant|5|major":{"13":1,"26":1,"44":5,"61":1},"dominant|1|major|11|dominant":{"0":1,"32":1,"38":2,"66":1},"diminished_family|6|major|0|dominant":{"0":2,"30":5,"66":1},"diminished_family|1|minor|5|dominant":{"1":14,"2":7,"9":1,"13":2,"19":1,"25":1,"30":123,"31":27,"32":14,"38":1,"39":1,"43":14,"45":3,"48":1,"55":7,"56":2},"dominant|7|major|1|diminished_family":{"7":6,"32":1},"major|1|diminished_family|1|minor":{"1":2,"9":18,"15":4,"19":3,"30":1,"32":153,"44":3},"minor|1|major|6|dominant":{"6":3},"major|6|dominant|1|major":{"0":1,"55":3},"major|9|minor|8|major":{"0":2,"2":1,"16":2,"26":3,"30":1,"32":1,"42":2,"55":2,"66":3,"68":1,"70":2},"minor|8|major|11|major":{"1":3},"major|11|major|0|minor":{"1":1,"31":1,"32":4},"major|0|minor|5|minor":{"14":1,"32":1,"48":1},"major|4|minor|8|major":{"25":3,"55":1},"minor|8|major|9|minor":{"1":1,"14":1,"19":1,"32":3,"48":1},"major|9|minor|5|dominant":{"1":20,"2":14,"9":1,"13":1,"20":1,"27":1,"30":37,"31":4,"32":39,"34":2,"38":1,"43":5,"45":1,"55":20,"56":1,"68":1},"dominant|2|dominant|2|dominant":{"1":1,"31":4,"32":3,"50":2},"dominant|5|dominant|10|dominant":{"13":3,"14":1,"26":3,"62":5,"68":2},"minor|11|major|0|major":{"0":3,"43":1,"54":3,"67":1},"major|1|minor|0|minor":{"1":3,"32":2},"major|5|dominant|9|dominant":{"2":3,"32":7},"dominant|7|major|5|dominant":{"14":4,"30":2,"32":1,"42":16,"56":1,"66":4,"67":7},"minor|11|diminished_family|11|minor":{"1":13,"9":1,"14":1,"15":2,"19":1,"32":120,"34":11,"44":1,"57":2,"60":1,"69":8},"minor|3|minor|2|dominant":{"1":1,"30":5,"31":2,"55":1},"minor|1|dominant|5|major":{"7":1,"20":5,"68":4},"major|11|dominant|7|minor":{"8":1,"32":2},"diminished_family|5|dominant|0|diminished_family":{"32":15},"major|3|diminished_family|0|diminished_family":{"8":2,"12":2,"67":6},"diminished_family|1|dominant|0|dominant":{"8":2,"32":2},"minor|8|dominant|2|major":{"0":1,"25":1,"26":2,"27":2,"55":4,"56":4},"major|9|dominant|5|diminished_family":{"32":4},"dominant|9|minor|5|minor":{"7":2,"31":57,"32":6,"33":1,"43":1,"48":3,"55":2,"61":1},"minor|4|minor|5|dominant":{"1":1,"6":2,"19":2,"30":2,"31":5,"32":3,"66":2},"minor|7|dominant|8|major":{"1":1,"14":1,"56":1},"diminished_family|5|dominant|9|diminished_family":{"32":10,"51":1,"67":2,"69":1},"dominant|5|dominant|11|minor":{"32":8,"68":1},"major|0|minor|9|dominant":{"1":1,"32":3},"dominant|8|dominant|11|dominant":{"2":2,"31":1,"32":4,"66":1},"dominant|5|dominant|8|dominant":{"67":3,"68":2},"minor|5|dominant|10|major":{"0":3,"2":1,"9":2,"13":1,"14":1,"26":3,"31":2,"32":1,"42":9,"51":1,"55":5,"56":1},"dominant|10|major|9|minor":{"31":2,"32":4},"dominant|11|minor|11|diminished_family":{"9":1,"26":1,"67":38},"major|7|dominant|5|minor":{"1":2,"32":2,"61":1},"minor|8|major|1|diminished_family":{"8":1,"32":1,"49":3,"57":1},"dominant|10|suspended|0|suspended":{"3":1,"30":2},"minor|8|major|10|major":{"16":2,"30":1},"dominant|0|minor|0|minor":{"1":1,"31":3,"32":11,"34":1,"55":3,"57":2,"68":1},"dominant|0|dominant|7|diminished_family":{"3":2,"6":1,"32":1},"minor|5|dominant|11|diminished_family":{"3":1,"32":19,"50":2,"68":2},"major|5|major|5|major":{"0":2,"9":1,"12":6,"26":1,"30":17,"40":1,"60":1,"66":1},"dominant|5|minor|11|diminished_family":{"7":4,"67":9},"diminished_family|9|major|5|major":{"9":3,"14":2,"30":1,"69":2},"minor|10|minor|3|minor":{"42":2,"67":1,"68":1},"minor|0|minor|10|major":{"0":15,"3":1,"13":2,"30":2,"44":1,"55":2,"56":1,"68":1},"diminished_family|5|dominant|8|major":{"1":4,"9":2,"26":3,"30":1,"68":1},"major|5|major|9|minor":{"13":2,"14":1,"31":3,"32":1,"43":1,"48":1},"minor|10|major|4|dominant":{"6":1,"30":1,"31":4},"dominant|2|diminished_family|5|dominant":{"3":2,"30":2,"31":10,"32":6,"34":1,"50":1},"diminished_family|5|dominant|6|dominant":{"62":3,"67":3,"68":4},"dominant|11|dominant|7|diminished_family":{"32":3},"dominant|7|diminished_family|5|dominant":{"1":2,"2":8,"7":1,"9":1,"27":1,"30":6,"31":27,"34":1,"37":1,"44":1,"45":30,"48":3,"55":1,"61":3},"minor|0|minor|3|major":{"0":6,"1":1,"7":2,"9":1,"12":1,"13":1,"21":2,"34":3,"56":3},"minor|3|major|0|minor":{"32":1,"42":1,"67":1},"dominant|11|minor|11|dominant":{"19":2,"33":1,"37":3,"40":1,"60":1,"62":1,"66":17,"67":4,"68":3},"minor|5|dominant|9|diminished_family":{"3":1,"32":73,"38":2,"67":13},"dominant|9|diminished_family|5|dominant":{"1":1,"2":1,"26":1,"30":4,"31":71,"32":10,"33":8,"38":1,"45":1,"48":6,"49":4,"55":1,"57":5},"minor|7|major|9|minor":{"18":4,"31":10,"32":8},"major|0|major|6|diminished_family":{"3":1,"19":1,"32":25,"50":1,"66":6,"67":8},"minor|3|dominant|6|diminished_family":{"32":6,"68":1,"69":1},"dominant|1|major|7|major":{"13":1,"26":3},"major|6|dominant|11|dominant":{"2":2,"30":1,"32":4,"38":1,"60":1,"66":4,"67":1,"68":6},"major|2|minor|5|minor":{"1":4,"32":1,"50":3},"minor|5|minor|9|diminished_family":{"32":15,"67":2,"68":1},"major|1|diminished_family|1|suspended":{"2":3,"30":1},"suspended|5|major|9|dominant":{"31":5,"32":1},"dominant|1|major|0|major":{"0":1,"1":1,"9":1,"25":5,"26":3,"27":1,"37":2,"39":1,"55":2,"56":1,"67":2,"68":3,"70":1},"dominant|9|minor|11|minor":{"32":2,"67":10},"dominant|7|minor|3|minor":{"32":1,"42":2},"dominant|2|major|2|minor":{"13":12,"15":1,"32":7,"60":1},"diminished_family|5|dominant|2|diminished_family":{"32":3},"dominant|5|dominant|1|dominant":{"19":1,"24":1,"26":1,"68":25},"dominant|0|dominant|3|major":{"0":1,"1":1,"7":1,"9":6,"13":8,"20":2,"67":2},"minor|5|dominant|7|dominant":{"1":4,"2":1,"25":2,"32":6,"43":2,"50":1},"major|5|dominant|5|dominant":{"12":6,"14":2,"30":1,"68":4},"dominant|5|dominant|6|dominant":{"3":1,"6":2,"30":4,"32":1,"37":1,"66":10,"68":11,"70":3},"dominant|6|dominant|1|major":{"61":2,"67":1},"diminished_family|5|dominant|1|minor":{"31":2,"32":4},"dominant|4|dominant|0|dominant":{"31":3,"32":4,"42":1,"44":3,"60":1,"66":1},"dominant|0|dominant|7|major":{"0":7,"2":1,"13":4,"25":3,"32":1,"46":2,"55":2},"dominant|0|dominant|10|major":{"0":14,"1":2,"20":2,"30":1,"42":4,"56":1,"68":1},"dominant|5|dominant|5|suspended":{"2":7,"30":3,"31":2,"60":1,"68":1},"diminished_family|1|minor|0|minor":{"6":1,"9":2,"31":1,"32":1,"49":2,"57":5},"dominant|5|diminished_family|0|major":{"0":2,"3":3,"25":1,"26":4,"55":1},"diminished_family|0|major|0|major":{"0":1,"1":1,"43":1,"44":1,"70":2},"minor|4|major|10|diminished_family":{"32":4},"major|10|diminished_family|5|dominant":{"31":2,"49":2},"dominant|5|minor|4|major":{"36":2,"49":1,"63":3},"diminished_family|5|dominant|8|minor":{"32":9},"major|7|major|0|dominant":{"1":1,"30":5,"32":5},"diminished_family|6|major|0|major":{"0":2,"3":1,"37":1,"44":1,"55":2,"56":1},"dominant|2|major|7|dominant":{"30":7},"major|7|minor|2|dominant":{"32":3},"minor|1|major|0|dominant":{"42":1,"67":4},"major|0|major|0|diminished_family":{"0":1,"3":9,"31":2},"major|0|diminished_family|5|minor":{"14":2,"42":3},"minor|7|major|0|minor":{"14":1,"61":2},"major|0|minor|2|dominant":{"2":1,"30":3,"32":2,"44":1,"55":2},"diminished_family|5|dominant|7|diminished_family":{"3":1,"32":62,"66":3},"minor|5|dominant|7|diminished_family":{"3":1,"32":11},"major|5|major|9|dominant":{"31":1,"32":2},"major|7|major|1|diminished_family":{"7":2,"38":2},"major|0|major|3|minor":{"9":2,"26":2,"31":1,"32":16,"67":4},"major|3|minor|5|dominant":{"24":2,"30":20,"31":2,"37":30,"43":3,"70":1},"dominant|0|dominant|1|major":{"0":6,"8":1,"9":1,"14":2,"21":1,"32":1},"dominant|1|dominant|1|dominant":{"6":2,"8":4,"14":1,"15":4,"26":1,"30":3,"31":3,"68":3},"dominant|1|dominant|1|major":{"56":2,"60":2},"dominant|0|minor|11|dominant":{"45":1,"62":1,"66":9,"68":1},"major|10|dominant|6|minor":{"32":2,"37":1},"dominant|6|minor|6|minor":{"32":4},"minor|6|minor|5|dominant":{"21":2,"30":4,"37":2,"66":6,"67":2},"diminished_family|5|dominant|6|major":{"32":2,"56":3},"dominant|2|major|11|diminished_family":{"3":1,"32":8},"minor|0|minor|11|diminished_family":{"3":4},"minor|11|diminished_family|0|diminished_family":{"66":1,"67":6},"diminished_family|0|diminished_family|11|minor":{"1":4,"13":3,"32":10,"34":1},"diminished_family|11|minor|0|minor":{"1":2,"2":1,"9":1,"19":1,"32":6,"43":2,"44":1,"57":6,"68":1},"diminished_family|11|major|6|diminished_family":{"32":4},"minor|5|dominant|6|major":{"0":2,"7":1,"20":1,"26":1,"55":1,"66":3,"68":1},"dominant|6|major|11|dominant":{"30":1,"31":1,"32":1},"minor|0|minor|7|major":{"0":3,"1":2,"13":1,"14":1,"25":1,"31":1,"44":4,"50":2,"55":4,"56":1,"68":2},"minor|7|major|11|dominant":{"6":2,"30":2,"43":1,"68":4},"dominant|7|dominant|5|minor":{"32":3,"48":1},"minor|7|dominant|5|major":{"0":1,"15":1,"20":1,"43":1,"55":3,"56":1},"major|4|minor|11|diminished_family":{"67":19,"69":2},"dominant|5|major|2|diminished_family":{"9":1,"13":1,"32":7,"60":2},"major|0|major|2|diminished_family":{"32":5,"60":3},"major|2|diminished_family|5|dominant":{"8":1,"30":9,"31":2,"36":3,"38":1,"45":1,"55":2},"dominant|1|diminished_family|9|major":{"0":2,"14":2,"21":1,"26":1,"30":2,"44":1,"55":4,"56":1},"major|0|dominant|0|major":{"2":4,"5":13},"dominant|0|major|0|other":{"0":13},"major|0|other|0|major":{"0":21,"1":2,"2":4,"5":4,"9":2,"13":3,"27":1,"43":2,"56":7,"66":1},"other|0|major|0|other":{"0":3,"13":1},"major|0|other|2|minor":{"32":4},"other|2|minor|5|dominant":{"30":1,"43":1,"55":2},"minor|1|diminished_family|1|minor":{"1":3,"8":6,"20":1,"31":7,"32":13,"38":4,"48":5},"dominant|10|major|9|dominant":{"31":3},"dominant|3|minor|10|major":{"38":3},"major|7|dominant|9|minor":{"61":1,"67":1,"69":3},"dominant|9|minor|10|minor":{"32":1,"60":3,"68":1,"69":1},"major|9|minor|11|dominant":{"66":1,"67":1,"68":19},"minor|11|dominant|11|dominant":{"1":1,"25":1,"30":22,"32":1,"39":1,"43":1,"68":7,"69":1},"dominant|11|dominant|7|minor":{"32":11},"major|7|dominant|0|minor":{"14":6,"32":11},"major|0|diminished_family|0|diminished_family":{"3":2,"13":3,"25":1,"36":1,"44":1,"58":1,"67":3},"minor|0|minor|0|diminished_family":{"3":6,"32":5,"50":1},"minor|0|diminished_family|0|diminished_family":{"1":1,"18":1,"32":3,"68":1},"diminished_family|6|dominant|9|dominant":{"31":7},"minor|4|dominant|5|major":{"0":2,"38":4,"44":2},"dominant|0|dominant|8|minor":{"26":1,"32":2,"69":3},"minor|5|dominant|4|major":{"0":3,"6":3},"minor|11|minor|11|diminished_family":{"32":3,"67":22},"dominant|11|dominant|0|minor":{"1":2,"14":1,"32":12,"33":3},"dominant|0|minor|5|diminished_family":{"8":1,"30":3},"minor|5|diminished_family|5|major":{"43":3},"diminished_family|5|major|7|minor":{"32":3},"diminished_family|5|dominant|1|dominant":{"2":2,"68":3},"dominant|0|minor|6|dominant":{"0":2,"68":8},"dominant|7|major|2|minor":{"13":3,"32":7,"69":1},"diminished_family|5|dominant|3|minor":{"1":4,"32":3,"34":1},"dominant|2|major|6|diminished_family":{"32":4,"67":1},"major|11|diminished_family|0|diminished_family":{"32":4,"66":1},"dominant|0|dominant|2|major":{"0":15,"3":1,"13":2,"25":1,"37":1,"55":1,"56":1},"diminished_family|6|major|2|dominant":{"32":4,"60":1},"dominant|3|minor|0|minor":{"32":5,"56":1,"57":3,"66":2},"minor|5|dominant|2|minor":{"1":12,"7":2,"31":2,"32":22,"36":1,"46":2,"49":3,"50":2,"68":5},"major|5|dominant|11|dominant":{"14":4,"31":5,"32":17,"38":3,"68":1,"69":1},"dominant|0|dominant|3|minor":{"1":7,"32":6},"minor|11|major|11|major":{"0":4,"31":1,"32":1,"55":1,"67":3},"dominant|8|major|0|major":{"1":2,"13":1,"38":1,"68":1},"dominant|5|major|6|dominant":{"2":7,"3":4,"6":1,"8":5,"19":2,"24":2,"30":14,"31":9,"32":17,"33":2,"54":2,"62":1,"66":15,"67":8,"68":14},"major|6|dominant|11|minor":{"1":1,"32":4,"67":3},"major|9|minor|1|diminished_family":{"7":3,"37":1,"56":2},"minor|3|minor|11|dominant":{"30":3,"31":1,"48":1},"minor|11|dominant|5|minor":{"15":1,"32":2,"49":1,"57":3,"61":3},"minor|5|minor|3|dominant":{"68":5},"diminished_family|0|diminished_family|2|minor":{"1":3},"diminished_family|2|minor|0|minor":{"3":2,"32":1},"minor|0|diminished_family|5|dominant":{"1":1,"30":13,"31":2,"55":1,"57":1,"68":1},"minor|4|diminished_family|5|dominant":{"6":2,"19":1,"31":4,"33":3,"45":1},"dominant|5|diminished_family|0|diminished_family":{"3":1,"32":2},"dominant|10|dominant|11|major":{"13":3,"15":1,"18":2,"20":3,"30":1},"dominant|11|major|2|diminished_family":{"13":2,"32":5,"34":1},"suspended|5|major|2|minor":{"9":2,"13":5,"32":8,"34":2,"60":1},"dominant|0|minor|2|minor":{"32":4,"67":1},"major|5|dominant|11|diminished_family":{"32":15,"38":1},"dominant|0|dominant|9|diminished_family":{"3":1,"32":10,"38":1,"67":1},"dominant|5|minor|6|diminished_family":{"7":1,"26":1,"32":1,"67":3},"diminished_family|1|minor|1|diminished_family":{"3":2,"7":6,"8":1,"54":10,"67":2},"diminished_family|1|minor|5|minor":{"3":1,"31":11,"32":3,"34":2},"minor|8|dominant|6|diminished_family":{"32":8},"dominant|7|major|4|minor":{"32":8,"44":3,"67":1},"dominant|4|major|5|dominant":{"39":1,"42":1,"68":1},"dominant|7|major|4|dominant":{"2":2,"31":2},"dominant|0|minor|10|major":{"0":2,"37":1,"44":1,"56":2},"minor|10|major|9|dominant":{"32":3},"suspended|0|dominant|5|suspended":{"2":7,"3":2,"4":1},"minor|7|major|7|dominant":{"30":13,"43":1},"major|6|diminished_family|8|minor":{"32":4},"diminished_family|8|minor|5|dominant":{"5":3,"13":3,"30":3},"minor|9|dominant|1|major":{"26":2,"56":1},"dominant|1|major|9|dominant":{"31":2,"32":1},"minor|5|dominant|10|dominant":{"3":1,"7":1,"8":3,"32":2,"37":1,"62":3,"67":5,"68":4,"70":2},"dominant|5|major|0|diminished_family":{"0":7,"3":3,"13":3,"15":3,"32":4,"42":3,"43":1,"44":2,"69":1},"major|0|diminished_family|5|dominant":{"7":1,"30":1,"31":1,"39":1},"major|1|diminished_family|0|diminished_family":{"7":6,"34":1,"60":1},"diminished_family|0|diminished_family|1|minor":{"9":2,"32":4},"dominant|7|major|9|minor":{"1":1,"31":4,"43":4},"minor|0|minor|7|diminished_family":{"32":7},"minor|10|major|7|minor":{"1":3,"30":1,"32":3},"minor|2|minor|11|dominant":{"30":1,"67":2},"minor|11|dominant|5|major":{"7":1,"13":1,"14":2,"24":1,"32":5,"39":1,"68":4,"69":2},"dominant|5|major|2|dominant":{"1":8,"2":3,"30":19,"32":4,"34":1,"35":1,"43":1,"55":9,"56":3,"57":1,"62":1},"dominant|10|dominant|2|minor":{"0":3,"1":1},"minor|1|minor|9|minor":{"32":2,"66":1},"minor|9|minor|11|major":{"2":1,"66":1,"67":1},"major|9|minor|7|minor":{"1":1,"6":1,"13":1,"19":3,"31":3,"32":7,"48":2,"61":1,"69":1},"minor|7|minor|10|minor":{"32":6},"dominant|7|diminished_family|11|major":{"14":3},"diminished_family|11|major|2|dominant":{"1":3},"major|2|dominant|0|minor":{"1":3,"31":1,"32":21},"minor|5|dominant|10|suspended":{"2":3,"4":2},"dominant|10|suspended|0|dominant":{"1":2,"30":2,"55":1},"suspended|0|dominant|0|minor":{"1":3,"32":6,"34":1,"38":4,"44":1,"68":2,"69":1},"major|1|dominant|11|major":{"0":6,"2":1,"8":18,"15":1,"31":1,"55":1,"56":3,"62":2,"66":3,"68":1},"dominant|11|major|1|dominant":{"36":1,"37":1,"49":1,"66":20},"dominant|1|dominant|0|dominant":{"2":1,"8":1,"39":1,"68":3},"dominant|1|dominant|5|major":{"0":3,"8":1,"13":1,"19":1,"26":3,"38":3},"dominant|5|major|1|dominant":{"32":1,"37":2,"62":1,"66":4,"68":1},"dominant|11|dominant|9|diminished_family":{"8":1,"32":1,"38":1,"67":1},"diminished_family|5|dominant|9|minor":{"31":4,"32":7,"67":1,"68":1,"69":1},"major|5|major|0|minor":{"32":1,"42":1,"67":1},"minor|5|dominant|10|minor":{"32":21,"42":1,"56":1,"67":2},"dominant|10|minor|7|major":{"31":2,"43":1,"69":1},"minor|5|dominant|8|major":{"1":4,"9":4,"13":1,"32":2,"55":4,"56":1,"60":2,"67":2,"68":1},"dominant|8|major|1|diminished_family":{"7":2,"32":3,"36":3},"dominant|11|major|11|diminished_family":{"32":6},"diminished_family|6|dominant|0|dominant":{"2":6,"30":4,"32":4,"44":1},"minor|10|major|0|dominant":{"30":7},"major|10|minor|0|minor":{"12":2,"16":1,"50":1},"minor|0|minor|2|major":{"0":3,"13":3,"55":3},"minor|2|major|0|major":{"13":1,"44":1,"61":1},"minor|10|major|9|minor":{"31":4},"major|11|dominant|9|minor":{"31":3,"32":2},"dominant|2|major|9|minor":{"31":19,"32":11,"43":1,"57":2,"68":5},"minor|5|minor|3|minor":{"14":3,"32":3,"56":1},"minor|2|dominant|9|minor":{"22":1,"32":3,"61":3,"69":1},"dominant|2|major|3|minor":{"32":5},"dominant|5|major|3|minor":{"32":25,"67":4,"69":3},"dominant|11|dominant|3|major":{"9":2,"68":1},"dominant|3|major|1|diminished_family":{"7":1,"36":10},"dominant|2|major|3|diminished_family":{"67":13},"minor|2|minor|11|diminished_family":{"26":3,"32":1,"67":9},"dominant|6|minor|11|diminished_family":{"3":3,"67":14},"major|9|dominant|0|minor":{"32":3},"minor|7|minor|2|diminished_family":{"32":12},"minor|5|diminished_family|5|dominant":{"1":1,"3":1,"30":3,"31":2,"32":1,"55":1,"57":3},"minor|0|minor|5|suspended":{"2":9,"4":3,"18":1,"30":4},"major|5|dominant|11|major":{"0":1,"1":1,"18":2,"32":2,"44":1,"55":1,"68":1},"dominant|11|major|7|dominant":{"30":4},"major|2|dominant|5|major":{"0":11,"2":6,"13":5,"20":1,"25":4,"26":1,"30":4,"31":1,"32":4,"39":3,"43":1,"44":6,"48":1,"55":4,"56":6,"69":2},"dominant|10|minor|2|dominant":{"6":1,"31":1,"43":2},"dominant|8|major|0|minor":{"42":8,"67":4},"minor|2|minor|11|major":{"24":2,"66":2},"major|11|major|11|minor":{"66":3},"major|0|dominant|11|dominant":{"6":3,"30":1,"31":4,"63":1,"68":8},"dominant|11|minor|7|dominant":{"31":5,"62":1},"minor|7|dominant|10|dominant":{"32":1,"43":1,"68":3},"dominant|11|dominant|9|minor":{"32":3,"67":3},"dominant|2|major|5|dominant":{"32":3,"37":3,"67":4,"69":1},"dominant|5|minor|0|diminished_family":{"32":9,"38":3,"60":5},"major|0|major|11|suspended":{"2":4,"4":3,"70":2},"minor|7|major|2|minor":{"13":1,"14":1,"32":5,"34":2,"60":3},"dominant|4|major|9|dominant":{"30":2,"31":1,"33":1},"diminished_family|1|diminished_family|5|dominant":{"31":2,"32":2,"60":2},"diminished_family|5|dominant|10|major":{"1":2,"42":1},"dominant|10|major|0|minor":{"14":2,"42":2,"69":1},"minor|7|major|0|major":{"0":2,"3":1,"13":1,"14":2,"25":2,"27":1,"31":4,"56":1,"69":1},"major|0|minor|11|diminished_family":{"32":4,"67":1},"minor|11|diminished_family|5|dominant":{"30":8,"31":12,"32":5,"33":1,"34":1,"55":1,"57":1,"68":1},"dominant|7|minor|2|minor":{"6":2,"8":4,"20":2,"32":1,"61":1},"major|11|minor|1|dominant":{"14":2,"67":2},"minor|1|dominant|4|minor":{"32":2,"34":3},"suspended|0|suspended|0|dominant":{"0":1,"2":3,"30":5,"68":1},"suspended|0|dominant|0|dominant":{"30":4,"34":2,"60":4},"minor|0|dominant|0|minor":{"32":6,"43":3},"minor|5|dominant|7|major":{"0":5,"13":1,"51":1},"suspended|10|major|2|suspended":{"60":10},"major|2|suspended|10|major":{"16":8,"60":1},"major|2|major|10|major":{"0":1,"6":1,"12":11,"16":2,"37":5,"66":2,"70":1},"minor|8|dominant|7|minor":{"32":6},"major|6|major|11|dominant":{"68":3},"dominant|1|major|2|dominant":{"30":3,"55":2,"57":1},"major|2|dominant|9|minor":{"31":2,"32":7,"67":3},"major|4|minor|10|minor":{"32":5,"48":1},"minor|10|dominant|5|dominant":{"30":2,"38":1,"44":1},"minor|10|major|10|major":{"0":2,"12":8,"25":1,"42":1,"67":2},"major|10|major|7|major":{"55":1,"60":2},"major|7|major|9|minor":{"9":2,"31":3,"32":2,"55":1},"minor|10|major|5|minor":{"14":2,"32":4,"34":1,"60":4},"major|5|minor|10|major":{"8":1,"30":2,"67":1,"68":2},"minor|10|major|11|minor":{"1":1,"7":1,"32":2},"major|7|suspended|0|suspended":{"4":3,"30":2,"43":1},"suspended|5|major|7|suspended":{"4":1,"30":22,"32":2,"55":2,"57":2,"60":1},"major|7|suspended|9|diminished_family":{"32":3},"suspended|9|diminished_family|5|dominant":{"31":3,"32":3},"dominant|5|major|7|suspended":{"2":5,"4":1,"30":18,"69":1},"dominant|6|dominant|5|minor":{"1":3,"55":1,"68":2},"major|11|major|9|minor":{"31":3,"32":1,"48":1},"dominant|11|minor|9|diminished_family":{"7":1,"32":1,"68":1},"dominant|5|minor|3|major":{"1":2,"32":1,"55":1,"56":1},"minor|3|major|9|dominant":{"31":4,"32":4},"minor|9|diminished_family|8|minor":{"14":1,"32":3,"44":1},"major|6|dominant|5|major":{"3":1,"30":3,"38":2,"44":1,"51":1,"55":1,"56":2,"60":2,"62":6},"major|9|dominant|7|minor":{"32":3},"major|7|dominant|7|minor":{"13":3,"32":5},"major|4|major|1|major":{"26":1,"30":2},"dominant|8|major|9|minor":{"31":6,"32":1,"49":1},"dominant|5|dominant|9|diminished_family":{"20":1,"61":2,"67":1},"dominant|7|minor|2|diminished_family":{"32":4},"major|3|dominant|0|minor":{"32":6},"minor|5|dominant|8|dominant":{"2":1,"68":2},"dominant|5|minor|4|diminished_family":{"7":2,"32":5},"dominant|5|major|11|major":{"1":1,"55":1,"66":1},"dominant|9|diminished_family|11|minor":{"32":11,"42":3,"67":4},"major|11|minor|7|dominant":{"30":2,"31":1,"32":2,"68":1},"minor|2|suspended|0|dominant":{"30":2,"31":2},"minor|7|dominant|11|dominant":{"2":2,"68":2,"70":1},"minor|9|dominant|0|dominant":{"30":1,"31":2},"major|11|minor|11|diminished_family":{"67":12},"minor|8|dominant|6|minor":{"32":5,"67":4,"69":1},"major|9|major|11|minor":{"1":3,"32":1},"major|2|diminished_family|10|diminished_family":{"0":3},"diminished_family|10|diminished_family|0|major":{"2":1,"3":3,"30":1},"diminished_family|5|minor|7|major":{"13":1,"31":1,"38":1},"suspended|5|major|2|diminished_family":{"32":2,"63":1},"minor|7|major|6|dominant":{"32":2,"66":1},"dominant|11|dominant|1|diminished_family":{"36":2,"38":2,"67":6},"dominant|0|minor|2|dominant":{"18":6,"30":1,"31":4,"32":3},"minor|3|major|0|major":{"0":1,"9":2,"13":1,"19":1,"25":2},"minor|11|dominant|0|dominant":{"7":3,"31":1,"32":3,"66":1},"suspended|5|major|5|major":{"42":1,"66":3,"67":2,"69":1},"major|5|major|11|diminished_family":{"32":17},"major|11|major|11|diminished_family":{"32":4},"minor|0|minor|1|diminished_family":{"3":4,"7":2,"36":1,"54":4},"dominant|6|major|11|major":{"18":1,"19":1,"69":1},"major|9|dominant|8|major":{"1":2,"9":1},"major|10|dominant|5|major":{"0":4,"14":1,"20":3,"26":4,"32":4,"44":1,"55":1},"major|8|major|8|major":{"12":2,"48":4},"diminished_family|5|dominant|2|minor":{"9":2,"50":1},"dominant|2|major|4|minor":{"32":14,"68":2,"69":1},"dominant|11|major|9|minor":{"31":4,"32":6,"33":1,"49":1,"57":2,"67":1},"diminished_family|11|minor|11|minor":{"3":2,"13":1,"31":3,"32":16,"68":6,"69":4},"diminished_family|11|major|11|minor":{"8":2,"31":1,"32":2,"38":1,"68":1},"minor|1|dominant|2|dominant":{"14":3,"15":1,"50":3},"dominant|2|dominant|8|dominant":{"19":3,"24":1,"30":3,"67":2},"dominant|8|dominant|11|minor":{"15":2,"32":1,"50":2},"dominant|11|minor|2|diminished_family":{"13":1,"32":6,"66":2},"dominant|11|suspended|11|dominant":{"67":2,"68":3},"minor|11|dominant|11|diminished_family":{"32":2,"44":2,"66":1},"major|4|dominant|10|minor":{"44":2,"66":1},"dominant|0|dominant|8|major":{"0":4,"13":1,"68":1},"dominant|8|major|11|dominant":{"31":3},"dominant|6|dominant|11|minor":{"8":2,"32":1,"43":1,"44":1,"50":1,"62":2},"minor|8|dominant|11|minor":{"1":2,"32":4},"minor|2|dominant|11|major":{"9":2,"66":2},"major|11|major|9|dominant":{"31":3},"major|10|dominant|2|major":{"0":1,"8":1,"13":3,"14":1,"30":1,"43":1,"44":2,"46":1,"50":6,"56":1,"61":1,"62":4},"dominant|2|major|7|minor":{"32":6},"minor|6|minor|0|minor":{"19":2,"37":2,"67":2},"minor|1|major|6|minor":{"32":2,"66":3},"dominant|1|diminished_family|1|major":{"26":3,"55":1},"diminished_family|1|major|9|minor":{"31":1,"32":2,"57":1},"dominant|2|major|4|diminished_family":{"32":4},"diminished_family|5|dominant|1|diminished_family":{"7":3},"diminished_family|11|minor|11|diminished_family":{"7":8,"13":1,"32":3,"38":1},"diminished_family|2|minor|5|dominant":{"30":4,"32":3,"37":1,"43":3},"diminished_family|9|major|4|dominant":{"31":3,"32":2},"minor|5|minor|10|minor":{"1":1,"31":1,"32":1,"42":1},"major|0|dominant|11|diminished_family":{"32":5},"dominant|4|major|2|minor":{"13":6},"dominant|11|minor|11|minor":{"19":1,"32":4,"67":4,"69":3},"diminished_family|10|major|3|minor":{"32":3},"minor|0|dominant|5|major":{"0":2,"2":2,"3":1},"dominant|10|major|5|dominant":{"12":1,"67":1,"68":1},"major|5|dominant|4|minor":{"32":13,"60":3,"68":1},"dominant|9|dominant|0|minor":{"32":3},"minor|1|minor|11|dominant":{"31":3,"68":1},"dominant|10|dominant|1|dominant":{"8":3,"45":1},"dominant|2|minor|8|dominant":{"12":1,"55":2},"dominant|11|major|0|minor":{"32":7,"49":2,"61":1,"67":1},"dominant|5|dominant|8|minor":{"42":3},"dominant|8|minor|7|major":{"2":3},"major|3|minor|11|minor":{"32":10},"major|9|minor|10|major":{"2":1,"13":1,"44":1,"66":1,"67":1},"minor|0|major|0|major":{"0":5,"31":2,"48":1},"major|2|dominant|1|diminished_family":{"7":4,"37":1,"54":2,"67":3},"minor|5|minor|5|suspended":{"2":8,"13":1,"30":11,"33":2,"55":1},"suspended|0|dominant|2|minor":{"1":1,"43":2},"minor|8|major|2|dominant":{"9":2,"13":1,"30":1},"dominant|1|diminished_family|11|minor":{"1":1,"32":8,"68":1},"diminished_family|11|minor|11|dominant":{"66":5},"dominant|11|major|2|dominant":{"1":3,"2":1,"9":1,"20":1,"30":1,"69":1},"minor|0|dominant|0|dominant":{"1":1,"2":1,"3":1,"31":4,"32":1,"34":1},"dominant|7|minor|11|dominant":{"66":5},"major|4|minor|5|minor":{"1":1,"2":1,"31":6,"32":1,"34":3,"68":1,"69":2},"minor|5|minor|11|dominant":{"31":2,"43":1,"68":4},"minor|5|minor|6|minor":{"32":5},"suspended|0|suspended|4|dominant":{"31":2,"68":3},"suspended|4|dominant|11|dominant":{"68":3},"dominant|2|minor|11|dominant":{"24":2,"67":6},"dominant|0|diminished_family|0|dominant":{"2":1,"3":1,"32":4,"43":2},"major|7|dominant|2|minor":{"1":1,"32":2,"68":2},"major|1|dominant|5|dominant":{"31":3},"minor|8|major|7|major":{"1":1,"30":2},"major|7|major|11|diminished_family":{"32":7},"minor|9|diminished_family|11|major":{"0":3,"9":3,"25":6,"39":3,"42":1,"67":1},"diminished_family|11|major|7|major":{"0":9,"13":1,"30":1},"dominant|11|major|6|minor":{"32":5},"minor|7|major|11|diminished_family":{"32":5},"dominant|5|minor|5|major":{"0":1,"43":4,"57":3},"minor|5|major|9|diminished_family":{"61":3},"major|9|diminished_family|10|minor":{"50":3},"diminished_family|10|minor|8|dominant":{"68":3},"dominant|3|minor|11|dominant":{"30":2,"67":2},"minor|11|dominant|6|minor":{"32":7,"62":1,"67":1},"dominant|6|minor|11|dominant":{"30":1,"66":1,"67":11,"68":3},"dominant|11|major|5|minor":{"32":3},"dominant|9|minor|11|dominant":{"30":4,"67":13},"major|5|dominant|5|major":{"0":2,"26":1,"30":1,"32":4,"38":4,"68":1},"major|7|major|4|dominant":{"31":7},"dominant|6|major|9|minor":{"31":1,"48":1,"57":1},"major|9|dominant|10|major":{"46":1,"55":1,"68":1},"dominant|7|major|6|diminished_family":{"32":5},"major|4|minor|1|major":{"42":3,"67":3,"69":1},"dominant|10|dominant|6|minor":{"32":8},"major|5|dominant|4|dominant":{"32":3,"62":4},"dominant|4|dominant|5|dominant":{"30":3,"32":3,"43":1},"diminished_family|11|minor|5|suspended":{"1":3,"2":3,"30":6},"suspended|5|major|0|dominant":{"30":4,"50":1},"minor|9|diminished_family|5|diminished_family":{"32":42},"dominant|2|major|11|minor":{"32":3},"dominant|6|minor|1|minor":{"32":3},"dominant|10|dominant|7|minor":{"26":1,"32":3,"60":1},"dominant|0|other|5|major":{"0":1,"68":3},"major|1|major|7|minor":{"32":3},"dominant|7|major|10|dominant":{"12":3,"30":4,"51":2},"dominant|2|major|8|dominant":{"24":3,"44":3},"major|8|dominant|7|dominant":{"12":3},"dominant|7|dominant|2|major":{"6":3},"dominant|2|major|1|major":{"6":3},"dominant|7|major|9|dominant":{"32":3},"minor|0|diminished_family|10|major":{"13":4,"37":1,"57":1},"major|1|minor|11|dominant":{"30":1,"66":1,"67":1},"dominant|4|minor|11|dominant":{"66":4},"major|8|dominant|11|dominant":{"2":2,"8":1,"30":2,"31":2,"43":2,"44":1},"major|2|dominant|7|minor":{"13":1,"32":2},"dominant|0|minor|9|diminished_family":{"32":3},"diminished_family|6|major|5|dominant":{"2":1,"30":1,"67":1,"69":1},"diminished_family|10|minor|5|dominant":{"1":3,"30":5,"31":9},"minor|1|diminished_family|11|minor":{"32":2,"38":1,"68":3},"major|1|diminished_family|11|minor":{"67":3},"minor|1|diminished_family|0|diminished_family":{"9":3,"54":2,"67":1},"major|2|minor|2|diminished_family":{"31":2,"32":1},"major|5|dominant|2|dominant":{"30":6,"32":1},"dominant|6|diminished_family|11|minor":{"25":2,"42":2,"67":3,"69":1},"diminished_family|11|minor|7|major":{"20":2,"21":4,"56":6,"60":2,"68":3},"major|0|dominant|6|diminished_family":{"32":1,"67":3},"major|10|major|2|suspended":{"2":2,"30":2},"diminished_family|5|minor|5|dominant":{"2":2,"20":1,"31":1},"suspended|0|dominant|5|diminished_family":{"0":3,"32":1},"diminished_family|0|major|4|dominant":{"2":2,"6":1,"8":1,"31":3},"major|1|diminished_family|8|minor":{"14":3,"32":1},"diminished_family|8|minor|2|dominant":{"31":3,"32":1},"dominant|8|minor|11|diminished_family":{"67":3},"diminished_family|6|major|7|dominant":{"30":15,"32":1},"minor|4|minor|4|minor":{"19":3},"minor|4|minor|3|minor":{"25":3},"minor|3|minor|4|minor":{"49":1,"68":2},"major|5|dominant|9|major":{"44":3},"dominant|9|major|7|dominant":{"1":1,"30":4},"dominant|2|major|5|minor":{"32":7},"dominant|4|major|4|minor":{"32":1,"67":3,"69":3},"major|10|major|1|major":{"6":1,"13":1,"56":1},"major|10|minor|1|dominant":{"32":2,"34":1},"minor|1|dominant|5|dominant":{"2":2,"32":12,"68":4},"dominant|0|dominant|5|suspended":{"2":5,"4":3,"31":3,"38":1},"dominant|5|suspended|5|minor":{"1":2,"2":1,"32":2},"suspended|5|minor|5|dominant":{"30":2,"31":1,"43":1},"dominant|5|major|10|major":{"12":8,"42":2,"60":3,"62":1,"66":3,"67":5,"68":2},"major|11|dominant|5|diminished_family":{"3":1,"32":3,"34":3},"dominant|5|diminished_family|5|suspended":{"2":3},"major|10|major|10|major":{"30":2,"60":4,"66":3,"68":9,"70":1},"major|10|major|11|dominant":{"30":6,"31":1,"32":1,"55":2,"66":2},"minor|5|minor|9|minor":{"1":1,"32":3},"dominant|0|dominant|0|major":{"0":3,"32":2},"dominant|0|major|0|major":{"0":2,"13":2,"61":3},"major|10|minor|11|other":{"20":3},"minor|11|other|3|dominant":{"31":3},"other|3|dominant|5|minor":{"31":1,"44":1,"50":1},"dominant|2|dominant|1|dominant":{"8":4},"dominant|1|dominant|5|minor":{"32":3},"major|5|major|7|diminished_family":{"0":3},"major|7|diminished_family|0|major":{"5":1,"26":1,"44":1},"major|4|dominant|1|dominant":{"68":3},"dominant|6|dominant|6|minor":{"32":3},"dominant|7|major|4|diminished_family":{"32":6},"minor|0|minor|4|dominant":{"2":1,"32":3},"minor|9|minor|11|minor":{"69":3},"major|5|dominant|7|dominant":{"32":2,"62":1},"major|5|major|6|minor":{"32":11,"34":2,"66":1},"diminished_family|0|major|11|minor":{"32":3},"minor|8|major|4|dominant":{"31":4,"32":1},"major|2|dominant|9|diminished_family":{"32":3},"major|1|major|5|major":{"24":3,"42":1,"54":1},"major|9|dominant|5|major":{"44":1,"56":2},"dominant|2|major|11|dominant":{"66":1,"68":4},"dominant|2|major|4|dominant":{"2":1,"31":10},"minor|3|dominant|4|dominant":{"2":3},"dominant|0|minor|5|suspended":{"2":4,"30":9,"33":1,"43":1},"suspended|0|dominant|5|dominant":{"2":1,"31":2,"32":3,"38":2},"major|2|minor|10|dominant":{"6":2,"30":2},"minor|7|minor|7|dominant":{"2":1,"31":2},"major|5|major|2|minor":{"12":1,"13":1,"32":1,"60":1},"dominant|2|minor|7|dominant":{"2":2,"3":1,"31":1,"32":3},"dominant|11|dominant|0|diminished_family":{"3":1,"32":6},"major|9|minor|3|major":{"0":1,"3":5,"32":2,"37":2,"43":1,"46":1,"55":6,"56":4},"minor|3|major|0|diminished_family":{"13":5},"major|0|diminished_family|2|minor":{"32":9},"minor|3|major|9|minor":{"18":4,"42":3},"diminished_family|11|diminished_family|5|dominant":{"30":3,"31":6},"major|9|minor|5|suspended":{"2":3,"12":1,"30":2,"60":2},"minor|1|major|2|minor":{"7":3,"32":2},"minor|8|major|6|diminished_family":{"31":1,"32":2},"minor|5|dominant|0|diminished_family":{"2":3,"14":2,"32":2,"38":1},"diminished_family|7|major|3|diminished_family":{"26":3,"69":1},"major|5|minor|7|dominant":{"62":3},"diminished_family|11|minor|4|minor":{"1":1,"43":2},"dominant|11|dominant|10|dominant":{"2":2,"30":3,"32":1,"43":1,"68":2},"dominant|7|minor|10|major":{"1":1,"13":2,"44":3},"major|8|diminished_family|11|minor":{"32":4},"dominant|0|minor|5|minor":{"2":2,"25":1,"30":1,"32":1,"51":1},"minor|5|minor|8|diminished_family":{"38":2,"67":1},"dominant|5|dominant|0|major":{"13":1,"39":2,"56":1},"dominant|5|dominant|8|major":{"9":1,"55":3},"diminished_family|5|dominant|11|dominant":{"37":1,"68":3},"minor|7|minor|9|diminished_family":{"2":1,"32":3},"minor|3|major|5|suspended":{"30":3},"major|5|suspended|5|major":{"30":3},"other|0|major|0|dominant":{"9":1,"13":2,"30":1},"major|0|dominant|2|minor":{"32":1,"44":5},"dominant|5|major|0|other":{"0":14,"30":1},"dominant|11|dominant|6|minor":{"32":10},"minor|11|minor|11|dominant":{"25":1,"26":1,"66":6,"67":5,"68":2},"diminished_family|6|major|7|minor":{"32":3},"dominant|2|dominant|1|minor":{"32":3},"major|9|diminished_family|10|major":{"27":3},"diminished_family|10|major|4|diminished_family":{"32":3},"dominant|3|dominant|6|minor":{"31":1,"32":3},"minor|10|major|7|dominant":{"30":3,"31":1,"43":3},"diminished_family|9|diminished_family|5|dominant":{"31":3},"diminished_family|4|dominant|0|dominant":{"2":1,"30":2,"43":2},"dominant|6|dominant|0|dominant":{"7":1,"68":2},"diminished_family|6|major|5|major":{"42":3,"69":3},"minor|1|diminished_family|6|major":{"30":2,"32":1},"diminished_family|1|minor|3|minor":{"32":3},"dominant|9|dominant|11|major":{"30":3},"dominant|11|major|5|major":{"7":2,"42":2,"66":3,"67":1,"68":1},"dominant|6|diminished_family|11|dominant":{"66":1,"67":1,"68":1},"major|0|minor|10|minor":{"14":2,"32":1,"69":4},"diminished_family|11|dominant|11|minor":{"1":3,"14":2,"15":1,"30":2,"31":5,"32":26,"61":2,"67":1,"68":2,"69":2},"major|10|dominant|2|dominant":{"30":3},"dominant|2|dominant|5|major":{"1":6,"2":3,"55":1},"minor|9|diminished_family|11|minor":{"0":1,"25":1,"32":2,"42":8,"67":11},"major|7|diminished_family|7|minor":{"32":4},"dominant|11|dominant|2|dominant":{"6":1,"20":4,"32":1},"dominant|4|minor|5|suspended":{"2":1,"20":1,"30":8,"45":2,"57":1},"diminished_family|9|major|2|minor":{"13":1,"32":8},"other|0|major|9|dominant":{"2":7},"minor|2|minor|8|major":{"48":2,"50":1},"major|4|major|7|dominant":{"1":1,"30":2},"major|11|suspended|0|dominant":{"6":3,"30":1,"31":1,"32":3,"66":3},"suspended|0|dominant|11|major":{"70":3},"dominant|11|major|11|suspended":{"2":3},"dominant|5|major|11|suspended":{"2":2,"30":1},"dominant|6|minor|3|minor":{"32":3},"dominant|6|dominant|11|suspended":{"2":1,"20":2},"dominant|11|suspended|0|dominant":{"2":4,"30":6,"31":3,"43":1,"44":1,"68":1},"minor|6|dominant|11|suspended":{"2":10},"major|0|major|0|other":{"0":10},"minor|2|minor|3|dominant":{"1":1,"30":5},"dominant|10|major|2|minor":{"32":4},"minor|8|minor|11|minor":{"22":1,"32":3,"68":1},"dominant|5|minor|5|diminished_family":{"32":5,"34":1},"minor|11|diminished_family|1|minor":{"9":1,"32":16,"44":2,"56":1},"dominant|4|major|1|major":{"43":2,"66":1},"suspended|5|major|5|dominant":{"2":1,"13":1,"44":1,"68":2},"dominant|11|suspended|5|major":{"13":1,"44":1,"57":2},"major|7|major|9|dominant":{"31":5},"dominant|10|major|7|major":{"0":6,"30":1,"43":1,"67":1,"69":5},"major|6|dominant|1|dominant":{"30":6},"dominant|7|major|0|dominant":{"30":2,"32":2},"major|11|dominant|10|dominant":{"2":3,"60":1},"dominant|7|diminished_family|0|diminished_family":{"3":1,"32":3},"major|2|major|7|minor":{"32":3},"minor|5|major|10|major":{"12":3},"minor|7|major|6|diminished_family":{"32":3,"66":2},"minor|8|minor|4|minor":{"32":2,"49":10},"minor|4|minor|8|minor":{"1":2,"25":10,"42":1,"55":3},"diminished_family|1|minor|8|major":{"43":2,"67":3,"68":3},"dominant|2|major|0|dominant":{"30":10},"major|11|minor|11|dominant":{"66":1,"67":11},"major|0|minor|11|dominant":{"2":3,"31":1,"32":1,"66":2},"dominant|10|dominant|10|major":{"0":1,"30":3,"61":1},"major|0|diminished_family|7|dominant":{"30":3},"dominant|11|major|4|minor":{"31":1,"32":1,"61":1},"other|0|major|0|major":{"0":2,"1":1,"2":4,"5":8,"13":6},"diminished_family|1|minor|2|diminished_family":{"6":6,"32":1},"major|2|minor|1|minor":{"7":4,"49":3},"major|0|diminished_family|2|diminished_family":{"63":3},"diminished_family|2|diminished_family|10|diminished_family":{"0":3},"major|5|major|5|dominant":{"12":2,"61":1,"68":1},"major|8|major|11|dominant":{"30":3},"major|6|diminished_family|11|minor":{"67":9},"major|7|suspended|0|dominant":{"1":2,"30":4,"54":1},"dominant|2|major|7|suspended":{"30":2,"57":1},"major|1|minor|5|suspended":{"30":4},"suspended|5|major|9|minor":{"18":1,"31":5,"32":8,"48":4,"55":2},"dominant|1|dominant|4|dominant":{"2":5,"38":1},"minor|11|minor|3|minor":{"67":3},"minor|2|major|9|minor":{"6":3,"31":2,"34":3},"major|9|minor|1|major":{"42":3},"major|7|major|10|minor":{"60":3},"dominant|11|minor|10|minor":{"13":2,"32":7,"60":2,"67":6,"69":1},"minor|10|minor|11|diminished_family":{"32":7,"66":1,"67":1,"68":9},"dominant|5|diminished_family|11|dominant":{"67":3},"minor|1|major|9|minor":{"13":1,"32":4},"minor|9|minor|8|dominant":{"30":1,"68":2},"minor|8|dominant|5|major":{"0":1,"9":1,"38":3,"68":1},"dominant|9|dominant|11|dominant":{"26":1,"67":1,"68":1},"dominant|5|dominant|1|major":{"7":1,"8":3},"dominant|1|major|1|dominant":{"66":4},"dominant|1|major|6|dominant":{"62":2,"68":1},"major|5|major|2|dominant":{"30":11},"dominant|0|minor|11|diminished_family":{"7":2,"67":2},"diminished_family|11|dominant|0|dominant":{"39":1,"56":1,"67":1},"major|0|minor|7|minor":{"1":3},"minor|2|dominant|5|diminished_family":{"32":3},"diminished_family|5|dominant|9|dominant":{"31":4,"32":2},"major|9|minor|1|dominant":{"25":3},"major|7|major|10|major":{"36":1,"37":2,"60":4},"minor|1|dominant|0|dominant":{"1":1,"55":4,"67":1,"68":1},"minor|9|dominant|5|major":{"43":2,"44":2,"55":1},"major|5|dominant|6|diminished_family":{"32":10},"suspended|5|major|7|minor":{"30":2,"32":4},"dominant|5|major|4|major":{"1":1,"26":1,"44":1,"68":1},"dominant|11|dominant|11|suspended":{"2":1,"16":1,"34":3},"major|9|minor|11|minor":{"67":4},"minor|5|dominant|2|diminished_family":{"19":3,"32":8,"66":1},"dominant|10|major|4|dominant":{"6":1,"31":2,"61":1},"minor|11|diminished_family|4|dominant":{"2":2,"39":1,"68":1},"dominant|11|dominant|1|major":{"38":2,"55":1,"68":1},"dominant|3|minor|7|major":{"2":3,"19":1,"55":1},"minor|7|major|3|minor":{"32":1,"69":5},"dominant|5|dominant|4|minor":{"32":10},"suspended|5|major|4|minor":{"32":5},"minor|4|diminished_family|1|minor":{"2":1,"44":1,"69":1},"suspended|6|minor|5|dominant":{"31":1,"32":2},"dominant|9|dominant|9|dominant":{"2":1,"20":1,"56":5},"diminished_family|11|minor|2|dominant":{"31":3,"55":1},"dominant|8|dominant|0|dominant":{"2":1,"24":1,"26":1,"39":3,"62":1,"67":1},"major|7|dominant|9|diminished_family":{"32":9},"minor|7|dominant|2|diminished_family":{"32":3},"minor|10|minor|2|dominant":{"31":7,"68":2},"diminished_family|11|dominant|11|suspended":{"2":1,"9":1,"30":3},"major|3|diminished_family|4|dominant":{"2":2,"39":6},"diminished_family|4|dominant|6|diminished_family":{"7":4,"38":4},"dominant|6|diminished_family|1|minor":{"15":3,"32":3,"60":1},"dominant|11|dominant|11|diminished_family":{"32":2,"67":1,"68":1},"dominant|11|diminished_family|11|minor":{"1":1,"14":1,"42":1,"69":3},"minor|5|major|0|dominant":{"30":1,"31":2},"major|6|diminished_family|11|major":{"1":1,"32":1,"42":7},"major|8|dominant|6|minor":{"32":4},"minor|10|minor|9|diminished_family":{"32":4},"dominant|2|major|10|major":{"9":2,"12":1},"diminished_family|11|dominant|4|minor":{"1":1,"15":1,"31":1,"39":2,"44":1,"50":3},"dominant|4|minor|5|minor":{"50":3},"minor|5|minor|8|dominant":{"9":1,"25":2,"62":6},"dominant|1|dominant|9|dominant":{"8":2,"31":2,"32":1},"minor|5|minor|1|diminished_family":{"7":3,"8":6},"major|7|minor|11|dominant":{"37":3,"66":1},"dominant|9|minor|1|minor":{"7":1,"67":2},"dominant|11|major|6|diminished_family":{"32":5},"dominant|11|minor|6|dominant":{"30":1,"70":2},"dominant|9|dominant|5|major":{"0":1,"15":1,"25":1,"61":1},"minor|7|suspended|5|minor":{"2":1,"32":1,"44":2},"dominant|11|dominant|4|dominant":{"32":1,"38":1,"44":1},"minor|3|major|5|dominant":{"12":1,"42":2},"minor|7|dominant|1|major":{"25":1,"58":2},"dominant|10|minor|7|minor":{"57":1,"61":3},"suspended|0|minor|5|dominant":{"13":1,"30":3},"dominant|10|major|2|major":{"30":3,"48":1},"dominant|3|minor|9|dominant":{"19":3,"67":2},"minor|9|dominant|3|minor":{"42":3},"dominant|6|diminished_family|6|dominant":{"2":2,"32":1,"39":7,"43":3,"50":1,"68":1},"diminished_family|6|dominant|5|dominant":{"2":1,"30":1,"67":2},"major|3|dominant|5|minor":{"1":1,"31":1,"32":5,"61":2},"minor|8|minor|5|suspended":{"4":1,"55":2},"dominant|11|dominant|5|diminished_family":{"32":4},"diminished_family|1|dominant|7|minor":{"32":3},"major|6|minor|11|major":{"30":1,"67":3},"major|2|dominant|2|dominant":{"31":3},"major|2|suspended|2|minor":{"1":4},"suspended|2|minor|0|minor":{"1":3,"30":1},"minor|0|minor|5|major":{"0":3,"13":1,"19":3,"30":3,"43":1},"major|7|minor|7|major":{"0":2,"43":1},"dominant|11|major|10|dominant":{"12":2,"30":1,"68":2},"major|2|dominant|9|dominant":{"2":1,"31":1,"32":2},"suspended|5|major|3|dominant":{"30":1,"31":1,"68":2},"diminished_family|5|dominant|10|minor":{"20":3,"32":8,"43":3},"dominant|1|dominant|6|minor":{"1":1,"32":4},"major|11|diminished_family|11|dominant":{"67":3,"68":1},"major|5|minor|4|minor":{"32":2,"49":1},"dominant|3|major|9|minor":{"3":1,"31":2,"57":1},"dominant|10|diminished_family|11|minor":{"32":7},"major|5|major|4|major":{"6":2,"69":1},"minor|5|minor|2|minor":{"0":6,"6":3,"7":1,"31":2},"minor|10|suspended|0|suspended":{"4":2,"57":1,"60":1,"69":1},"minor|10|major|5|major":{"0":2,"13":1,"42":3,"66":4,"68":2},"major|5|major|11|dominant":{"6":1,"31":2,"32":1,"38":2,"62":1,"69":1},"minor|6|dominant|1|diminished_family":{"32":3},"diminished_family|11|diminished_family|11|diminished_family":{"32":4,"62":2},"minor|2|diminished_family|10|minor":{"31":6,"32":2},"diminished_family|10|minor|5|minor":{"31":3,"43":6},"minor|0|minor|4|diminished_family":{"32":4},"dominant|10|dominant|10|dominant":{"68":9},"minor|1|diminished_family|4|minor":{"32":3},"diminished_family|4|minor|5|dominant":{"31":3},"major|5|minor|1|diminished_family":{"38":1,"54":3},"diminished_family|9|dominant|5|major":{"0":3,"9":3},"minor|10|minor|11|dominant":{"31":1,"32":2,"66":3},"major|2|suspended|0|dominant":{"13":2,"30":3},"major|10|major|6|minor":{"31":6,"32":1},"diminished_family|5|dominant|10|dominant":{"2":3,"43":3},"dominant|0|dominant|2|diminished_family":{"3":1,"32":2},"dominant|11|minor|2|dominant":{"31":1,"66":2},"minor|5|minor|11|diminished_family":{"7":2,"24":2},"diminished_family|10|major|2|minor":{"13":1,"34":2,"60":2},"minor|5|suspended|5|diminished_family":{"46":2,"67":1},"minor|1|minor|2|dominant":{"31":3,"34":1,"55":1},"diminished_family|1|minor|11|diminished_family":{"7":2,"66":1,"67":1},"dominant|0|minor|7|minor":{"2":1,"15":1,"31":3,"43":2,"44":1},"dominant|9|diminished_family|6|dominant":{"68":3,"70":1},"dominant|6|dominant|10|dominant":{"37":3},"dominant|0|minor|9|dominant":{"3":1,"31":2,"32":1},"suspended|0|dominant|9|minor":{"32":4},"dominant|3|major|1|major":{"6":5},"minor|7|minor|0|dominant":{"31":2,"32":1},"diminished_family|1|suspended|0|dominant":{"30":5,"33":1},"major|5|dominant|3|dominant":{"31":1,"32":3},"major|9|minor|5|diminished_family":{"32":6},"dominant|9|dominant|1|dominant":{"30":1,"68":2},"minor|5|major|5|major":{"0":2,"9":1,"56":1,"69":3},"minor|3|dominant|11|diminished_family":{"32":3},"minor|5|dominant|0|other":{"30":3},"other|5|major|11|dominant":{"68":3},"minor|5|major|0|minor":{"30":2,"61":4},"minor|11|diminished_family|11|dominant":{"67":10},"dominant|0|minor|10|minor":{"68":2,"69":1},"minor|11|dominant|5|dominant":{"31":3,"32":1},"minor|5|minor|7|dominant":{"6":2,"31":4},"minor|1|diminished_family|1|dominant":{"6":1,"8":6,"30":1},"minor|2|diminished_family|1|major":{"9":3,"55":3,"69":1},"major|11|major|6|dominant":{"30":3},"major|5|major|6|major":{"30":3},"major|6|major|5|major":{"30":3},"minor|7|dominant|1|dominant":{"37":1,"39":3},"dominant|5|major|5|suspended":{"2":2,"12":1,"37":1},"major|5|suspended|2|major":{"0":1,"32":2},"suspended|2|major|0|major":{"0":2,"43":1},"major|7|dominant|10|major":{"0":1,"14":3},"dominant|10|major|2|dominant":{"30":3,"38":1},"diminished_family|1|minor|7|dominant":{"31":6},"dominant|1|major|7|minor":{"32":3},"dominant|3|major|11|dominant":{"14":2,"31":1,"68":1},"diminished_family|6|minor|5|dominant":{"1":1,"30":4},"dominant|1|diminished_family|10|diminished_family":{"32":3},"diminished_family|10|diminished_family|5|dominant":{"31":6},"dominant|4|dominant|6|dominant":{"30":1,"31":1,"68":1},"dominant|6|dominant|5|major":{"3":1,"32":4},"major|4|minor|9|diminished_family":{"33":7},"dominant|11|diminished_family|11|dominant":{"24":1,"68":2},"major|0|dominant|11|minor":{"1":2,"32":3,"48":2},"minor|8|major|0|dominant":{"32":1,"67":2},"major|5|dominant|1|minor":{"32":3},"major|0|dominant|9|dominant":{"31":5,"49":3},"dominant|10|major|5|major":{"0":1,"38":3},"major|6|dominant|3|minor":{"8":12,"32":1},"major|0|diminished_family|7|major":{"1":2,"21":3},"diminished_family|1|major|1|diminished_family":{"8":3},"major|4|minor|11|minor":{"67":4},"minor|5|suspended|0|minor":{"32":3},"dominant|5|suspended|5|major":{"0":8,"13":1,"32":1,"43":1,"55":3,"56":1,"62":1},"diminished_family|1|minor|1|dominant":{"57":3,"67":3},"major|11|minor|3|suspended":{"30":4},"minor|3|suspended|5|major":{"13":2,"30":2,"68":1},"diminished_family|9|major|2|dominant":{"2":2,"30":2},"major|1|diminished_family|6|minor":{"2":3,"32":1},"minor|3|dominant|5|minor":{"14":3},"dominant|7|dominant|11|dominant":{"32":2,"66":1,"68":1,"70":1},"dominant|4|major|7|minor":{"32":1,"55":4},"major|11|dominant|6|dominant":{"42":2,"68":3},"dominant|1|dominant|8|dominant":{"32":3},"dominant|8|dominant|5|dominant":{"31":3},"suspended|5|major|4|dominant":{"31":7},"minor|2|minor|3|minor":{"32":1,"43":2},"diminished_family|0|dominant|5|dominant":{"32":3,"44":1,"61":1},"suspended|0|dominant|1|major":{"0":3},"dominant|9|dominant|1|diminished_family":{"7":3},"dominant|7|minor|5|suspended":{"30":3},"dominant|11|dominant|5|suspended":{"2":4,"30":2,"56":1},"minor|1|minor|8|minor":{"13":3},"minor|8|minor|2|minor":{"49":3},"minor|2|minor|8|minor":{"1":6,"68":3},"minor|8|minor|11|dominant":{"7":3},"minor|11|dominant|1|minor":{"13":1,"68":3,"69":1},"dominant|1|minor|11|dominant":{"7":3},"major|11|dominant|10|minor":{"1":4,"18":1,"32":5,"57":1},"diminished_family|11|minor|2|minor":{"32":3},"major|4|diminished_family|10|minor":{"32":6},"major|2|diminished_family|2|minor":{"7":3},"diminished_family|2|minor|1|minor":{"32":3},"major|4|dominant|0|diminished_family":{"32":3},"dominant|4|diminished_family|0|diminished_family":{"32":3},"minor|2|minor|1|dominant":{"14":1,"32":4},"dominant|6|major|9|dominant":{"68":3},"dominant|11|dominant|6|major":{"37":2,"66":1},"major|1|diminished_family|10|minor":{"31":3,"32":8},"minor|10|major|1|diminished_family":{"7":4},"diminished_family|1|minor|10|minor":{"69":3},"minor|11|minor|1|minor":{"50":1,"55":2},"minor|8|dominant|5|dominant":{"39":2,"51":1},"minor|7|major|10|major":{"60":2,"67":2},"major|11|major|5|minor":{"32":1,"42":2,"60":2},"minor|7|major|3|major":{"54":2,"68":1},"major|3|major|11|dominant":{"6":2,"66":1},"major|8|major|9|major":{"67":3},"diminished_family|9|major|9|minor":{"31":1,"32":3,"57":3},"dominant|11|minor|1|minor":{"61":3},"dominant|2|major|0|other":{"13":3},"major|6|diminished_family|11|dominant":{"67":12,"70":1},"suspended|5|major|7|dominant":{"30":2,"32":1},"minor|8|dominant|10|dominant":{"66":6},"dominant|11|major|3|major":{"18":2,"68":2},"dominant|6|dominant|7|major":{"2":1,"54":2},"major|3|dominant|10|dominant":{"66":3},"dominant|5|major|2|major":{"2":3,"54":4},"major|2|major|0|dominant":{"55":3},"minor|7|minor|2|minor":{"36":1,"66":2},"minor|10|major|11|major":{"1":3,"55":1},"major|6|dominant|5|diminished_family":{"32":3},"diminished_family|1|dominant|1|dominant":{"8":4,"68":7},"dominant|7|dominant|5|suspended":{"30":2,"32":1},"diminished_family|1|major|0|minor":{"25":4,"67":1},"diminished_family|6|dominant|6|diminished_family":{"38":8},"suspended|7|minor|5|dominant":{"30":3},"major|5|suspended|0|dominant":{"30":1,"37":2},"minor|4|dominant|5|dominant":{"30":2,"32":3},"major|4|minor|7|dominant":{"31":5},"major|4|dominant|7|minor":{"32":4},"dominant|8|dominant|3|minor":{"32":3},"dominant|8|dominant|5|major":{"2":1,"32":7},"suspended|9|minor|5|minor":{"31":2,"48":1},"diminished_family|9|major|7|minor":{"32":3,"34":1},"dominant|4|diminished_family|11|dominant":{"67":1,"68":2,"70":2},"minor|5|major|3|minor":{"32":3},"dominant|4|minor|7|dominant":{"30":1,"31":2},"minor|11|dominant|4|major":{"0":1,"25":3,"44":2,"55":1},"minor|1|major|2|suspended":{"2":2,"6":1,"13":3},"diminished_family|1|major|4|dominant":{"32":3},"suspended|11|dominant|11|dominant":{"68":3},"dominant|11|suspended|5|suspended":{"6":3},"suspended|5|suspended|1|major":{"32":3},"suspended|1|major|5|dominant":{"68":3},"minor|11|major|6|minor":{"32":3},"dominant|5|dominant|6|major":{"67":3},"dominant|6|major|11|minor":{"31":3},"major|9|dominant|11|major":{"38":4},"minor|10|minor|1|diminished_family":{"54":3},"diminished_family|9|major|5|dominant":{"42":3},"dominant|0|dominant|4|dominant":{"1":1,"2":2},"dominant|2|major|10|minor":{"32":3},"major|5|dominant|10|major":{"12":3},"major|5|major|7|suspended":{"30":3},"dominant|6|minor|8|dominant":{"30":3},"minor|2|diminished_family|0|diminished_family":{"32":2,"66":1,"68":1},"suspended|0|suspended|0|major":{"0":3},"suspended|0|major|0|major":{"0":3},"minor|0|minor|5|diminished_family":{"3":3},"minor|5|diminished_family|0|diminished_family":{"32":1,"33":2},"dominant|10|dominant|5|major":{"68":3},"minor|10|major|5|dominant":{"67":3,"69":1},"dominant|4|minor|10|major":{"13":3},"diminished_family|1|dominant|5|dominant":{"69":3},"dominant|5|dominant|11|diminished_family":{"7":1,"32":2,"67":3},"minor|10|major|8|dominant":{"2":2,"30":1},"major|8|dominant|5|major":{"8":1,"38":2,"50":2,"55":1},"major|0|minor|9|minor":{"32":3},"suspended|0|dominant|11|diminished_family":{"2":3,"32":1},"major|7|major|6|dominant":{"66":3},"minor|8|dominant|9|minor":{"32":3},"major|7|major|7|minor":{"32":3},"major|1|major|9|minor":{"1":1,"32":3,"43":1},"diminished_family|11|major|4|minor":{"57":6},"dominant|3|dominant|5|dominant":{"31":3,"32":4},"dominant|3|major|2|minor":{"1":8},"suspended|0|dominant|1|suspended":{"2":1,"4":2},"dominant|10|minor|3|dominant":{"68":3},"major|5|dominant|6|dominant":{"31":1,"32":2,"50":2},"other|0|major|2|minor":{"13":3},"diminished_family|5|dominant|8|dominant":{"2":4},"minor|5|minor|0|dominant":{"1":3,"42":3,"68":1},"minor|5|minor|0|suspended":{"2":3},"minor|0|suspended|0|dominant":{"1":3},"minor|0|dominant|7|major":{"0":1,"9":2},"dominant|2|diminished_family|3|minor":{"32":3},"diminished_family|3|minor|5|dominant":{"30":3},"minor|1|dominant|9|diminished_family":{"32":3},"minor|6|diminished_family|11|minor":{"32":3},"minor|2|diminished_family|6|dominant":{"68":3},"diminished_family|11|major|1|diminished_family":{"32":3},"diminished_family|10|dominant|0|dominant":{"2":4,"31":1},"dominant|4|minor|9|diminished_family":{"33":3},"dominant|11|minor|9|dominant":{"68":3},"diminished_family|0|diminished_family|1|diminished_family":{"32":3},"major|4|minor|1|minor":{"32":3},"diminished_family|6|minor|0|dominant":{"30":2,"32":1},"major|9|dominant|2|minor":{"1":3},"dominant|1|major|5|major":{"32":1,"37":2,"66":1},"dominant|8|major|4|dominant":{"43":3},"minor|0|diminished_family|6|dominant":{"68":3},"diminished_family|1|dominant|1|diminished_family":{"7":3},"major|8|major|0|dominant":{"31":2,"39":1},"dominant|9|dominant|8|minor":{"67":3},"dominant|8|minor|11|minor":{"32":3},"dominant|5|diminished_family|0|minor":{"32":3},"diminished_family|0|minor|5|dominant":{"2":3,"30":4},"major|6|minor|11|dominant":{"66":3},"major|6|dominant|0|diminished_family":{"32":4},"major|1|diminished_family|10|diminished_family":{"32":3},"minor|7|minor|10|dominant":{"13":3,"32":2},"dominant|2|minor|5|minor":{"31":2,"32":3},"minor|5|suspended|9|minor":{"31":1,"32":2},"minor|2|minor|0|major":{"0":6},"major|9|dominant|9|diminished_family":{"68":3},"dominant|9|diminished_family|11|dominant":{"67":3},"dominant|6|minor|2|dominant":{"31":3},"dominant|3|minor|11|diminished_family":{"32":3},"major|11|minor|11|minor":{"67":3},"dominant|5|minor|10|major":{"13":2,"30":2},"major|2|major|9|major":{"24":1,"31":4},"major|9|major|5|minor":{"1":2,"32":2},"minor|11|major|1|minor":{"60":1,"66":3},"major|1|minor|11|major":{"7":3},"major|2|major|6|dominant":{"66":3},"minor|6|dominant|4|minor":{"32":4},"minor|6|dominant|10|major":{"6":3},"dominant|10|major|1|major":{"55":3},"minor|7|minor|3|minor":{"32":3},"dominant|3|dominant|4|major":{"0":3},"major|7|dominant|7|dominant":{"32":3},"minor|7|minor|1|diminished_family":{"67":3},"minor|5|major|9|dominant":{"31":3},"dominant|11|major|2|suspended":{"30":3},"suspended|5|major|3|diminished_family":{"67":3},"diminished_family|11|minor|7|minor":{"62":3},"minor|10|dominant|2|minor":{"31":3},"major|3|minor|11|diminished_family":{"32":9},"major|6|diminished_family|11|diminished_family":{"69":4},"major|4|dominant|11|dominant":{"32":8},"major|1|major|1|minor":{"34":4},"dominant|11|diminished_family|0|dominant":{"66":3},"diminished_family|0|dominant|11|major":{"0":3},"dominant|1|major|1|minor":{"1":1,"62":5},"major|11|dominant|5|suspended":{"2":4},"minor|2|major|2|minor":{"32":3},"dominant|3|minor|1|dominant":{"32":12},"minor|11|minor|10|minor":{"57":1,"60":2},"major|6|dominant|10|dominant":{"25":4},"dominant|10|dominant|4|minor":{"32":4},"dominant|3|major|2|dominant":{"1":4,"32":1},"minor|10|dominant|1|major":{"7":5},"major|1|minor|10|dominant":{"0":5},"minor|10|dominant|0|major":{"0":5},"major|2|major|1|major":{"0":1,"37":2},"dominant|2|minor|8|minor":{"32":3},"major|8|major|2|major":{"18":2,"42":1,"54":1},"dominant|4|dominant|1|dominant":{"68":6},"dominant|5|dominant|4|dominant":{"8":5},"dominant|1|dominant|2|diminished_family":{"32":4},"major|10|dominant|4|major":{"43":4},"major|7|minor|9|minor":{"32":4},"dominant|5|minor|4|dominant":{"30":4},"dominant|0|diminished_family|10|dominant":{"2":4},"diminished_family|10|minor|9|diminished_family":{"33":4},"minor|5|suspended|10|diminished_family":{"25":6},"suspended|10|diminished_family|4|minor":{"30":2,"49":2,"55":2},"dominant|0|major|0|dominant":{"0":2,"30":2},"minor|2|dominant|3|major":{"44":2,"45":2,"55":2},"dominant|10|dominant|4|dominant":{"32":3},"dominant|2|minor|0|major":{"6":1,"19":2},"major|1|major|0|dominant":{"18":2,"32":2},"major|4|diminished_family|1|major":{"1":4},"major|0|minor|4|minor":{"1":4},"diminished_family|11|dominant|7|major":{"62":4},"minor|2|dominant|2|minor":{"1":3},"minor|8|dominant|7|major":{"39":3},"major|0|minor|6|dominant":{"32":3},"diminished_family|1|minor|6|dominant":{"68":4},"diminished_family|5|dominant|2|dominant":{"32":4},"dominant|2|dominant|3|dominant":{"14":4},"dominant|3|dominant|2|dominant":{"50":4},"major|6|minor|5|minor":{"31":6},"minor|5|dominant|10|diminished_family":{"67":6},"major|11|minor|8|major":{"30":4},"diminished_family|5|dominant|4|minor":{"32":4},"major|1|major|10|minor":{"32":4}}}},"support":{"sequences":1170,"events":55640,"contexts_kept":1979,"contexts_pruned":1578},"heldout_bits":{"order":{"0":4.467,"1":3.865,"2":3.41,"3":3.273},"train":936,"test":234}}}}'
+DEFAULT_TABLES['transitions'] = json.loads(_TRANSITIONS_JSON)
+_RHYTHM_JSON = '{"evidence":"MEASURED","source":"Experiment 37: chord-length patterns per span of 4, 2 and 1 bars, half-bar grid, three corpora with one method","note":"P(pattern | span size, position). Position is cadential for the last span of a section, interior otherwise. Patterns are filtered to the allowed chord lengths (rates) and tilted by the harmonic-activity dial. Patterns seen fewer than 3 times are dropped.","licence_note":"jazz profile derived from the Jazz Harmony Treebank (CC BY-NC-SA 4.0); Billboard profile from McGill Billboard via ChoCo (CC BY 4.0)","profiles":{"beatles":{"4":{"interior":{"1+1+1+1":0.19938,"4":0.19237,"2+2":0.17679,"2+1+1":0.0771,"1+1+2":0.05997,"3+1":0.04595,"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.03427,"0.5+0.5+1+0.5+0.5+1":0.02103,"1+2+1":0.02103,"0.5+0.5+0.5+0.5+1+1":0.01947,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.01558,"0.5+0.5+1+1+1":0.01324,"1+0.5+0.5+1+0.5+0.5":0.01246,"1+0.5+0.5+1+1":0.00935,"1+1+0.5+0.5+1":0.00857,"1+1+1.5+0.5":0.00701,"0.5+0.5+3":0.00623,"1+1+0.5+0.5+0.5+0.5":0.00623,"0.5+0.5+0.5+1+0.5+0.5+0.5":0.00545,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.00545,"2.5+0.5+0.5+0.5":0.00467,"0.5+0.5+1.5+0.5+1":0.00467,"0.5+0.5+1+2":0.00467,"2+0.5+0.5+0.5+0.5":0.00389,"1.5+0.5+2":0.00389,"1+1+1+0.5+0.5":0.00389,"1+0.5+0.5+0.5+0.5+1":0.00389,"2+0.5+1.5":0.00312,"1+3":0.00312,"2.5+0.5+1":0.00312,"0.5+0.5+1+1+0.5+0.5":0.00312,"0.5+1+0.5+0.5+1+0.5":0.00312,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.00312,"3.5+0.5":0.00312,"1+1.5+0.5+1":0.00234,"0.5+0.5+0.5+1+0.5+1":0.00234,"0.5+1.5+0.5+0.5+0.5+0.5":0.00234,"1.5+0.5+1.5+0.5":0.00234,"0.5+0.5+1+0.5+1.5":0.00234},"cadential":{"1+1+1+1":0.19651,"1+1+2":0.1083,"2+2":0.10568,"4":0.07773,"2+1+1":0.05328,"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.04716,"1+1+0.5+0.5+1":0.03406,"1+2+1":0.02969,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.02707,"0.5+0.5+1+0.5+0.5+1":0.02183,"1+1+1+0.5+0.5":0.02096,"1+0.5+0.5+1+0.5+0.5":0.02009,"1+0.5+0.5+1+1":0.01921,"3+1":0.01747,"1+1+0.5+0.5+0.5+0.5":0.01485,"0.5+0.5+0.5+0.5+2":0.01485,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.01397,"0.5+0.5+1+1+1":0.01397,"1+0.5+0.5+2":0.01135,"1+0.5+0.5+0.5+0.5+1":0.01135,"0.5+0.5+1+0.5+0.5+0.5+0.5":0.01048,"0.5+0.5+0.5+0.5+1+1":0.00961,"2+0.5+0.5+1":0.00961,"0.5+0.5+1.5+0.5+1":0.00873,"1+3":0.00873,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.00611,"1+1+0.5+1.5":0.00611,"1+1.5+0.5+1":0.00524,"1.5+0.5+0.5+0.5+0.5+0.5":0.00524,"1+1+0.5+1+0.5":0.00524,"0.5+0.5+0.5+1+0.5+0.5+0.5":0.00524,"1.5+1+0.5+1":0.00437,"0.5+0.5+0.5+0.5+0.5+1+0.5":0.00437,"2+0.5+1.5":0.00437,"1+0.5+1+0.5+0.5+0.5":0.00437,"1+1+1.5+0.5":0.00349,"2+1+0.5+0.5":0.00349,"1+0.5+0.5+0.5+1.5":0.00349,"1+0.5+1.5+0.5+0.5":0.00349,"0.5+2+0.5+1":0.00349,"0.5+0.5+1+1+0.5+0.5":0.00349,"0.5+1+0.5+0.5+0.5+0.5+0.5":0.00349,"1.5+0.5+2":0.00262,"1.5+1+1+0.5":0.00262,"0.5+3.5":0.00262,"2+0.5+0.5+0.5+0.5":0.00262,"0.5+1.5+0.5+1.5":0.00262,"0.5+1+0.5+0.5+0.5+1":0.00262,"0.5+0.5+3":0.00262}},"2":{"interior":{"2":0.39913,"1+1":0.36921,"0.5+0.5+0.5+0.5":0.0888,"0.5+0.5+1":0.06202,"1+0.5+0.5":0.05092,"1.5+0.5":0.01327,"0.5+1.5":0.01062,"0.5+1+0.5":0.00603},"cadential":{"2":0.33147,"1+1":0.30837,"0.5+0.5+0.5+0.5":0.12351,"0.5+0.5+1":0.12112,"1+0.5+0.5":0.06534,"1.5+0.5":0.02151,"0.5+1.5":0.01514,"0.5+1+0.5":0.01355}},"1":{"interior":{"1":0.81845,"0.5+0.5":0.18155},"cadential":{"1":0.80237,"0.5+0.5":0.19763}}},"billboard":{"4":{"interior":{"2+2":0.19299,"1+1+1+1":0.1811,"4":0.1559,"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.06784,"1+1+2":0.06018,"2+1+1":0.05309,"1+0.5+0.5+1+0.5+0.5":0.03526,"0.5+0.5+1+0.5+0.5+1":0.03076,"1+1+1+0.5+0.5":0.02626,"1+1+0.5+0.5+1":0.01294,"3+1":0.01236,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.01217,"2+1+0.5+0.5":0.01217,"1.5+0.5+1.5+0.5":0.01102,"1+0.5+0.5+1+1":0.00891,"1+0.5+0.5+2":0.00814,"1+2+1":0.00805,"0.5+0.5+0.5+0.5+2":0.00709,"0.5+0.5+1+0.5+0.5+0.5+0.5":0.0068,"3+0.5+0.5":0.0068,"2+1.5+0.5":0.00623,"2+0.5+0.5+1":0.00527,"1+0.5+1.5+0.5+0.5":0.00498,"1+3":0.00489,"0.5+0.5+1+1+1":0.00383,"2.5+0.5+1":0.00383,"2+0.5+0.5+0.5+0.5":0.00355,"1+0.5+0.5+0.5+0.5+1":0.00345,"1+1+1.5+0.5":0.00326,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.00307,"0.5+0.5+1+2":0.00297,"1+1+0.5+0.5+0.5+0.5":0.00278,"0.5+0.5+0.5+1+0.5+0.5+0.5":0.0023,"0.5+0.5+0.5+0.5+1+1":0.0023,"3.5+0.5":0.0023,"0.5+0.5+1.5+0.5+1":0.00211,"1+1+0.5+1+0.5":0.00211,"1.5+0.5+1+0.5+0.5":0.00201,"0.5+1+1+1+0.5":0.00201,"0.5+0.5+0.5+1+0.5+1":0.00182,"1.5+0.5+2":0.00163,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.00163,"0.5+1.5+0.5+1.5":0.00153,"0.5+1+0.5+0.5+1+0.5":0.00153,"1.5+0.5+1+1":0.00125,"1+0.5+0.5+1.5+0.5":0.00115,"1.5+0.5+0.5+0.5+1":0.00115,"0.5+0.5+2+1":0.00096,"0.5+0.5+1+1+0.5+0.5":0.00096,"0.5+0.5+0.5+0.5+0.5+1+0.5":0.00086,"0.5+2+0.5+0.5+0.5":0.00086,"1+1.5+0.5+1":0.00077,"0.5+0.5+3":0.00077,"1+2+0.5+0.5":0.00077,"2.5+0.5+0.5+0.5":0.00067,"1+0.5+2.5":0.00067,"1+0.5+1.5+1":0.00067,"0.5+2.5+0.5+0.5":0.00067,"1.5+0.5+0.5+0.5+0.5+0.5":0.00057,"1.5+1+1+0.5":0.00057,"0.5+3.5":0.00048,"0.5+1+1+1.5":0.00048,"0.5+1+1.5+0.5+0.5":0.00048,"2+0.5+1.5":0.00038,"0.5+1+0.5+0.5+0.5+0.5+0.5":0.00038,"1+2.5+0.5":0.00038,"0.5+1.5+1+1":0.00038,"0.5+0.5+2+0.5+0.5":0.00038,"0.5+0.5+0.5+0.5+0.5+1.5":0.00038,"0.5+0.5+1+0.5+1+0.5":0.00029,"0.5+0.5+1+1.5+0.5":0.00029,"1.5+1+0.5+1":0.00029,"0.5+0.5+1+0.5+1.5":0.00029,"0.5+0.5+2.5+0.5":0.00029,"0.5+2+0.5+1":0.00029},"cadential":{"1+1+1+1":0.1825,"4":0.125,"2+2":0.11039,"1+1+2":0.09276,"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.07084,"2+1+1":0.05241,"1+1+1+0.5+0.5":0.0332,"0.5+0.5+1+0.5+0.5+1":0.03224,"1+0.5+0.5+1+0.5+0.5":0.03129,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.02589,"1+1+0.5+0.5+1":0.01747,"1+0.5+0.5+2":0.01461,"1+1+0.5+0.5+0.5+0.5":0.0135,"0.5+0.5+0.5+0.5+2":0.01191,"2+1+0.5+0.5":0.01191,"0.5+0.5+0.5+0.5+1+1":0.0108,"1+2+1":0.00969,"3+1":0.00969,"1+0.5+0.5+1+1":0.00794,"0.5+0.5+1+0.5+0.5+0.5+0.5":0.00747,"2+0.5+0.5+1":0.00731,"1.5+0.5+1.5+0.5":0.00731,"2+0.5+0.5+0.5+0.5":0.00699,"2+1.5+0.5":0.00635,"3+0.5+0.5":0.00588,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.00572,"1+3":0.00556,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.00508,"1.5+0.5+2":0.00508,"0.5+0.5+1+1+1":0.00492,"1+1+1.5+0.5":0.00429,"0.5+0.5+1.5+0.5+1":0.00429,"1+0.5+0.5+0.5+0.5+1":0.00381,"1+1+0.5+1+0.5":0.00334,"0.5+0.5+1+2":0.00318,"0.5+0.5+0.5+1+0.5+0.5+0.5":0.00286,"1+2+0.5+0.5":0.0027,"1+0.5+1.5+0.5+0.5":0.0027,"0.5+1+1+1.5":0.00238,"0.5+1.5+0.5+1.5":0.00238,"0.5+0.5+0.5+0.5+0.5+1.5":0.00222,"2.5+0.5+1":0.00206,"0.5+0.5+0.5+0.5+0.5+1+0.5":0.00191,"0.5+1+0.5+0.5+1+0.5":0.00191,"0.5+0.5+0.5+1+0.5+1":0.00175,"1.5+0.5+1+1":0.00159,"1+2.5+0.5":0.00127,"2.5+0.5+0.5+0.5":0.00127,"1.5+0.5+0.5+0.5+1":0.00127,"0.5+0.5+1+0.5+1+0.5":0.00111,"0.5+1+0.5+0.5+0.5+1":0.00111,"3.5+0.5":0.00111,"0.5+0.5+1+1+0.5+0.5":0.00111,"2+0.5+1.5":0.00095,"1+0.5+2.5":0.00095,"0.5+1+0.5+0.5+0.5+0.5+0.5":0.00095,"0.5+0.5+0.5+1.5+1":0.00095,"0.5+1+0.5+2":0.00095,"1+0.5+0.5+1.5+0.5":0.00095,"0.5+1+1+1+0.5":0.00095,"1+0.5+1+0.5+0.5+0.5":0.00095,"0.5+3.5":0.00079,"0.5+0.5+0.5+2.5":0.00079,"0.5+1+1.5+0.5+0.5":0.00079,"0.5+0.5+1.5+0.5+0.5+0.5":0.00064,"0.5+1+0.5+1.5+0.5":0.00064,"0.5+0.5+1+0.5+1.5":0.00064,"1+0.5+1.5+1":0.00064,"0.5+1+0.5+1+0.5+0.5":0.00064,"1.5+0.5+1+0.5+0.5":0.00064,"1+0.5+1+0.5+1":0.00048,"0.5+0.5+3":0.00048,"2.5+1.5":0.00048,"0.5+0.5+2+0.5+0.5":0.00048,"0.5+0.5+0.5+0.5+1.5+0.5":0.00048,"0.5+1+1+0.5+1":0.00048}},"2":{"interior":{"2":0.4171,"1+1":0.30659,"0.5+0.5+0.5+0.5":0.103,"1+0.5+0.5":0.07826,"0.5+0.5+1":0.06242,"1.5+0.5":0.02022,"0.5+1+0.5":0.0079,"0.5+1.5":0.00452},"cadential":{"2":0.38922,"1+1":0.26882,"0.5+0.5+0.5+0.5":0.11404,"0.5+0.5+1":0.09799,"1+0.5+0.5":0.09026,"1.5+0.5":0.02241,"0.5+1.5":0.00878,"0.5+1+0.5":0.00848}},"1":{"interior":{"1":0.80179,"0.5+0.5":0.19821},"cadential":{"1":0.77719,"0.5+0.5":0.22281}}},"jazz":{"4":{"interior":{"1+1+1+1":0.16128,"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.13806,"2+2":0.07758,"2+1+1":0.05742,"1+1+2":0.05518,"1+1+1+0.5+0.5":0.04657,"4":0.04563,"1+1+0.5+0.5+0.5+0.5":0.03926,"1+0.5+0.5+1+0.5+0.5":0.03926,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.03773,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.03407,"1+0.5+0.5+1+1":0.0316,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.02936,"0.5+0.5+0.5+0.5+1+1":0.02511,"1+1+0.5+0.5+1":0.01568,"0.5+0.5+1+0.5+0.5+1":0.01379,"1+0.5+0.5+0.5+0.5+1":0.01368,"1+0.5+0.5+2":0.01332,"0.5+0.5+1+0.5+0.5+0.5+0.5":0.01238,"0.5+0.5+1+1+1":0.01155,"0.5+0.5+0.5+0.5+2":0.01108,"2+0.5+0.5+0.5+0.5":0.00778,"2+1+0.5+0.5":0.00755,"3+1":0.00672,"1+2+1":0.00566,"1.5+0.5+2":0.00483,"0.5+0.5+1+1+0.5+0.5":0.00448,"1+1+1.5+0.5":0.00436,"2+0.5+0.5+1":0.00401,"1.5+0.5+0.5+0.5+0.5+0.5":0.00377,"3+0.5+0.5":0.00377,"1+3":0.00365,"1.5+0.5+1+1":0.00259,"2.5+0.5+0.5+0.5":0.00236,"0.5+0.5+1+2":0.00224,"1+0.5+0.5+1.5+0.5":0.00224,"2+0.5+1.5":0.00212,"1.5+0.5+1.5+0.5":0.002,"1.5+0.5+1+0.5+0.5":0.002,"0.5+0.5+0.5+0.5+1.5+0.5":0.00165,"2+1.5+0.5":0.00153,"0.5+0.5+1.5+0.5+0.5+0.5":0.00141,"1+1+0.5+1.5":0.0013,"0.5+0.5+2+1":0.0013,"1.5+0.5+0.5+0.5+1":0.00106,"0.5+0.5+1.5+0.5+1":0.00106,"0.5+0.5+3":0.00094,"3.5+0.5":0.00083,"2.5+0.5+1":0.00083,"0.5+0.5+2+0.5+0.5":0.00083,"0.5+0.5+0.5+0.5+0.5+1.5":0.00083,"1+1.5+0.5+1":0.00059,"1+0.5+1.5+1":0.00047,"1+1.5+0.5+0.5+0.5":0.00047,"0.5+1.5+1+1":0.00035,"1+2+0.5+0.5":0.00035,"1.5+0.5+0.5+1.5":0.00035,"0.5+0.5+0.5+2.5":0.00035,"0.5+1+0.5+0.5+1+0.5":0.00035,"0.5+0.5+1+1.5+0.5":0.00035,"0.5+0.5+0.5+1+0.5+1":0.00035,"2.5+1.5":0.00035,"1.5+1.5+1":0.00035},"cadential":{"0.5+0.5+0.5+0.5+0.5+0.5+0.5+0.5":0.1411,"1+1+1+1":0.10038,"1+1+2":0.09091,"1+1+1+0.5+0.5":0.08902,"0.5+0.5+0.5+0.5+1+0.5+0.5":0.07481,"0.5+0.5+0.5+0.5+0.5+0.5+1":0.06913,"1+1+0.5+0.5+0.5+0.5":0.06629,"1+0.5+0.5+1+0.5+0.5":0.05303,"1+0.5+0.5+0.5+0.5+0.5+0.5":0.04451,"0.5+0.5+0.5+0.5+2":0.03598,"1+1+0.5+0.5+1":0.02746,"0.5+0.5+0.5+0.5+1+1":0.02273,"1+0.5+0.5+0.5+0.5+1":0.02178,"1+0.5+0.5+1+1":0.02083,"4":0.02083,"2+2":0.01705,"1+0.5+0.5+2":0.01705,"2+1+1":0.0161,"0.5+0.5+1+0.5+0.5+0.5+0.5":0.01326,"0.5+0.5+1+1+1":0.00947,"1.5+0.5+2":0.00758,"0.5+0.5+1+1+0.5+0.5":0.00758,"0.5+0.5+1+0.5+0.5+1":0.00663,"0.5+0.5+1+2":0.00568,"2+1+0.5+0.5":0.00473,"2+0.5+0.5+0.5+0.5":0.00473,"2+0.5+1.5":0.00284,"2+0.5+0.5+1":0.00284,"3+1":0.00284,"1.5+0.5+0.5+0.5+1":0.00284}},"2":{"interior":{"1+1":0.32306,"0.5+0.5+0.5+0.5":0.24799,"2":0.20637,"1+0.5+0.5":0.13716,"0.5+0.5+1":0.06642,"1.5+0.5":0.01495,"0.5+1.5":0.00323,"0.5+1+0.5":0.00082},"cadential":{"0.5+0.5+0.5+0.5":0.25528,"1+0.5+0.5":0.23232,"2":0.20845,"1+1":0.14876,"0.5+0.5+1":0.14601,"0.5+1.5":0.00551,"1.5+0.5":0.00367}},"1":{"interior":{"1":0.63903,"0.5+0.5":0.36097},"cadential":{"1":0.51148,"0.5+0.5":0.48852}}}},"repeat":{"beatles":0.3244,"billboard":0.565,"jazz":0.2237},"support":{"beatles":{"4":{"interior":1310,"cadential":1179},"2":{"interior":4144,"cadential":1255},"1":{"interior":9865,"cadential":1265}},"billboard":{"4":{"interior":10462,"cadential":6320},"2":{"interior":28341,"cadential":6603},"1":{"interior":64285,"cadential":6647}},"jazz":{"4":{"interior":8506,"cadential":1089},"2":{"interior":18263,"cadential":1089},"1":{"interior":37701,"cadential":1089}}}}'
+DEFAULT_TABLES['rhythm'] = json.loads(_RHYTHM_JSON)
+DEFAULT_TABLES.pop('rate', None)
+DEFAULT_TABLES['version'] = 5
+DEFAULT_TABLES['return_preparation'] = '{"evidence": "MEASURED", "source": "Experiment 38: endings of new sections followed by a return (Beatles, Billboard)", "note": "P(destination | the next section is a return). Jazz has no section data and uses the pop profiles.", "profiles": {"beatles": {"half": 0.3636, "authentic": 0.1672, "plagal": 0.1466, "open": 0.0733, "free": 0.0674, "lead_step": 0.0499, "tonic": 0.0469, "mixture": 0.044, "lead_dominant": 0.0352, "deceptive": 0.0059}, "billboard": {"half": 0.3625, "open": 0.1187, "authentic": 0.107, "plagal": 0.1016, "lead_step": 0.0969, "tonic": 0.0883, "free": 0.0641, "mixture": 0.0312, "lead_dominant": 0.0266, "deceptive": 0.0031}}, "setup_share": {"beatles": 0.449, "billboard": 0.486}}'
+DEFAULT_TABLES['return_preparation'] = json.loads(DEFAULT_TABLES['return_preparation'])
+DEFAULT_TABLES['version'] = 6
+
+
+# ---------------------------------------------------------------- utilities
+
+def rng_for(seed, stage, variant=0):
+    digest = hashlib.sha256(f'{seed}:{stage}:{variant}'.encode()).digest()
+    return random.Random(int.from_bytes(digest[:8], 'big'))
+
+
+def weighted_choice(rng, weights):
+    items = [(k, float(w)) for k, w in weights.items() if w > 0]
+    if not items:
+        raise ValueError('No option has positive weight.')
+    total = sum(w for _, w in items)
+    x = rng.random() * total
+    for k, w in items:
+        x -= w
+        if x <= 0:
+            return k
+    return items[-1][0]
+
+
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def tilt(weights, score, dial, strength=4.0):
+    """Reweight a measured distribution: dial 0.5 leaves it unchanged, 0 and 1 push towards low or high scores."""
+    beta = strength * (2 * float(dial) - 1)
+    out = {k: float(w) * math.exp(beta * score(k)) for k, w in weights.items()}
+    return {k: v for k, v in out.items() if v > 0}
+
+
+def corpus_weights(s):
+    w = {k: float(v) for k, v in s['corpus_mix'].items() if float(v) > 0}
+    total = sum(w.values())
+    return {k: v / total for k, v in w.items()}
+
+
+def mixed(tables, name, cls, s, fallback='statement'):
+    """Blend a class's measured distribution across corpus profiles by the corpus mix.
+
+    A corpus without data for the class does not contribute; if none of the chosen corpora
+    has the class, every profile that has it is blended equally and the fallback is noted."""
+    profiles = tables[name]['profiles']
+    for c in (cls, fallback):
+        weights = corpus_weights(s)
+        have = {k: w for k, w in weights.items() if c in profiles.get(k, {})}
+        if not have:
+            have = {k: 1.0 for k, v in profiles.items() if c in v}
+            if have:
+                s.setdefault('_notes', []).append(f'{name}/{c}: chosen corpora have no data; blended {", ".join(sorted(have))}')
+        if have:
+            total = sum(have.values())
+            out = collections.Counter()
+            for k, w in have.items():
+                for t, p in profiles[k][c].items():
+                    out[t] += w / total * p
+            return dict(out)
+    raise ValueError(f'No measured {name} table for {cls}.')
+
+
+def mixed_departure(tables, cls, s):
+    kr = tables['key_relation']['p_depart']
+    have = {k: w for k, w in corpus_weights(s).items() if cls in kr.get(k, {})}
+    if not have:
+        have = {k: 1.0 for k, v in kr.items() if cls in v}
+    total = sum(have.values())
+    return sum(w / total * kr[k][cls] for k, w in have.items()) if have else 0.05
+
+
+def dial_probability(dial, measured):
+    """Map a 0..1 dial to a probability: 0 never, 0.5 the measured rate, 1 always."""
+    dial = float(dial)
+    return measured * dial / 0.5 if dial <= 0.5 else measured + (1 - measured) * (dial - 0.5) / 0.5
+
+
+OPENING_STABILITY = {'1': 1.0, '3': 0.5, '6': 0.5}
+CADENCE_STRENGTH = {'authentic': 1.0, 'plagal': 0.85, 'tonic': 0.75, 'mixture': 0.7, 'deceptive': 0.4, 'half': 0.35,
+                    'lead_dominant': 0.3, 'open': 0.2, 'lead_step': 0.15, 'free': 0.0}
+META_KEYS = ('evidence', 'note', 'source', 'support', 'p_depart')
+
+
+def load_tables(path=None):
+    if path is None:
+        return copy.deepcopy(DEFAULT_TABLES)
+    data = json.loads(Path(path).read_text())
+    if data.get('schema') != 'harmonic-engine-tables':
+        raise ValueError('Not a harmonic-engine tables file.')
+    if 'rhythm' not in data:
+        raise ValueError('This tables file predates v0.5: it has no rhythm table (Experiment 37).')
+    return data
+
+
+# ---------------------------------------------------------------- keys and chords
+
+def parse_key(key):
+    m = re.fullmatch(r'\s*([A-Ga-g])([#b]?)\s+([a-z]+)\s*', str(key))
+    if not m:
+        raise ValueError(f'Key must be a tonic and mode, e.g. "D major" or "A dorian": {key!r}')
+    mode = MODE_ALIASES.get(m[3], m[3])
+    if mode not in MODES:
+        raise ValueError(f'Supported modes: {", ".join(sorted(MODES) + sorted(MODE_ALIASES))}.')
+    pc = (LETTER_PC[m[1].upper()] + {'': 0, '#': 1, 'b': -1}[m[2]]) % 12
+    return pc, mode
+
+
+def key_name(pc, mode):
+    return f'{PC_NAMES[pc]} {mode}'
+
+
+def related_key(home, relation):
+    pc, mode = parse_key(home)
+    if relation == 'home':
+        return key_name(pc, mode)
+    if relation == 'relative':
+        return key_name((pc + 9) % 12, 'minor') if mode in MAJOR_LIKE else key_name((pc + 3) % 12, 'major')
+    if relation == 'parallel':
+        return key_name(pc, 'minor' if mode in MAJOR_LIKE else 'major')
+    if relation == 'dominant':
+        return key_name((pc + 7) % 12, mode)
+    if relation == 'subdominant':
+        return key_name((pc + 5) % 12, mode)
+    return key_name(*parse_key(relation))
+
+
+def scale_pcs(key):
+    pc, mode = parse_key(key)
+    return {(pc + x) % 12 for x in MODES[mode]}
+
+
+def diatonic_family(mode, degree):
+    sc = MODES[mode]
+    r = sc[degree - 1]
+    third = (sc[(degree + 1) % 7] - r) % 12
+    fifth = (sc[(degree + 3) % 7] - r) % 12
+    if third == 4:
+        return 'augmented' if fifth == 8 else 'major'
+    return 'diminished' if fifth == 6 else 'minor'
+
+
+def token_str(t):
+    return str(t)
+
+
+def token_chord(token, key):
+    """Return (root_pc, core_family, kind) for a token in a local key."""
+    token = token_str(token)
+    tonic, mode = parse_key(key)
+    if re.fullmatch(r'[1-7]', token):
+        d = int(token)
+        return (tonic + MODES[mode][d - 1]) % 12, diatonic_family(mode, d), 'diatonic'
+    if token in MIXTURE_TOKENS:
+        off, fam = MIXTURE_TOKENS[token]
+        root = (tonic + off) % 12
+        kind = 'diatonic' if set((root + x) % 12 for x in TRIADS[fam]) <= scale_pcs(key) else 'mixture'
+        return root, fam, kind
+    m = re.fullmatch(r'x(\d+)([Mmd])', token)
+    if m:
+        return (tonic + int(m[1])) % 12, {'M': 'major', 'm': 'minor', 'd': 'diminished'}[m[2]], 'chromatic'
+    raise ValueError(f'Unknown chord token {token!r}.')
+
+
+def degree_of_root(root_pc, key):
+    tonic, mode = parse_key(key)
+    off = (root_pc - tonic) % 12
+    return MODES[mode].index(off) + 1 if off in MODES[mode] else None
+
+
+ROMAN = ('I', 'II', 'III', 'IV', 'V', 'VI', 'VII')
+
+
+def roman(token, key):
+    root, fam, kind = token_chord(token, key)
+    tonic, mode = parse_key(key)
+    off = (root - tonic) % 12
+    major_scale = MODES['major']
+    if off in major_scale:
+        base, acc = ROMAN[major_scale.index(off)], ''
+    else:
+        base, acc = ROMAN[major_scale.index((off + 1) % 12)], 'b'
+    numeral = base if fam in ('major', 'augmented') else base.lower()
+    return acc + numeral + {'diminished': '°', 'augmented': '+'}.get(fam, '')
+
+
+def token_function(token, key):
+    t = token_str(token)
+    if t in FUNCTION_OF:
+        return FUNCTION_OF[t]
+    root, _, _ = token_chord(t, key)
+    d = degree_of_root(root, key)
+    return FUNCTION_OF.get(str(d), 'D') if d else 'D'
+
+
+def token_for_root(root_pc, key, allow_chromatic=True, prefer_major=False):
+    """Diatonic token whose root is root_pc, else a chromatic token or None."""
+    d = degree_of_root(root_pc, key)
+    tonic, mode = parse_key(key)
+    if d is not None:
+        fam = diatonic_family(mode, d)
+        if prefer_major and fam != 'major' and allow_chromatic:
+            return f'x{(root_pc - tonic) % 12}M'
+        return str(d)
+    if allow_chromatic:
+        return f'x{(root_pc - tonic) % 12}{"M" if prefer_major else "m"}'
+    return None
+
+
+# ---------------------------------------------------------------- structure and functions
+
+def parse_structure(text, default_phrase=4):
+    """Rows: 'name bars [p+p...] [variant_of=name]'. Names keep their case."""
+    sections = []
+    for line in str(text).splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        bits = line.split()
+        opts = dict(b.split('=', 1) for b in bits if '=' in b)
+        bits = [b for b in bits if '=' not in b]
+        if len(bits) not in (2, 3) or not re.fullmatch(r"[A-Za-z][\w′'\-]*", bits[0]) or not bits[1].isdigit():
+            raise ValueError(f'Use one row per section, e.g. "A 8" or "verse 8 3+3+2": {line!r}')
+        bars = int(bits[1])
+        if len(bits) == 3:
+            phrases = [int(x) for x in bits[2].split('+')]
+        else:
+            phrases = [default_phrase] * (bars // default_phrase) + ([bars % default_phrase] if bars % default_phrase else [])
+        sections.append(dict(identity=bits[0], bars=bars, phrases=phrases, **opts))
+    return normalise_structure(sections)
+
+
+def from_context(structure, settings):
+    """Unpack a GCL context document: sections from the structure stage, global parameters as defaults."""
+    if not (isinstance(structure, dict) and 'sections' in structure):
+        return structure, settings
+    if not str(structure.get('schema', '')).startswith('gcl-context'):
+        raise ValueError('Expected a GCL context document (schema gcl-context-0.1).')
+    g = structure.get('global_parameters') or {}
+    merged = {k: g[k] for k in ('key', 'tempo', 'meter', 'seed') if k in g}
+    merged.update(settings or {})
+    return structure['sections'], merged
+
+
+def normalise_structure(sections):
+    """Accepts parse_structure rows or GCL context sections; returns indexed rows."""
+    out, seen, start = [], collections.Counter(), 0
+    for i, s in enumerate(sections):
+        ident = str(s['identity'])
+        bars = int(s['bars'])
+        phrases = [int(p) for p in s.get('phrases') or [bars]]
+        if bars < 1 or sum(phrases) != bars or min(phrases) < 1:
+            raise ValueError(f'{ident}: phrase lengths must be positive and sum to {bars} bars.')
+        seen[ident] += 1
+        row = dict(index=i, identity=ident, occurrence=seen[ident], start=start, bars=bars, phrases=phrases)
+        if s.get('variant_of'):
+            row['variant_of'] = str(s['variant_of'])
+        out.append(row)
+        start += bars
+    if not out:
+        raise ValueError('The structure has no sections.')
+    return out
+
+
+VARIANT_SUFFIX = re.compile(r"^(.+?)(_v\d+|′+|'+)$")
+
+
+def derive_functions(sections):
+    """Structural functions from the form itself, independent of section names.
+
+    recurrence: statement (new material), return (identity heard before),
+                variant (new identity derived from an earlier one)
+    cls:        opening_statement, statement (new, before any return),
+                contrast_statement (new, after a return), final_statement,
+                return, variant
+    position:   opening, interior, final
+    source:     index of the section a return or variant derives from
+    contrast_with: index of the opening statement, for new interior material
+    """
+    first = {}
+    funcs = []
+    lengths = sorted(s['bars'] for s in sections)
+    median = lengths[len(lengths) // 2]
+    last = len(sections) - 1
+    for s in sections:
+        i, ident = s['index'], s['identity']
+        position = 'opening' if i == 0 else 'final' if i == last else 'interior'
+        base = s.get('variant_of')
+        if not base:
+            m = VARIANT_SUFFIX.match(ident)
+            base = m[1] if m and m[1] in first else None
+        if ident in first:
+            recurrence, source = 'return', first[ident]
+        elif base and base in first:
+            recurrence, source = 'variant', first[base]
+        else:
+            recurrence, source = 'statement', None
+        first.setdefault(ident, i)
+        if recurrence == 'statement':
+            cls = 'opening_statement' if i == 0 else 'final_statement' if (i == last and i > 0) else 'statement'
+            if cls == 'statement' and any(g['recurrence'] != 'statement' for g in funcs):
+                cls = 'contrast_statement'  # new material after something has returned
+        else:
+            cls = recurrence
+        funcs.append(dict(index=i, position=position, recurrence=recurrence, source=source, cls=cls,
+                          contrast_with=0 if recurrence == 'statement' and i > 0 else None,
+                          relative_length=round(s['bars'] / median, 3)))
+    return funcs
+
+
+# ---------------------------------------------------------------- settings
+
+DEFAULT_SETTINGS = dict(
+    key='C major', tempo=100, meter='4/4', seed=42,
+    rates=[0.5, 1],                    # allowed chord lengths, as chords per bar (0.5 = 2-bar chords, 1 = 1-bar, 2/3 = 1½ bars); see lengths_to_rates
+    tonal_departure=0.5,               # 0 never, 0.5 measured rate (about 5%), 1 always: new interior material changes key
+    stability=0.5,                     # opening chords: 0.5 measured; higher favours tonic openings
+    cadence_strength=0.5,              # section endings: 0.5 measured; higher favours firm arrivals
+    harmonic_activity=0.5,             # phrase rhythm patterns: 0.5 measured; higher favours more chords per phrase
+    model_generation=0.5,              # share of candidate phrases sampled from the corpus chord-change models (rest authored motifs)
+    relations=['relative', 'subdominant', 'dominant', 'parallel'],
+    return_home=True,                  # opening and final sections in the home key
+    colour=0.5,                        # 0 plain, 0.5 Beatles profile, 1 jazz profile (Experiment 27)
+    colour_persistence=None,           # None follows the profile; 0..1 sets P(colour | previous coloured)
+    dominant_sevenths=0.3,             # functional V7 before a resolution; separate from colour
+    mixture=0.5,                       # borrowed and chromatic chords: 0 none, 0.5 measured, 1 doubled
+    raised_dominant=0.5,               # minor keys: chance a dominant cadence uses major V (never in modal keys)
+    modal_emphasis=0.5,                # modes: 0 conversion by degree only; higher favours the mode's signature chord (DESIGN)
+    variation=0.15,                    # substitution rate inside primed phrases (A')
+    variant_variation=0.35,            # substitution rate for variant sections
+    hold=0.0,                          # chance a slot holds the previous chord
+    interest=0.5,                      # predictable (0) to surprising (1): 0.5 keeps the measured balance
+    interest_contour='flat',           # how interest changes across the form: flat, rising, arch, contrast
+    development=0.0,                   # repeats change a little more each time they return (0 exact, 1 strongly)
+    prepare_returns=0.5,               # sections leading into a return end with a set-up: 0.5 measured (Experiment 38)
+    section_contrast=0.6,              # target degree mismatch of new material against the opening
+    corpus_mix={'billboard': 70, 'beatles': 30, 'jazz': 0},  # style: blends root motion and section profiles
+    candidates=24, top_k=4, choice_temperature=1.0,
+    min_distinct_roots=3,
+    final_destination='table',         # 'table' or 'loop' (final section leads back to the opening)
+    final_tonic=True,                  # restrict the final destination to tonic arrivals
+    adapt_return_endings=True,         # a return may re-aim its last bar at a different next section
+    join_bars=1,                       # bars a re-aimed ending may change
+    recolour_returns=0.0,              # chance a return's colour is re-sampled (development by colour)
+    phrase_form='auto',                # 'auto' or a pattern such as 'aaba'
+    policies={},                       # optional repeat treatment per section index: exact, extend, compress, vary, variant, independent
+)
+
+
+def resolve_settings(settings):
+    s = copy.deepcopy(DEFAULT_SETTINGS)
+    for k, v in (settings or {}).items():
+        if k not in s:
+            raise ValueError(f'Unknown setting {k!r}.')
+        s[k] = copy.deepcopy(v)
+    parse_key(s['key'])
+    m = re.fullmatch(r'(\d+)/(1|2|4|8|16)', str(s['meter']))
+    if not m:
+        raise ValueError('Meter must be a time signature such as 4/4.')
+    for k in ('tonal_departure', 'stability', 'cadence_strength', 'harmonic_activity', 'model_generation', 'colour', 'dominant_sevenths', 'mixture', 'raised_dominant', 'modal_emphasis', 'variation',
+              'variant_variation', 'hold', 'section_contrast', 'recolour_returns', 'interest', 'development',
+              'prepare_returns'):
+        if not 0 <= float(s[k]) <= 1:
+            raise ValueError(f'{k} must be between 0 and 1.')
+    if s['colour_persistence'] is not None and not 0 <= float(s['colour_persistence']) <= 1:
+        raise ValueError('colour_persistence must be None or between 0 and 1.')
+    s['rates'] = sorted({Fraction(str(r)).limit_denominator(12) for r in s['rates']})
+    if not s['rates'] or any(r not in RATE_CHOICES for r in s['rates']):
+        raise ValueError('Chord lengths must be 4, 3, 2, 1½, 1, ½ or ¼ bars (rates 1/4, 1/3, 1/2, 2/3, 1, 2, 4 per bar).')
+    if sum(float(v) for v in s['corpus_mix'].values()) <= 0:
+        raise ValueError('Set at least one corpus weight.')
+    if s['interest_contour'] not in INTEREST_CONTOURS:
+        raise ValueError(f"interest_contour must be one of {', '.join(INTEREST_CONTOURS)}.")
+    if s['final_destination'] not in ('table', 'loop'):
+        raise ValueError("final_destination must be 'table' or 'loop'.")
+    if not 1 <= int(s['candidates']) <= 256 or not 1 <= int(s['top_k']) <= int(s['candidates']):
+        raise ValueError('candidates must be 1..256 and top_k at most candidates.')
+    if not 0 < float(s['choice_temperature']) <= 10:
+        raise ValueError('choice_temperature must be in (0, 10].')
+    return s
+
+
+def bar_ticks(meter):
+    num, den = map(int, str(meter).split('/'))
+    return PPQ * 4 * num // den
+
+
+# ---------------------------------------------------------------- motif helpers
+
+def fit_motif(motif, n):
+    """Slow rates sample the motif's trajectory; fast rates repeat it."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [motif[0]]
+    if n < len(motif):
+        return [motif[round(i * (len(motif) - 1) / (n - 1))] for i in range(n)]
+    return [motif[i % len(motif)] for i in range(n)]
+
+
+def phrase_pattern(name, n):
+    if name == 'auto':
+        base = {1: 'a', 2: 'aa', 3: 'aab'}.get(n, 'aaba')
+    else:
+        base = name.lower()
+    labels = []
+    for i in range(n):
+        ch = base[i % len(base)].upper()
+        prime = ch in labels  # repeated label inside the section carries a prime
+        labels.append(ch + ("'" if prime and i == n - 1 and n > 2 else ''))
+    return labels
+
+
+def cadence_tokens(kind, key, settings, rng, next_root=None):
+    """Tokens that end a section, as a short list for the final slots."""
+    _, mode = parse_key(key)
+    minor_like = mode not in MAJOR_LIKE
+    dom = '5M' if minor_like and rng.random() < settings['raised_dominant'] else '5'
+    if kind == 'authentic':
+        return [dom, '1']
+    if kind == 'plagal':
+        return ['4', '1']
+    if kind == 'tonic':
+        return ['1']
+    if kind == 'mixture':
+        return ['7' if minor_like or mode == 'mixolydian' else 'b7', '1']
+    if kind == 'half':
+        return [dom]
+    if kind == 'open':
+        return ['4']
+    if kind == 'deceptive':
+        return [dom, '6']
+    if kind in ('lead_dominant', 'lead_step') and next_root is not None:
+        if kind == 'lead_dominant':
+            return [token_for_root((next_root + 7) % 12, key, allow_chromatic=True, prefer_major=True)]
+        for step in (2, 1, -2, -1):
+            t = token_for_root((next_root + step) % 12, key, allow_chromatic=False)
+            if t:
+                return [t]
+    return []
+
+
+# ---------------------------------------------------------------- planning
+
+def section_seed_key(sections, i):
+    s = sections[i]
+    return f"{s['identity']}#{s['occurrence']}"
+
+
+def plan_keys(sections, funcs, s, tables):
+    home = key_name(*parse_key(s['key']))
+    kr = tables['key_relation']
+    ident_key = {}
+    for f, sec in zip(funcs, sections):
+        ident = sec['identity']
+        if ident in ident_key:
+            continue
+        if f['recurrence'] == 'variant':
+            ident_key[ident] = ident_key[sections[f['source']]['identity']]
+        elif f['cls'] in ('statement', 'contrast_statement') and s['relations']:
+            r = rng_for(s['seed'], 'key:' + ident)
+            p = dial_probability(s['tonal_departure'], mixed_departure(tables, f['cls'], s))
+            if r.random() < p:
+                shape = {k: v for k, v in kr['statement'].items() if k in s['relations'] and k not in META_KEYS}
+                ident_key[ident] = related_key(home, weighted_choice(r, shape)) if shape else home
+            else:
+                ident_key[ident] = home
+        else:
+            ident_key[ident] = home
+    keys = [ident_key[sec['identity']] for sec in sections]
+    if s['return_home']:
+        keys[0] = home
+        keys[-1] = home
+    return keys
+
+
+def gated_weights(table, mixture):
+    out = {}
+    for k, v in table.items():
+        if k in META_KEYS:
+            continue
+        is_mix = not re.fullmatch(r'[1-7]', k)
+        w = float(v) * (mixture / 0.5 if is_mix else 1.0)
+        if w > 0:
+            out[k] = w
+    return out
+
+
+def plan_openings(sections, funcs, s, tables):
+    openings = {}
+    for f, sec in zip(funcs, sections):
+        ident = sec['identity']
+        if ident in openings or f['recurrence'] != 'statement':
+            continue
+        table = mixed(tables, 'opening', f['cls'], s)
+        weights = tilt(gated_weights(table, s['mixture']), lambda t: OPENING_STABILITY.get(t, 0.0), s['stability'])
+        openings[ident] = weighted_choice(rng_for(s['seed'], 'opening:' + ident), weights)
+    return openings
+
+
+# ---------------------------------------------------------------- scheduling
+
+def pattern_lengths(pattern):
+    return [Fraction(x) for x in pattern.split('+')]
+
+
+def span_sizes(bars):
+    """A phrase is read as spans of 4, 2 and 1 bars from its start, as in Experiment 37."""
+    out = []
+    while bars > 0:
+        n = next(k for k in (4, 2, 1) if k <= bars)
+        out.append(n)
+        bars -= n
+    return out
+
+
+# Allowed chord lengths, given as chords per bar: 4 bars, 3, 2, 1½, 1, half and quarter of a bar.
+RATE_CHOICES = (Fraction(1, 4), Fraction(1, 3), Fraction(1, 2), Fraction(2, 3), Fraction(1), Fraction(2), Fraction(4))
+
+
+def lengths_to_rates(shortest, longest):
+    """Every allowed chord length (in bars) from shortest to longest, as the rates setting expects."""
+    lo, hi = Fraction(str(shortest)), Fraction(str(longest))
+    return [str(r) for r in RATE_CHOICES if lo <= 1 / r <= hi and r != 4]
+
+
+def allowed_lengths(s):
+    return {Fraction(1) / Fraction(r) for r in s['rates']}
+
+
+def rhythm_dist(s, tables, n, position, allowed):
+    """P(pattern) for an n-bar span: measured profiles blended by the corpus mix, restricted to the allowed
+    chord lengths and tilted by the harmonic-activity dial (0.5 leaves the measured shape)."""
+    prof = tables['rhythm']['profiles']
+    out = collections.Counter()
+    for k, w in corpus_weights(s).items():
+        for p, q in prof.get(k, {}).get(str(n), {}).get(position, {}).items():
+            out[p] += w * q
+    dist = {p: q for p, q in out.items() if all(x in allowed for x in pattern_lengths(p))}
+    if not dist:
+        fits = [x for x in sorted(allowed, reverse=True) if (Fraction(n) / x).denominator == 1]
+        if not fits:
+            return {}
+        dist = {'+'.join([f'{float(fits[0]):g}'] * int(Fraction(n) / fits[0])): 1.0}
+    dist = tilt(dist, lambda p: (math.log2(len(p.split('+')) / n) + 2) / 3, s['harmonic_activity'])
+    total = sum(dist.values())
+    return {p: q / total for p, q in dist.items()}
+
+
+def choose_rhythm(sec, s, tables, rng):
+    """Chord-length patterns for each phrase of a new section (one list of span patterns per phrase).
+    A span repeats the previous span's pattern at the measured rate for the blended corpora."""
+    allowed = allowed_lengths(s)
+    p_repeat = sum(w * tables['rhythm']['repeat'].get(k, 0.0) for k, w in corpus_weights(s).items())
+    out, prev, last_phrase = [], None, len(sec['phrases']) - 1
+    for pi, bars in enumerate(sec['phrases']):
+        sizes, pats = span_sizes(bars), []
+        for si, n in enumerate(sizes):
+            pos = 'cadential' if pi == last_phrase and si == len(sizes) - 1 else 'interior'
+            dist = rhythm_dist(s, tables, n, pos, allowed)
+            if not dist:
+                # No allowed length fits this span (an odd bar in a 5-bar phrase with only 2-bar chords, say):
+                # use 1-bar chords for this span only, and say so.
+                dist = {'+'.join(['1'] * n): 1.0}
+                s.setdefault('_notes', []).append(
+                    f"{sec['identity']}: {sec['phrases']}-bar phrases need a chord length outside the chosen range "
+                    f"({', '.join(f'{float(x):g}' for x in sorted(allowed))} bars); 1-bar chords used where needed.")
+            pat = None
+            if prev is not None and prev[0] == n and prev[1] in dist and dist[prev[1]] < 1:
+                q = dist[prev[1]]
+                if rng.random() < min(1.0, max(0.0, (p_repeat - q) / (1 - q))):
+                    pat = prev[1]
+            if pat is None:
+                pat = weighted_choice(rng, dist)
+            pats.append(pat)
+            prev = (n, pat)
+        out.append(pats)
+    return out
+
+
+def schedule(sec, rhythm, bt):
+    slots, start = [], sec['start'] * bt
+    for pi, (bars, pats) in enumerate(zip(sec['phrases'], rhythm)):
+        cum = Fraction(0)
+        for pat in pats:
+            for x in pattern_lengths(pat):
+                a, b = int(cum * bt), int((cum + x) * bt)
+                slots.append(dict(phrase_index=pi, start_tick=start + a, duration_ticks=b - a))
+                cum += x
+        start += bars * bt
+    return slots
+
+
+# ---------------------------------------------------------------- scoring
+
+def root_motion_dist(s, tables):
+    rm = tables['root_motion']
+    w = {k: float(v) for k, v in s['corpus_mix'].items() if float(v) > 0}
+    dist = [sum(w[k] * rm[k][i] for k in w) for i in range(11)]
+    total = sum(dist)
+    return [x / total for x in dist]
+
+
+# ---------------------------------------------------------------- chord-change models (Experiment 36)
+
+MODEL_QUALITIES = ('major', 'minor', 'dominant', 'diminished_family', 'suspended', 'other')
+MODEL_OUTCOMES = [(i, q) for i in range(12) for q in MODEL_QUALITIES]
+MODEL_INDEX = {o: k for k, o in enumerate(MODEL_OUTCOMES)}
+_MODEL_CACHE = {}
+
+
+def transition_models(tables):
+    """Parsed order-3 back-off models per corpus, or None if the tables have none."""
+    tr = tables.get('transitions')
+    if not tr:
+        return None
+    hit = _MODEL_CACHE.get(id(tr))
+    if hit and hit[0] is tr:
+        return hit[1]
+    models = {}
+    for name, c in tr['corpora'].items():
+        orders = {}
+        for k, ctxs in c['model']['orders'].items():
+            orders[int(k)] = {ctx: ({int(o): v for o, v in cnt.items()}, sum(cnt.values())) for ctx, cnt in ctxs.items()}
+        models[name] = (c['model']['base'], orders)
+    parsed = (float(tr['alpha']), models)
+    if len(_MODEL_CACHE) > 4:
+        _MODEL_CACHE.clear()
+        _DIST_CACHE.clear()
+    _MODEL_CACHE[id(tr)] = (tr, parsed)
+    return parsed
+
+
+def context_key(history, k):
+    h = history
+    if k == 1:
+        parts = (h[-1][1],)
+    elif k == 2:
+        parts = (h[-2][1], h[-1][0], h[-1][1])
+    else:
+        parts = (h[-3][1], h[-2][0], h[-2][1], h[-1][0], h[-1][1])
+    return '|'.join(str(x) for x in parts)
+
+
+def model_dist(model, alpha, history):
+    base, orders = model
+    p = list(base)
+    for k in (1, 2, 3):
+        if len(history) < k:
+            break
+        hit = orders[k].get(context_key(history, k))
+        if hit:
+            c, n = hit
+            p = [(c.get(j, 0) + alpha * p[j]) / (n + alpha) for j in range(len(p))]
+    return p
+
+
+def model_prob(model, alpha, history, j):
+    base, orders = model
+    p = base[j]
+    for k in (1, 2, 3):
+        if len(history) < k:
+            break
+        hit = orders[k].get(context_key(history, k))
+        if hit:
+            c, n = hit
+            p = (c.get(j, 0) + alpha * p) / (n + alpha)
+    return p
+
+
+def model_weights(s, models):
+    w = {k: v for k, v in corpus_weights(s).items() if k in models}
+    if not w:
+        w = {k: 1.0 for k in models}
+    total = sum(w.values())
+    return {k: v / total for k, v in w.items()}
+
+
+_DIST_CACHE = {}
+
+
+def mixed_model_dist(s, parsed, history):
+    """Blended next-chord distribution. Only the last three tokens matter, so results are cached."""
+    alpha, models = parsed
+    weights = model_weights(s, models)
+    key = (id(parsed), tuple(sorted(weights.items())), tuple(history[-3:]))
+    hit = _DIST_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = [0.0] * len(MODEL_OUTCOMES)
+    for name, w in weights.items():
+        for j, p in enumerate(model_dist(models[name], alpha, history[-3:])):
+            out[j] += w * p
+    if len(_DIST_CACHE) > 20000:
+        _DIST_CACHE.clear()
+    _DIST_CACHE[key] = out
+    return out
+
+
+def mixed_model_prob(s, parsed, history, j):
+    return mixed_model_dist(s, parsed, history)[j]
+
+
+def model_quality(fam, root, next_root, given=None):
+    """Quality class of an engine chord for the corpus models."""
+    if given:
+        return given
+    if fam == 'major':
+        return 'dominant' if next_root is not None and (next_root - root) % 12 == 5 else 'major'
+    return {'minor': 'minor', 'diminished': 'diminished_family'}.get(fam, 'other')
+
+
+def quality_family(q, root, key):
+    if q == 'minor':
+        return 'minor'
+    if q == 'diminished_family':
+        return 'diminished'
+    if q == 'suspended':
+        d = degree_of_root(root, key)
+        if d:
+            fam = diatonic_family(parse_key(key)[1], d)
+            return fam if fam in ('major', 'minor') else 'major'
+    return 'major'
+
+
+def token_from_chord(root, fam, key):
+    """Engine token for a root and core family in a local key (diatonic, mixture or chromatic)."""
+    tonic, mode = parse_key(key)
+    off = (root - tonic) % 12
+    sc = MODES[mode]
+    if off in sc and diatonic_family(mode, sc.index(off) + 1) == fam:
+        return str(sc.index(off) + 1)
+    for t, (o, f) in MIXTURE_TOKENS.items():
+        if o == off and f == fam:
+            return t
+    return f"x{off}{dict(major='M', minor='m', diminished='d').get(fam, 'M')}"
+
+
+def model_sequence(tokens, quals, key, prev_root=None):
+    """(roots, model tokens) for chord runs; intervals are absolute, so they cross key changes."""
+    runs = []
+    for t, q in zip(tokens, quals):
+        if runs and runs[-1][0] == t:
+            continue
+        runs.append((t, q))
+    roots = [token_chord(t, key)[0] for t, _ in runs]
+    fams = [token_chord(t, key)[1] for t, _ in runs]
+    out = []
+    for i, ((t, q), r, f) in enumerate(zip(runs, roots, fams)):
+        nxt = roots[i + 1] if i + 1 < len(roots) else None
+        prev = roots[i - 1] if i else prev_root
+        out.append(((r - prev) % 12 if prev is not None else None, model_quality(f, r, nxt, q)))
+    return roots, out
+
+
+def generate_phrase(m, key, s, parsed, rng, history, prev_root, start_token=None):
+    """Sample m chord slots from the blended corpus models, continuing the given history."""
+    tokens, quals = [], []
+    hist = list(history)
+    for j in range(m):
+        if j == 0 and start_token is not None:
+            root, fam, _ = token_chord(start_token, key)
+            tok, q = start_token, None
+            iv = (root - prev_root) % 12 if prev_root is not None else None
+            hist.append((iv, model_quality(fam, root, None)))
+        else:
+            p = mixed_model_dist(s, parsed, hist)
+            inv_temp = 2.0 ** (-3 * (s.get('_interest', 0.5) - 0.5))   # interest 0.5 samples the model as measured
+            weights = []
+            for idx, (iv, q) in enumerate(MODEL_OUTCOMES):
+                w = p[idx] ** inv_temp if p[idx] > 0 else 0.0
+                if prev_root is None:
+                    w = 0.0 if iv else w
+                elif iv == 0:
+                    w *= math.exp(-6.0) if hist and q == hist[-1][1] else math.exp(-0.8)
+                weights.append(w)
+            if prev_root is None:
+                root, q, tok = parse_key(key)[0], 'major', '1'
+                fam = token_chord('1', key)[1]
+                iv = None
+            else:
+                choices = []
+                for idx, (iv_, q_) in enumerate(MODEL_OUTCOMES):
+                    if weights[idx] <= 0:
+                        continue
+                    r = (prev_root + iv_) % 12
+                    f = quality_family(q_, r, key)
+                    t = token_from_chord(r, f, key)
+                    w = weights[idx]
+                    if token_chord(t, key)[2] != 'diatonic':
+                        w *= s['mixture'] / 0.5
+                    if w > 0:
+                        choices.append((w, t, q_, iv_, r))
+                total = sum(c[0] for c in choices)
+                x = rng.random() * total
+                for w, t, q_, iv_, r in choices:
+                    x -= w
+                    if x <= 0:
+                        break
+                tok, q, iv, root = t, q_, iv_, r
+            hist.append((iv, q))
+        tokens.append(tok)
+        quals.append(q)
+        prev_root = token_chord(tok, key)[0]
+    return tokens, quals
+
+
+def score_tokens(tokens, key, dist, weights, s, contrast_ref=None, used_endings=(), cadence_len=0,
+                 quals=None, parsed=None, history=(), prev_root=None):
+    runs = [t for i, t in enumerate(tokens) if i == 0 or t != tokens[i - 1]]
+    roots = [token_chord(t, key)[0] for t in runs]
+    funcs = [FUNCTION_TRANSITIONS.get((token_function(a, key), token_function(b, key)), 0)
+             for a, b in zip(runs, runs[1:])]
+    distinct = len(set(roots))
+    target = max(1, min(s['min_distinct_roots'], len(tokens)))
+    if parsed is not None:
+        _, seq = model_sequence(tokens, quals or [None] * len(tokens), key, prev_root)
+        hist = list(history)
+        logs = []
+        for tok in seq:
+            if tok[0] is not None or hist:
+                logs.append(math.log(max(mixed_model_prob(s, parsed, hist, MODEL_INDEX[(tok[0] if tok[0] is not None else 0, tok[1])]), 1e-12)))
+            hist.append(tok)
+        mean_log = sum(logs) / len(logs) if logs else 0.0
+        score = weights.get('transition', 1.0) * mean_log + (interest_term(mean_log, weights, s) if logs else 0.0)
+    else:
+        motion = [math.log(dist[(b - a) % 12 - 1]) for a, b in zip(roots, roots[1:]) if a != b]
+        score = weights['motion'] * (sum(motion) / len(motion) if motion else math.log(0.07))
+    score += weights['function'] * (sum(funcs) / len(funcs) if funcs else 0)
+    score += weights['diversity'] * min(distinct, target) / target
+    if distinct < target:
+        score -= weights['diversity'] * (target - distinct)
+    if contrast_ref is not None:
+        ref = fit_motif(contrast_ref, len(tokens))
+        mismatch = sum(a != b for a, b in zip(tokens, ref)) / len(tokens)
+        score -= weights['contrast'] * (mismatch - s['section_contrast']) ** 2
+    mix = sum(1 for t in runs if token_chord(t, key)[2] != 'diatonic')
+    score -= weights['mixture_use'] * mix * max(0.0, 1 - 2 * s['mixture'])
+    if cadence_len:
+        ending = tuple(tokens[-max(2, cadence_len):])
+        score -= weights['ending_reuse'] * sum(1 for e in used_endings if e == ending)
+    return score
+
+
+# ---------------------------------------------------------------- core generation for new material
+
+def motif_pool(key, s, tables):
+    _, mode = parse_key(key)
+    family = 'major' if mode in MAJOR_LIKE else 'minor'
+    pool = [(tuple(str(t) for t in m), 1.0) for m in tables['motifs'][family]]
+    if s['mixture'] > 0:
+        pool += [(tuple(str(t) for t in m), s['mixture']) for m in tables['motifs'][family + '_mixture']]
+    return pool
+
+
+def rotate_to(motif, opening):
+    if opening in motif:
+        k = motif.index(opening)
+        return motif[k:] + motif[:k], False
+    return (opening,) + motif[1:], True
+
+
+def substitute(token, key, rng):
+    group = token_function(token, key)
+    _, mode = parse_key(key)
+    opts = [str(d) for d in range(1, 8) if FUNCTION_OF[str(d)] == group and str(d) != str(token)
+            and diatonic_family(mode, d) != 'diminished']
+    return rng.choice(opts) if opts else token
+
+
+def section_target_mode(key, s):
+    """The mode a reference-mode local key will be read in (None when it is not converted)."""
+    target = s.get('_target_mode')
+    if not target or target == REFERENCE_MODE[target] or parse_key(key)[1] != REFERENCE_MODE[target]:
+        return None
+    return target
+
+
+def modal_bonus(tokens, key, s, weights):
+    """DESIGN: modal emphasis. Rewards candidates that use the target mode's signature chord."""
+    target = section_target_mode(key, s)
+    if not target or target not in MODAL_SIGNATURE or s['modal_emphasis'] <= 0:
+        return 0.0
+    runs = [t for i, t in enumerate(tokens) if i == 0 or t != tokens[i - 1]]
+    share = sum(1 for t in runs if str(t) in MODAL_SIGNATURE[target]) / len(runs)
+    return weights.get('modal', 1.5) * 2 * s['modal_emphasis'] * min(share, 0.5)
+
+
+def convert_modal(events_by_section, sections, keys, s, variant):
+    """Read the reference-mode tokens in a modal key: no raised dominant or borrowed major IV, signature chord for diminished
+    results, and a repair where a replacement repeats its neighbour (same choice for every occurrence)."""
+    for sec in sections:
+        i = sec['index']
+        mode = parse_key(keys[i])[1]
+        if mode not in MODAL_MODES:
+            continue
+        evs = events_by_section[i]
+        sub = MODAL_SUBSTITUTE.get(mode, {})
+        changed = False
+        for j, e in enumerate(evs):
+            t = str(e['token'])
+            # minor-key alterations (raised V, borrowed major IV, chromatic major V) give way to the mode's own degrees
+            new = {'5M': '5', '4M': '4', 'x7M': '5'}.get(t, t)
+            new = sub.get(new, new)
+            if new != t:
+                evs[j] = dict(e, token=new, model_quality=None, modal_from=t)
+                changed = True
+        if not changed:
+            continue
+        toks = [e['token'] for e in evs]
+        origs = [(e.get('source_origin') or e.get('origin') or '') if str(e.get('origin', '')).startswith('inherit')
+                 else (e.get('origin') or '') for e in evs]
+        qs = [e.get('model_quality') for e in evs]
+        repair_repeats(toks, origs, qs, set(), keys[i], rng_for(s['seed'], f"modal:{sec['identity']}", variant))
+        for j, t in enumerate(toks):
+            if t != evs[j]['token']:
+                evs[j] = dict(evs[j], token=t, model_quality=None, modal_from=evs[j].get('modal_from', evs[j]['token']))
+
+
+def build_candidate(sec, slots, labels, opening, cadence, key, s, pool, rng, parsed=None, history=(), prev_root=None):
+    """One candidate for a new section. Each new phrase label takes either an authored motif or a phrase
+    sampled from the blended corpus models (chance set by the model_generation dial)."""
+    phrases = collections.defaultdict(list)
+    for j, sl in enumerate(slots):
+        phrases[sl['phrase_index']].append(j)
+    n = len(slots)
+    motifs, tokens, origins, quals = {}, [None] * n, [None] * n, [None] * n
+    held = set()
+    for pi, label in enumerate(labels):
+        idx = phrases[pi]
+        m = len(idx)
+        base = label[0]
+        if base in motifs:
+            seq = fit_motif(motifs[base], m)
+            toks, qs = [t for t, _ in seq], [q for _, q in seq]
+            origin = [f'{motifs[base + "#origin"]}:{base}'] * m
+            if label != base:
+                for k in range(1, m):
+                    if rng.random() < s['variation']:
+                        toks[k], qs[k] = substitute(toks[k], key, rng), None
+                        origin[k] = 'variation'
+        else:
+            use_model = parsed is not None and rng.random() < s['model_generation']
+            if use_model:
+                done = [j for j in range(n) if tokens[j] is not None]
+                if done:
+                    roots, seq_tok = model_sequence([tokens[j] for j in done], [quals[j] for j in done], key, prev_root)
+                    hist, pr = list(history) + seq_tok, roots[-1]
+                else:
+                    hist, pr = list(history), prev_root
+                toks, qs = generate_phrase(m, key, s, parsed, rng, hist, pr, start_token=opening if pi == 0 else None)
+                kind = 'model'
+            else:
+                motif = pool[rng.choices(range(len(pool)), weights=[w for _, w in pool])[0]][0]
+                if pi == 0:
+                    motif, _ = rotate_to(motif, opening)
+                toks = fit_motif(list(motif), m)
+                qs = [None] * m
+                kind = 'motif'
+            for k in range(1, m):
+                if rng.random() < s['hold']:
+                    toks[k], qs[k] = toks[k - 1], qs[k - 1]
+                    held.add(idx[k])
+            motifs[base] = list(zip(toks, qs)) if kind == 'model' else [(t, None) for t in motif]
+            motifs[base + '#origin'] = kind
+            origin = [f'{kind}:{base}'] * m
+        for k, j in enumerate(idx):
+            tokens[j], origins[j], quals[j] = toks[k], origin[k], qs[k]
+    if opening and tokens[0] != opening:
+        tokens[0], quals[0] = opening, None
+    origins[0] = 'opening'
+    kind, cad = cadence
+    if cad:
+        last = phrases[len(labels) - 1]
+        cad = cad[-len(last):]
+        for k, t in enumerate(cad):
+            j = last[len(last) - len(cad) + k]
+            tokens[j], origins[j], quals[j] = t, 'cadence:' + kind, None
+    repair_repeats(tokens, origins, quals, held, key, rng)
+    return tokens, origins, quals
+
+
+def repair_repeats(tokens, origins, quals, held, key, rng):
+    """A slot that repeats its neighbour's chord would silently merge into it and erase the rhythm pattern;
+    re-choose it within its function (cadence and opening slots are kept, chosen holds are respected)."""
+    fixed = lambda j: j == 0 or origins[j].startswith(('cadence', 'join', 'inherit'))
+    sound = lambda t: token_chord(t, key)[:2]        # 'x0M' and '1' are the same chord in a major key
+    for j in range(1, len(tokens)):
+        if sound(tokens[j]) != sound(tokens[j - 1]) or j in held:
+            continue
+        k = j if not fixed(j) else (j - 1 if not fixed(j - 1) else None)
+        if k is None and len(tokens) == 2:
+            k = 0                    # a two-chord section that opens on its own arrival: re-choose the opening
+        if k is None:
+            continue
+        near = {sound(tokens[i]) for i in (k - 1, k, k + 1) if 0 <= i < len(tokens)}
+        _, mode = parse_key(key)
+        group = FUNCTION_OF.get(str(tokens[k]), token_function(tokens[k], key))
+        opts = {str(d): (3.0 if FUNCTION_OF[str(d)] == group else 1.0) for d in range(1, 8)
+                if sound(str(d)) not in near and diatonic_family(mode, d) != 'diminished'}
+        if opts:
+            t = weighted_choice(rng, opts)
+            tokens[k], quals[k], origins[k] = t, None, 'repair'
+
+
+# ---------------------------------------------------------------- interest, key clarity
+
+INTEREST_CONTOURS = ('flat', 'rising', 'arch', 'contrast')
+
+
+def section_interest(s, sec, func, sections):
+    """Interest for one section: the overall setting plus the contour's offset (DESIGN), kept within 0..1.
+    flat: the same everywhere. rising: lower early, higher late. arch: highest in the middle of the piece.
+    contrast: higher in contrasting material, lower in the opening and final sections."""
+    total = sum(x['bars'] for x in sections)
+    pos = (sec['start'] + sec['bars'] / 2) / total
+    c = s['interest_contour']
+    off = 0.0
+    if c == 'rising':
+        off = -0.15 + 0.3 * pos
+    elif c == 'arch':
+        off = 0.25 * math.sin(math.pi * pos) - 0.1
+    elif c == 'contrast':
+        off = {'contrast_statement': 0.2, 'variant': 0.1, 'statement': 0.05,
+               'opening_statement': -0.1, 'final_statement': -0.1}.get(func['cls'], 0.0)
+    return min(1.0, max(0.0, float(s['interest']) + off))
+
+
+INTEREST_BITS = (2.4, 3.0, 4.2)   # target surprise (bits per change) at interest 0, 0.5 and 1 (DESIGN)
+
+
+def interest_target(i):
+    lo, mid, hi = INTEREST_BITS
+    return mid + (i - 0.5) * 2 * ((hi - mid) if i > 0.5 else (mid - lo))
+
+
+def interest_settings(s, i):
+    """Settings for one section at interest i (DESIGN). Above 0.5 the section draws more of its phrases from the
+    corpus models (the stock motifs are the most predictable source), admits borrowed chords more readily and
+    tries more candidates; below 0.5 the reverse. At 0.5 nothing changes."""
+    ss = dict(s)
+    ss['_notes'] = []            # the section's own notes; merged back by the caller
+    ss['_interest'] = i
+    d = i - 0.5
+    if abs(d) > 1e-9:
+        ss['model_generation'] = min(1.0, max(0.0, s['model_generation'] + 1.2 * d))
+        ss['mixture'] = min(1.0, max(0.0, s['mixture'] * 2 ** (2 * d)))
+        ss['candidates'] = int(round(s['candidates'] * (1 + abs(2 * d))))
+    return ss
+
+
+def interest_term(mean_log, weights, s):
+    """Pull towards the interest setting's target surprise; no effect at 0.5. mean_log is the mean natural-log
+    probability of the candidate's chord changes under the corpus models."""
+    i = s.get('_interest', 0.5)
+    if abs(i - 0.5) < 1e-9:
+        return 0.0
+    bits = -mean_log / math.log(2)
+    return -weights.get('interest', 4.0) * abs(2 * (i - 0.5)) * (bits - interest_target(i)) ** 2
+
+
+FUNCTIONAL_CHROMATIC = ('5M', 'x7M')    # raised V in minor: functional, not a borrowing
+
+
+def borrowed_run(tokens, key):
+    """Longest run of consecutive borrowed or chromatic chords (raised V excepted)."""
+    runs = [t for i, t in enumerate(tokens) if i == 0 or t != tokens[i - 1]]
+    best = cur = 0
+    for t in runs:
+        cur = cur + 1 if token_chord(t, key)[2] != 'diatonic' and str(t) not in FUNCTIONAL_CHROMATIC else 0
+        best = max(best, cur)
+    return best
+
+
+def borrowed_limit(s):
+    return 2 + (1 if s['mixture'] > 0.75 else 0)
+
+
+def enforce_borrowed_limit(tokens, origins, quals, key, s):
+    """Firm cap on consecutive borrowed chords: a chord beyond the limit becomes the diatonic chord whose root is
+    nearest (not the same as its neighbours). Cadence slots are kept."""
+    _, mode = parse_key(key)
+    limit = borrowed_limit(s)
+    degrees = [str(d) for d in range(1, 8) if diatonic_family(mode, d) != 'diminished']
+    run = 0
+    for j, t in enumerate(tokens):
+        if j and t == tokens[j - 1]:
+            continue
+        borrowed = token_chord(t, key)[2] != 'diatonic' and str(t) not in FUNCTIONAL_CHROMATIC
+        run = run + 1 if borrowed else 0
+        if run > limit and not origins[j].startswith('cadence'):
+            root = token_chord(t, key)[0]
+            near = {tokens[k] for k in (j - 1, j + 1) if 0 <= k < len(tokens)}
+            opts = [d for d in degrees if d not in near] or degrees
+            new = min(opts, key=lambda d: (min((token_chord(d, key)[0] - root) % 12, (root - token_chord(d, key)[0]) % 12), d))
+            k = j
+            while k < len(tokens) and tokens[k] == t:
+                tokens[k], origins[k], quals[k] = new, 'clarity', None
+                k += 1
+            run = 0
+
+
+def clarity_penalty(tokens, key, s, first_phrase, needs_tonic):
+    """Keep the key readable (DESIGN): a section that opens a key states its tonic in the first phrase, and
+    borrowed chords do not run on long enough to form an unlabelled key of their own."""
+    pen = 0.0
+    if needs_tonic and not any(str(t) == '1' for t in tokens[:first_phrase]):
+        pen += 3.0
+    pen += 2.0 * max(0, borrowed_run(tokens, key) - borrowed_limit(s))
+    return pen
+
+
+def fill_statement(sec, func, opening, cadence, key, s, tables, dist, contrast_ref, used_endings, variant,
+                   history=(), prev_root=None, needs_tonic=False):
+    seed_key = f"{sec['identity']}#{sec['occurrence']}"
+    rng = rng_for(s['seed'], 'rhythm:' + seed_key, variant)
+    rhythm = choose_rhythm(sec, s, tables, rng)
+    bt = bar_ticks(s['meter'])
+    slots = schedule(sec, rhythm, bt)
+    labels = phrase_pattern(s['phrase_form'], len(sec['phrases']))
+    pool = motif_pool(key, s, tables)
+    weights = tables['scoring']
+    parsed = transition_models(tables)
+    first_phrase = sum(1 for x in slots if x['phrase_index'] == 0)
+    scored = []
+    for c in range(int(s['candidates'])):
+        crng = rng_for(s['seed'], f'candidate:{seed_key}:{c}', variant)
+        tokens, origins, quals = build_candidate(sec, slots, labels, opening, cadence, key, s, pool, crng,
+                                                 parsed, history, prev_root)
+        sc = score_tokens(tokens, key, dist, weights, s, contrast_ref, used_endings, len(cadence[1]),
+                          quals, parsed, history, prev_root)
+        sc += modal_bonus(tokens, key, s, weights)
+        sc -= clarity_penalty(tokens, key, s, first_phrase, needs_tonic)
+        scored.append((sc, c, tokens, origins, quals))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    top = scored[:int(s['top_k'])]
+    best = top[0][0]
+    pick_rng = rng_for(s['seed'], 'pick:' + seed_key, variant)
+    choice = pick_rng.choices(range(len(top)), weights=[math.exp((x[0] - best) / s['choice_temperature']) for x in top])[0]
+    sc, c, tokens, origins, quals = top[choice]
+    tokens, origins, quals = list(tokens), list(origins), list(quals)
+    enforce_borrowed_limit(tokens, origins, quals, key, s)
+    events = [dict(sl, token=t, origin=o, model_quality=q) for sl, t, o, q in zip(slots, tokens, origins, quals)]
+    generated = sum(1 for o in origins if o.startswith('model'))
+    return events, dict(rhythm=rhythm, score=round(sc, 4), candidate=c, rank=choice + 1,
+                        candidates=len(scored), labels=labels, generated_slots=generated,
+                        interest=round(s.get('_interest', 0.5), 3))
+
+
+# ---------------------------------------------------------------- inheritance
+
+def phrase_map(n_src, n_tgt):
+    if n_tgt == n_src:
+        return list(range(n_src))
+    if n_tgt > n_src:
+        middle = [i % max(1, n_src - 1) for i in range(n_tgt - n_src)] if n_src > 1 else [0] * (n_tgt - n_src)
+        return list(range(n_src - 1)) + middle + [n_src - 1] if n_src > 1 else [0] * n_tgt
+    return list(range(n_tgt - 1)) + [n_src - 1] if n_tgt > 1 else [n_src - 1]
+
+
+def inherit(sec, src_sec, src_events, policy, s, bt, rng):
+    by_phrase = collections.defaultdict(list)
+    for e in src_events:
+        by_phrase[e['phrase_index']].append(e)
+    if policy == 'exact' and sec['phrases'] != src_sec['phrases']:
+        raise ValueError(f"{sec['identity']} {sec['occurrence']}: exact repeat needs the same phrase lengths as its "
+                         f"source; use extend or compress.")
+    mapping = phrase_map(len(src_sec['phrases']), len(sec['phrases']))
+    out, start = [], sec['start'] * bt
+    for pi, (bars, sp) in enumerate(zip(sec['phrases'], mapping)):
+        src = by_phrase[sp]
+        src_bars = src_sec['phrases'][sp]
+        tag = 'inherit:' + policy
+        if bars == src_bars:
+            offset = start - (src_sec['start'] * bt + sum(src_sec['phrases'][:sp]) * bt)
+            for e in src:
+                out.append(dict(e, phrase_index=pi, start_tick=e['start_tick'] + offset, origin=tag,
+                                source_origin=e.get('origin')))
+        else:
+            # Refit a source phrase to a new length: a measured rhythm pattern for the new length, the source's
+            # chord runs fitted to it, its first and last chords kept, and no slot repeating its neighbour.
+            runs = []
+            for e in src:
+                tq = (e['token'], e.get('model_quality'))
+                if not runs or runs[-1][0] != tq[0]:
+                    runs.append(tq)
+            pr = rng_for(s['seed'], f"refit:{sec['identity']}#{sec['occurrence']}:{pi}", 0)
+            rhythm = choose_rhythm(dict(identity=sec['identity'], phrases=[bars]), s, DEFAULT_TABLES, pr)
+            lens = [x for pat in rhythm[0] for x in pattern_lengths(pat)]
+            n = len(lens)
+            toks = fit_motif(runs, n)
+            if n >= 2:
+                toks[0], toks[-1] = runs[0], runs[-1]
+            for j in range(1, n):
+                if toks[j][0] == toks[j - 1][0]:
+                    nxt = toks[j + 1][0] if j + 1 < n else None
+                    alt = [r for r in runs if r[0] not in (toks[j - 1][0], nxt)]
+                    if alt:
+                        k = j if j < n - 1 else j - 1
+                        if k == j - 1 and k == 0:
+                            continue
+                        toks[k] = alt[(j * 7) % len(alt)]
+            cum = Fraction(0)
+            for (t, q), x in zip(toks, lens):
+                a, b = int(cum * bt), int((cum + x) * bt)
+                out.append(dict(phrase_index=pi, start_tick=start + a, duration_ticks=b - a, token=t,
+                                model_quality=q, origin=tag + ':refit'))
+                cum += x
+        start += bars * bt
+    return out
+
+
+def default_policy(sec, src_sec, func):
+    if func['recurrence'] == 'variant':
+        return 'variant'
+    if sec['phrases'] == src_sec['phrases']:
+        return 'exact'
+    return 'extend' if sec['bars'] > src_sec['bars'] else 'compress'
+
+
+# ---------------------------------------------------------------- colour
+
+def colour_rates(s, tables):
+    anchors = sorted(tables['colour_profiles']['anchors'], key=lambda a: a['dial'])
+    x = float(s['colour'])
+    for a, b in zip(anchors, anchors[1:]):
+        if a['dial'] <= x <= b['dial']:
+            t = 0 if b['dial'] == a['dial'] else (x - a['dial']) / (b['dial'] - a['dial'])
+            onset = a['onset'] + t * (b['onset'] - a['onset'])
+            stay = a['persistence'] + t * (b['persistence'] - a['persistence'])
+            break
+    else:
+        onset, stay = anchors[-1]['onset'], anchors[-1]['persistence']
+    if s['colour_persistence'] is not None:
+        stay = float(s['colour_persistence'])
+    return onset, stay
+
+
+def colour_class(token, key):
+    root, fam, _ = token_chord(token, key)
+    if fam == 'diminished':
+        return 'diminished'
+    if fam == 'minor':
+        return 'minor'
+    tonic, _ = parse_key(key)
+    off = (root - tonic) % 12
+    if off == 7 or (str(token).startswith('x') and str(token).endswith('M')):
+        return 'dominant_major'
+    if off in (0, 5):
+        return 'tonic_major'
+    return 'other_major'
+
+
+def valid_colour(token, suffix, key):
+    root, fam, kind = token_chord(token, key)
+    sfam, ivs = SUFFIXES[suffix]
+    if sfam not in ('any', fam):
+        return False
+    allowed = scale_pcs(key)
+    if kind != 'diatonic':
+        tonic, mode = parse_key(key)
+        par = 'minor' if mode in MAJOR_LIKE else 'major'
+        allowed = allowed | {(tonic + x) % 12 for x in MODES[par]}
+    extra = {(root + x) % 12 for x in ivs} - {(root + x) % 12 for x in TRIADS[fam]}
+    return extra <= allowed
+
+
+def apply_colour(sections, events_by_section, funcs, keys, s, tables, variant, locked_colour):
+    """Markov colour state over chord runs (Experiment 27). Returns are copied unless re-sampled."""
+    onset, stay = colour_rates(s, tables)
+    vocab = tables['colour_vocabulary']
+    state = False
+    statement_runs = {}
+    for sec, f in zip(sections, funcs):
+        i = sec['index']
+        evs = events_by_section[i]
+        key = keys[i]
+        if i in locked_colour:
+            state = any(e.get('colour') for e in evs[-1:])
+            continue
+        rng = rng_for(s['seed'], f"colour:{sec['identity']}#{sec['occurrence']}", variant)
+        runs = []
+        for j, e in enumerate(evs):
+            if runs and runs[-1][-1]['token'] == e['token'] and j > 0:
+                runs[-1].append(e)
+            else:
+                runs.append([e])
+        src_runs = statement_runs.get(f['source']) if f['source'] is not None else None
+        resample = rng.random() < s['recolour_returns']
+        for r_i, run in enumerate(runs):
+            token = run[0]['token']
+            nxt = runs[r_i + 1][0]['token'] if r_i + 1 < len(runs) else None
+            copied = None
+            if src_runs is not None and not resample and r_i < len(src_runs) and src_runs[r_i]['token'] == token:
+                copied = src_runs[r_i]['colour']
+            if copied is not None or (src_runs is not None and not resample and r_i < len(src_runs)
+                                      and src_runs[r_i]['token'] == token):
+                col = copied
+                origin = 'colour:copied'
+            else:
+                col, origin = None, None
+                root, fam, _ = token_chord(token, key)
+                tonic, _ = parse_key(key)
+                resolves = nxt is not None and (token_chord(nxt, key)[0] - root) % 12 == 5
+                functional = fam == 'major' and resolves and ((root - tonic) % 12 == 7 or str(token).startswith('x'))
+                mq = run[0].get('model_quality')
+                if mq == 'dominant' and fam == 'major':
+                    col, origin = dict(suffix='7', kind='function'), 'core:dominant'
+                elif mq == 'suspended':
+                    col, origin = dict(suffix='sus4', kind='function'), 'core:suspended'
+                elif functional and rng.random() < s['dominant_sevenths']:
+                    col, origin = dict(suffix='7', kind='function'), 'colour:function'
+                elif rng.random() < (stay if state else onset):
+                    options = {k: v for k, v in vocab[colour_class(token, key)].items() if valid_colour(token, k, key)}
+                    if options:
+                        col, origin = dict(suffix=weighted_choice(rng, options), kind='optional'), 'colour:sampled'
+            for e in run:
+                e['colour'] = copy.deepcopy(col)
+                e['colour_origin'] = origin
+            if col is None or col['kind'] == 'optional':
+                state = col is not None
+        if f['recurrence'] == 'statement':
+            statement_runs[i] = [dict(token=run[0]['token'], colour=run[0].get('colour')) for run in runs]
+
+
+# ---------------------------------------------------------------- realisation
+
+def realise(events, key):
+    for e in events:
+        root, fam, kind = token_chord(e['token'], key)
+        col = e.get('colour')
+        suffix = col['suffix'] if col else PLAIN_SUFFIX[fam]
+        ivs = SUFFIXES[suffix][1]
+        e.update(local_key=key, root_pc=root, core_family=fam, chord_kind=kind,
+                 roman=roman(e['token'], key), core_symbol=PC_NAMES[root] + PLAIN_SUFFIX[fam],
+                 chord_symbol=PC_NAMES[root] + suffix, intervals=list(ivs), bass_pc=root)
+    return events
+
+
+def validate(sections, events_by_section, s):
+    bt = bar_ticks(s['meter'])
+    pos = 0
+    for sec in sections:
+        evs = events_by_section[sec['index']]
+        bounds, acc = [], sec['start'] * bt
+        for bars in sec['phrases']:
+            bounds.append((acc, acc + bars * bt))
+            acc += bars * bt
+        for e in evs:
+            if e['start_tick'] != pos or e['duration_ticks'] <= 0:
+                raise AssertionError(f"Timing gap or overlap at {sec['identity']} {sec['occurrence']}.")
+            a, b = bounds[e['phrase_index']]
+            if not a <= e['start_tick'] < e['start_tick'] + e['duration_ticks'] <= b:
+                raise AssertionError(f"Chord crosses a phrase boundary in {sec['identity']} {sec['occurrence']}.")
+            pos += e['duration_ticks']
+    if pos != sum(sec['bars'] for sec in sections) * bt:
+        raise AssertionError('Harmony does not cover the whole structure.')
+
+
+# ---------------------------------------------------------------- main entry point
+
+SETUP_ENDINGS = ('half', 'lead_dominant', 'lead_step')
+
+
+def return_preparation_table(tables, s):
+    """Measured endings of new sections that lead into a return (Experiment 38), blended by the corpus mix.
+    Jazz has no section data, so its share falls to the pop profiles."""
+    rp = tables.get('return_preparation')
+    if not rp:
+        return None
+    w = {k: v for k, v in corpus_weights(s).items() if k in rp['profiles']}
+    if not w:
+        return None
+    total = sum(w.values())
+    out = collections.Counter()
+    for k, v in w.items():
+        for kind, q in rp['profiles'][k].items():
+            out[kind] += v / total * q
+    return dict(out)
+
+
+def development_rate(s, sec, policy):
+    """Share of a repeat's chords that change, growing with each return (DESIGN): occurrence 2 changes
+    development x 0.35 of its chords, occurrence 3 twice that, up to 0.7. Explicit vary/variant policies are
+    left to their own settings."""
+    if s['development'] <= 0 or policy not in ('exact', 'extend', 'compress') or sec['occurrence'] < 2:
+        return 0.0
+    return min(0.7, s['development'] * 0.35 * (sec['occurrence'] - 1))
+
+
+MODE_OF_OFFSET = {0: 'major', 2: 'dorian', 4: 'phrygian', 5: 'lydian', 7: 'mixolydian', 9: 'minor', 11: 'locrian'}
+TRIAD = {'major': (0, 4, 7), 'minor': (0, 3, 7), 'diminished': (0, 3, 6), 'augmented': (0, 4, 8)}
+SCALE_SWITCH_COST = 3.0      # bars of misfit a new key region must save before the map changes key
+
+
+def chord_pcs(e):
+    return {(e['root_pc'] + x) % 12 for x in TRIAD.get(e['core_family'], (0, 7))}
+
+
+def scale_map(sections, events_by_section, keys, bt):
+    """Which key (and so which scale) fits each stretch of the piece, worked out from the chords played.
+    Each section is segmented over the twelve diatonic collections by dynamic programming: a chord that does not
+    fit costs its length in bars, changing collection costs SCALE_SWITCH_COST bars, and the planned key is
+    preferred. A region in the planned collection keeps the planned key's name and mode; another region is named
+    from its chords. Chords that fit no region are listed as borrowed. Each event gets a 'scale' field."""
+    collections_ = [frozenset((t + x) % 12 for x in MODES['major']) for t in range(12)]
+    out = []
+    for sec in sections:
+        i = sec['index']
+        evs = events_by_section[i]
+        if not evs:
+            continue
+        runs = []
+        for e in evs:
+            if runs and runs[-1]['ev']['core_symbol'] == e['core_symbol']:
+                runs[-1]['dur'] += e['duration_ticks'] / bt
+                runs[-1]['events'].append(e)
+            else:
+                runs.append(dict(ev=e, dur=e['duration_ticks'] / bt, events=[e], pcs=chord_pcs(e)))
+        home_pc, mode = parse_key(keys[i])
+        planned = frozenset(scale_pcs(keys[i]))
+        cost = [[(0.0 if r['pcs'] <= c else r['dur']) - (0.25 * r['dur'] if c == planned else 0.0)
+                 for c in collections_] for r in runs]
+        # leaving the planned key at the start of a section costs half a switch
+        best, back = [[cost[0][c] + (0 if collections_[c] == planned else SCALE_SWITCH_COST / 2) for c in range(12)]], []
+        for k in range(1, len(runs)):
+            row, brow = [], []
+            for c in range(12):
+                prev = min(range(12), key=lambda p: best[-1][p] + (0 if p == c else SCALE_SWITCH_COST))
+                row.append(best[-1][prev] + (0 if prev == c else SCALE_SWITCH_COST) + cost[k][c])
+                brow.append(prev)
+            best.append(row)
+            back.append(brow)
+        c = min(range(12), key=lambda x: (best[-1][x], collections_[x] != planned))
+        path = [c]
+        for brow in reversed(back):
+            c = brow[c]
+            path.append(c)
+        path.reverse()
+        k = 0
+        while k < len(runs):
+            j = k
+            while j + 1 < len(runs) and path[j + 1] == path[k]:
+                j += 1
+            col = collections_[path[k]]
+            region = runs[k:j + 1]
+            if col == planned:
+                name = keys[i]
+            else:
+                major_pc = path[k]
+                offset = (home_pc - major_pc) % 12
+                home_mode = MODE_OF_OFFSET.get(offset)
+                if home_mode and home_mode != 'locrian':
+                    name = key_name(home_pc, home_mode)        # same tonic, another mode: C mixolydian, C dorian
+                else:
+                    fits = [r for r in region if r['pcs'] <= col]
+                    last = fits[-1]['ev'] if fits else region[-1]['ev']
+                    ref_minor = REFERENCE_MODE[mode] == 'minor'
+                    if last['root_pc'] == (major_pc + 9) % 12 or (ref_minor and last['root_pc'] != major_pc):
+                        name = key_name((major_pc + 9) % 12, 'minor')
+                    else:
+                        name = key_name(major_pc, 'major')
+            start = region[0]['ev']['start_tick']
+            end = region[-1]['events'][-1]['start_tick'] + region[-1]['events'][-1]['duration_ticks']
+            borrowed = list(dict.fromkeys(r['ev']['core_symbol'] for r in region if not r['pcs'] <= frozenset(scale_pcs(name))))
+            for r in region:
+                for e in r['events']:
+                    e['scale'] = name
+            out.append(dict(section_index=i, start_bar=start // bt + 1, end_bar=end // bt, key=name,
+                            planned=name == keys[i], borrowed=borrowed))
+            k = j + 1
+    return out
+
+
+def section_surprise(sections, events_by_section, keys, s, tables, info):
+    """Mean surprise of each section in bits per chord change under the unmodified blended corpus models,
+    continuing from the previous section. Lower is more expected; generated corpus-like music sits near 3."""
+    parsed = transition_models(tables)
+    hist, prev_root, last_symbol = [], None, None
+    for sec in sections:
+        i = sec['index']
+        evs = events_by_section[i]
+        syms = [e['core_symbol'] for e in evs]
+        keep = [k for k in range(len(evs)) if (syms[k] != syms[k - 1] if k else syms[0] != last_symbol)]
+        toks = [evs[k]['token'] for k in keep]
+        last_symbol = syms[-1] if syms else last_symbol
+        if not toks:
+            info.setdefault(i, {})['surprise'] = None
+            continue
+        quals = [None] * len(toks)
+        roots, seq = model_sequence(toks, quals, keys[i], prev_root)
+        bits = []
+        for tok in seq:
+            if tok[0] is not None or hist:
+                p = mixed_model_prob(s, parsed, hist[-3:], MODEL_INDEX[(tok[0] if tok[0] is not None else 0, tok[1])])
+                bits.append(-math.log2(max(p, 1e-12)))
+            hist.append(tok)
+        prev_root = roots[-1] if roots else prev_root
+        info.setdefault(i, {})['surprise'] = round(sum(bits) / len(bits), 2) if bits else None
+
+
+def generate(structure, settings=None, tables=None, variant=0, previous=None, locks=None):
+    """Populate a structure with harmony.
+
+    structure: text rows (see parse_structure), a list of section dicts, or a GCL context document
+    (schema gcl-context-0.1) from the structure stage. With a context, its global key, tempo, meter and
+    seed are used unless the settings give them.
+    locks: {section_index: 'all' | 'core'}; 'core' keeps chords and re-samples colour.
+    """
+    structure, settings = from_context(structure, settings)
+    s = resolve_settings(settings)
+    target_key = s['key']
+    home_pc, target_mode = parse_key(target_key)
+    ref_mode = REFERENCE_MODE[target_mode]
+    s['key'] = key_name(home_pc, ref_mode)
+    s['_target_mode'] = target_mode
+    to_target = lambda k: (key_name(parse_key(k)[0], target_mode)
+                           if target_mode != ref_mode and parse_key(k)[1] == ref_mode else k)
+    tables = tables or DEFAULT_TABLES  # read-only; never modified during generation
+    sections = parse_structure(structure) if isinstance(structure, str) else normalise_structure(structure)
+    funcs = derive_functions(sections)
+    locks = {int(k): v for k, v in (locks or {}).items()}
+    if locks:
+        if previous is None:
+            raise ValueError('Locks need a previous result.')
+        for i, mode in locks.items():
+            if mode not in ('all', 'core'):
+                raise ValueError("Lock mode must be 'all' or 'core'.")
+            p = previous['sections']
+            if i >= len(sections) or i >= len(p) or any(p[i][k] != sections[i][k] for k in ('identity', 'bars', 'phrases', 'start')):
+                raise ValueError(f'Section {i + 1} is locked; unlock it before changing its structure.')
+    bt = bar_ticks(s['meter'])
+    keys = plan_keys(sections, funcs, s, tables)
+    if locks:
+        for i in locks:
+            if previous['keys'][i] != to_target(keys[i]):
+                raise ValueError(f'Section {i + 1} is locked; unlock it before changing its key.')
+    openings = plan_openings(sections, funcs, s, tables)
+    for sec, f in zip(sections, funcs):       # a section that changes key starts inside the new key
+        i = sec['index']
+        if f['recurrence'] == 'statement' and i > 0 and keys[i] != keys[i - 1] and sec['identity'] in openings \
+                and token_chord(openings[sec['identity']], keys[i])[2] != 'diatonic':
+            openings[sec['identity']] = '1'
+    dist = root_motion_dist(s, tables)
+
+    # Destinations, planned before any chord is chosen.
+    first_root = {}
+    for sec, f in zip(sections, funcs):
+        ident = sec['identity']
+        if f['recurrence'] == 'statement':
+            first_root[sec['index']] = token_chord(openings[ident], keys[sec['index']])[0]
+    def opening_root(i):
+        f = funcs[i]
+        src = i if f['recurrence'] == 'statement' else f['source']
+        return first_root.get(src)
+    destinations = []
+    for sec, f in zip(sections, funcs):
+        i = sec['index']
+        final = i == len(sections) - 1
+        rng = rng_for(s['seed'], f"destination:{sec['identity']}#{sec['occurrence']}", variant)
+        if final and s['final_destination'] == 'loop':
+            kind = 'lead_dominant'
+        elif f['recurrence'] != 'statement' and not final:
+            kind = 'inherit'
+        else:
+            leads_to_return = not final and funcs[i + 1]['recurrence'] != 'statement'
+            table = return_preparation_table(tables, s) if leads_to_return else None
+            table = table or mixed(tables, 'destination', 'final' if final else f['cls'], s)
+            weights = tilt(gated_weights_dest(table, s['mixture']), lambda k: CADENCE_STRENGTH.get(k, 0.0),
+                           s['cadence_strength'])
+            if leads_to_return:
+                weights = tilt(weights, lambda k: 1.0 if k in SETUP_ENDINGS else 0.0, s['prepare_returns'])
+            if final and s['final_tonic']:
+                weights = {k: v for k, v in weights.items() if k in TONIC_ARRIVALS} or {'authentic': 1.0}
+            kind = weighted_choice(rng, weights)
+        nxt = 0 if final else i + 1
+        destinations.append(dict(kind=kind, next_index=nxt if kind.startswith('lead') else None))
+
+    events_by_section, info = {}, {}
+    used_endings = []
+    for sec, f in zip(sections, funcs):
+        i = sec['index']
+        key = keys[i]
+        seed_key = f"{sec['identity']}#{sec['occurrence']}"
+        rng = rng_for(s['seed'], 'section:' + seed_key, variant)
+        d = destinations[i]
+        next_root = None
+        if d['next_index'] is not None:
+            next_root = opening_root(d['next_index'])
+        if i in locks:
+            events_by_section[i] = [copy.deepcopy(e) for e in previous['events'] if e['section_index'] == i]
+            info[i] = dict(source='locked:' + locks[i])
+            continue
+        policy = s['policies'].get(str(i), s['policies'].get(i))
+        if f['recurrence'] != 'statement' and policy != 'independent':
+            src = f['source']
+            policy = policy or default_policy(sec, sections[src], f)
+            src_events = [dict(e) for e in events_by_section[src]]
+            evs = inherit(sec, sections[src], src_events, policy, s, bt, rng)
+            dev = development_rate(s, sec, policy)
+            if dev > 0:
+                drng = rng_for(s['seed'], f"development:{sec['identity']}#{sec['occurrence']}", variant)
+                for j in range(1, max(1, len(evs) - 2)):
+                    if drng.random() < dev:
+                        for _ in range(4):
+                            new = substitute(evs[j]['token'], key, drng)
+                            if new not in (evs[j]['token'], evs[j - 1]['token'], evs[j + 1]['token']):
+                                evs[j] = dict(evs[j], token=new, origin='development', model_quality=None)
+                                break
+            if policy in ('variant', 'vary'):
+                rate_v = s['variant_variation'] if policy == 'variant' else s['variation']
+                protect = 2
+                for j in range(1, max(1, len(evs) - protect)):
+                    if rng.random() < rate_v:
+                        new = substitute(evs[j]['token'], key, rng)
+                        if new != evs[j]['token']:
+                            evs[j] = dict(evs[j], token=new, origin='variation', model_quality=None)
+            final = i == len(sections) - 1
+            retarget = None
+            if final and d['kind'] not in ('inherit',):
+                retarget = d['kind']
+            elif s['adapt_return_endings'] and not final:
+                src_dest = destinations[src]['kind']
+                if src_dest.startswith('lead') and opening_root(i + 1) != opening_root(destinations[src]['next_index'] or 0):
+                    retarget = src_dest
+                    next_root = opening_root(i + 1)
+            if retarget:
+                cad = cadence_tokens(retarget, key, s, rng, next_root=next_root if retarget.startswith('lead') else None)
+                limit_ticks = s['join_bars'] * bt if not final else None
+                end_tick = (sec['start'] + sec['bars']) * bt
+                last_phrase = len(sec['phrases']) - 1
+                idx = [j for j, e in enumerate(evs) if e['phrase_index'] == last_phrase
+                       and (limit_ticks is None or e['start_tick'] >= end_tick - limit_ticks)]
+                cad = cad[-len(idx):] if idx else []
+                for k, t in enumerate(cad):
+                    j = idx[len(idx) - len(cad) + k]
+                    if evs[j]['token'] != t:
+                        evs[j] = dict(evs[j], token=t, model_quality=None, origin=('cadence:' if final else 'join:') + retarget)
+                toks, origs, qs = [e['token'] for e in evs], [e.get('origin') or '' for e in evs], [e.get('model_quality') for e in evs]
+                repair_repeats(toks, origs, qs, set(), keys[i], rng_for(s['seed'], f'repair:{i}', variant))
+                for j, (t, o, q) in enumerate(zip(toks, origs, qs)):
+                    if t != evs[j]['token']:
+                        evs[j] = dict(evs[j], token=t, origin=o, model_quality=q)
+            events_by_section[i] = evs
+            info[i] = dict(source=src, policy=policy, retarget=retarget)
+        else:
+            opening = openings.get(sec['identity']) or token_for_root(opening_root(i) or parse_key(key)[0], key) or '1'
+            if f['recurrence'] != 'statement':
+                opening = events_by_section[f['source']][0]['token']
+            kind = d['kind'] if d['kind'] != 'inherit' else 'free'
+            cad = cadence_tokens(kind, key, s, rng, next_root=next_root)
+            ref = None
+            if f['contrast_with'] is not None and f['contrast_with'] in events_by_section:
+                ref = [e['token'] for e in events_by_section[f['contrast_with']]]
+            history, prev_root = (), None
+            if i > 0 and events_by_section.get(i - 1):
+                pe = events_by_section[i - 1]
+                roots, seq = model_sequence([e['token'] for e in pe], [e.get('model_quality') for e in pe], keys[i - 1])
+                history, prev_root = tuple(seq[-3:]), roots[-1]
+            opens_key = i == 0 or key != keys[i - 1]
+            ss = interest_settings(s, section_interest(s, sec, f, sections))
+            evs, meta = fill_statement(sec, f, opening, (kind, cad), key, ss, tables, dist, ref, used_endings, variant,
+                                       history, prev_root, needs_tonic=opens_key)
+            for note in ss.get('_notes', []):
+                s.setdefault('_notes', []).append(note)
+            used_endings.append(tuple(e['token'] for e in evs[-max(2, len(cad)):]))
+            events_by_section[i] = evs
+            info[i] = dict(policy='new', **meta)
+        for e in events_by_section[i]:
+            e.update(section_index=i, identity=sec['identity'], occurrence=sec['occurrence'])
+
+    for i, mode in locks.items():
+        if mode == 'all':
+            continue
+        for e in events_by_section[i]:
+            e.pop('colour', None)
+    locked_colour = {i for i, m in locks.items() if m == 'all'}
+    # Read the core chords (scale degrees) in the target mode before colour, which is checked against it.
+    keys = [to_target(k) for k in keys]
+    s['key'] = target_key
+    s.pop('_target_mode', None)
+    convert_modal(events_by_section, sections, keys, s, variant)
+    apply_colour(sections, events_by_section, funcs, keys, s, tables, variant, locked_colour)
+    for i, evs in events_by_section.items():
+        if i not in locked_colour:
+            realise(evs, keys[i])
+    validate(sections, events_by_section, s)
+    smap = scale_map(sections, events_by_section, keys, bt)
+    section_surprise(sections, events_by_section, keys, s, tables, info)
+    events = [e for sec in sections for e in events_by_section[sec['index']]]
+    table_notes = sorted(set(s.pop('_notes', [])))
+    result = dict(engine=ENGINE_VERSION, settings=settings_for_json(s), table_notes=table_notes, sections=sections, functions=funcs,
+                  keys=keys, openings=openings, destinations=destinations, section_info=info, scale_map=smap,
+                  events=events, variant=variant,
+                  provenance=provenance(tables, s))
+    result['diagnostics'] = diagnostics(result)
+    return result
+
+
+TONIC_ARRIVALS = ('authentic', 'plagal', 'mixture', 'tonic')
+
+
+def gated_weights_dest(table, mixture):
+    out = {}
+    for k, v in table.items():
+        if k in META_KEYS:
+            continue
+        w = float(v) * (mixture / 0.5 if k == 'mixture' else 1.0)
+        if w > 0:
+            out[k] = w
+    return out
+
+
+def settings_for_json(s):
+    out = copy.deepcopy(s)
+    out['rates'] = [float(r) if r.denominator in (1, 2, 4) else str(r) for r in s['rates']]
+    return out
+
+
+def provenance(tables, s):
+    engine_src = Path(__file__).read_text() if '__file__' in globals() and Path(__file__).exists() else ''
+    notes = []
+    if float(s['corpus_mix'].get('billboard', 0)) > 0:
+        notes.append('Uses McGill Billboard annotations via ChoCo (CC BY 4.0; attribution required).')
+    if float(s['corpus_mix'].get('jazz', 0)) > 0:
+        notes.append('Uses Jazz Harmony Treebank-derived chord-change models, openings and rhythm patterns (CC BY-NC-SA 4.0).')
+    if float(s['colour']) > 0.5:
+        notes.append('Colour rates interpolate towards a Jazz Harmony Treebank-derived profile (CC BY-NC-SA 4.0).')
+    evidence = {k: v.get('evidence') for k, v in tables.items() if isinstance(v, dict) and 'evidence' in v}
+    return dict(engine_version=ENGINE_VERSION, engine_sha256=sha256_text(engine_src) if engine_src else None,
+                tables_sha256=sha256_text(canonical_json(tables)), evidence=evidence, licence_notes=notes)
+
+
+# ---------------------------------------------------------------- diagnostics
+
+def chord_runs(events):
+    runs = []
+    for e in events:
+        if runs and runs[-1]['chord_symbol'] == e['chord_symbol'] and runs[-1]['section_index'] == e['section_index']:
+            runs[-1] = dict(runs[-1], duration_ticks=runs[-1]['duration_ticks'] + e['duration_ticks'])
+        else:
+            runs.append(dict(e))
+    return runs
+
+
+def diagnostics(result):
+    secs, events, funcs = result['sections'], result['events'], result['functions']
+    home = result['settings']['key']
+    home_pc, _ = parse_key(home)
+    by = collections.defaultdict(list)
+    for e in events:
+        by[e['section_index']].append(e)
+    last = events[-1]
+    returns, identical, identical_body = 0, 0, 0
+    for f in funcs:
+        if f['recurrence'] == 'return' and result['section_info'].get(f['index'], {}).get('policy') == 'exact':
+            returns += 1
+            a = [(e['token'], e['duration_ticks']) for e in by[f['index']]]
+            b = [(e['token'], e['duration_ticks']) for e in by[f['source']]]
+            identical += a == b
+            body = [x for x, e in zip(a, by[f['index']]) if e['origin'].startswith('inherit')]
+            identical_body += len(a) == len(b) and all(x == y for x, y, e in zip(a, b, by[f['index']])
+                                                        if e['origin'].startswith('inherit'))
+    runs = chord_runs(events)
+    colour_seq = [bool(r.get('colour')) and r['colour']['kind'] == 'optional' for r in runs]
+    after = collections.Counter()
+    for a, b in zip(colour_seq, colour_seq[1:]):
+        after[(a, b)] += 1
+    def rate(prev):
+        n = after[(prev, True)] + after[(prev, False)]
+        return round(after[(prev, True)] / n, 3) if n else None
+    deg = collections.Counter(r['roman'] for r in runs)
+    origins = collections.Counter(e['origin'].split(':')[0] for e in events)
+    openings = {f"{s['identity']} {s['occurrence']}": by[s['index']][0]['roman'] for s in secs}
+    endings = {f"{s['identity']} {s['occurrence']}": by[s['index']][-1]['roman'] for s in secs}
+    return dict(
+        final_chord=last['chord_symbol'], ends_on_home_tonic=last['root_pc'] == home_pc and last['local_key'] == key_name(*parse_key(home)),
+        exact_returns=returns, returns_identical_core=identical, returns_identical_except_ending=identical_body,
+        colour_share=round(sum(colour_seq) / len(colour_seq), 3) if colour_seq else 0,
+        p_colour_after_plain=rate(False), p_colour_after_colour=rate(True),
+        functional_sevenths=sum(1 for r in runs if r.get('colour') and r['colour']['kind'] == 'function'),
+        degree_profile=dict(deg.most_common()), origins=dict(origins), openings=openings, endings=endings,
+        distinct_chords=len({r['chord_symbol'] for r in runs}))
+
+
+# ---------------------------------------------------------------- charts and exports
+
+def chart_text(result):
+    lines = []
+    by = collections.defaultdict(list)
+    for r in chord_runs(result['events']):
+        by[r['section_index']].append(r)
+    bt = bar_ticks(result['settings']['meter'])
+    for sec, key in zip(result['sections'], result['keys']):
+        cells = ' '.join(f"{r['chord_symbol']}({r['duration_ticks'] / bt:g})" for r in by[sec['index']])
+        lines.append(f"{sec['identity']:>8} {sec['occurrence']} {sec['bars']:>3} bars  {key:<12} {cells}")
+        for m in result.get('scale_map', []):
+            if m['section_index'] == sec['index'] and (not m['planned'] or m['borrowed']):
+                note = f" (borrowed: {', '.join(m['borrowed'])})" if m['borrowed'] else ''
+                lines.append(f"{'':>26}scale bars {m['start_bar']}-{m['end_bar']}: {m['key']}{note}")
+    return '\n'.join(lines)
+
+
+def to_csv(result):
+    import csv, io
+    bt = bar_ticks(result['settings']['meter'])
+    beats = int(result['settings']['meter'].split('/')[0])
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(['section', 'occurrence', 'bar', 'beat', 'bars', 'chord', 'core', 'roman', 'local_key', 'scale', 'origin',
+                'colour_origin'])
+    for r in chord_runs(result['events']):
+        bar = r['start_tick'] // bt + 1
+        beat = (r['start_tick'] % bt) // (bt // beats) + 1
+        w.writerow([r['identity'], r['occurrence'], bar, beat, f"{r['duration_ticks'] / bt:g}", r['chord_symbol'],
+                    r['core_symbol'], r['roman'], r['local_key'], r.get('scale', r['local_key']), r['origin'],
+                    r.get('colour_origin') or ''])
+    return out.getvalue()
+
+
+def manifest(result):
+    return dict(schema='harmonic-engine-result', schema_version=1, **result)
+
+
+def voice_lead(events, low=55, high=79, bass_low=36):
+    """Neutral audition voicing: bass on the root, close voice-led chord above."""
+    prev = None
+    out = []
+    for r in events:
+        pcs = sorted({(r['root_pc'] + x) % 12 for x in r['intervals']})
+        if len(pcs) > 4:
+            fifth = (r['root_pc'] + 7) % 12
+            pcs = [p for p in pcs if p != fifth][:4]
+        best = None
+        for base in range(low, high - 11):
+            notes = sorted(base + ((p - base) % 12) for p in pcs)
+            if notes[-1] > high:
+                continue
+            centre = sum(notes) / len(notes)
+            cost = abs(centre - (low + high) / 2) * 0.2
+            if prev:
+                a, b = sorted(prev), notes
+                m = min(len(a), len(b))
+                cost += sum(abs(x - y) for x, y in zip(a[:m], b[:m])) + 3 * abs(len(a) - len(b))
+            if best is None or cost < best[0]:
+                best = (cost, notes)
+        upper = best[1]
+        bass = bass_low + (r['bass_pc'] - bass_low) % 12
+        out.append(dict(r, upper=upper, bass=bass))
+        prev = upper
+    return out
+
+
+def _vlq(n):
+    b = [n & 127]
+    n >>= 7
+    while n:
+        b.insert(0, 128 | (n & 127))
+        n >>= 7
+    return bytes(b)
+
+
+def _track(events):
+    events.sort(key=lambda x: (x[0], x[1]))
+    data, prev = bytearray(), 0
+    for tick, _, msg in events:
+        data += _vlq(tick - prev) + msg
+        prev = tick
+    data += b'\x00\xff\x2f\x00'
+    return b'MTrk' + struct.pack('>I', len(data)) + bytes(data)
+
+
+def to_midi(result, velocity=80):
+    """Type-1 MIDI: conductor (tempo, meter, markers, key signatures), chords, bass."""
+    s = result['settings']
+    num, den = map(int, s['meter'].split('/'))
+    tempo = round(60_000_000 / float(s['tempo']))
+    conductor = [(0, 0, b'\xff\x51\x03' + tempo.to_bytes(3, 'big')),
+                 (0, 0, b'\xff\x58\x04' + bytes([num, int(math.log2(den)), 24, 8]))]
+    bt = bar_ticks(s['meter'])
+    last_key = None
+    for sec, key in zip(result['sections'], result['keys']):
+        tick = sec['start'] * bt
+        text = f"{sec['identity']} {sec['occurrence']} | {key}".encode()
+        conductor.append((tick, 0, b'\xff\x06' + _vlq(len(text)) + text))
+        if key != last_key:
+            pc, mode = parse_key(key)
+            major_pc = (pc - {'major': 0, 'dorian': 2, 'phrygian': 4, 'lydian': 5, 'mixolydian': 7, 'minor': 9, 'locrian': 11}[mode]) % 12
+            sf = {0: 0, 7: 1, 2: 2, 9: 3, 4: 4, 11: 5, 6: -6, 1: -5, 8: -4, 3: -3, 10: -2, 5: -1}[major_pc]
+            conductor.append((tick, 0, b'\xff\x59\x02' + bytes([sf % 256, int(REFERENCE_MODE[mode] == 'minor')])))
+            last_key = key
+    chords, bass = [(0, 0, b'\xff\x03\x06Chords')], [(0, 0, b'\xff\x03\x04Bass')]
+    for r in voice_lead(chord_runs(result['events'])):
+        on, off = r['start_tick'], r['start_tick'] + r['duration_ticks']
+        for n in r['upper']:
+            chords += [(on, 2, bytes([0x90, n, velocity])), (off, 1, bytes([0x80, n, 0]))]
+        bass += [(on, 2, bytes([0x91, r['bass'], velocity])), (off, 1, bytes([0x81, r['bass'], 0]))]
+    body = _track(conductor) + _track(chords) + _track(bass)
+    return b'MThd' + struct.pack('>IHHH', 6, 1, 3, PPQ) + body
+
+
+def export_all(result, stem):
+    stem = Path(stem)
+    paths = dict(midi=stem.with_suffix('.mid'), csv=stem.with_suffix('.csv'), json=stem.with_suffix('.json'))
+    paths['midi'].write_bytes(to_midi(result))
+    paths['csv'].write_text(to_csv(result))
+    paths['json'].write_text(json.dumps(manifest(result), indent=2, default=str))
+    return paths
+
+
+if __name__ == '__main__':
+    demo = generate('intro 8\nverse 8\nchorus 8\nverse 12\nchorus 8\nbridge 8\nchorus 8\noutro 4')
+    print(chart_text(demo))
+    print(json.dumps(demo['diagnostics'], indent=2))

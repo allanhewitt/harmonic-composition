@@ -1,0 +1,51 @@
+name: Container smoke test
+on:
+  push:
+    paths:
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'engine/**'
+      - 'app/**'
+      - 'pieces/**'
+      - '.github/workflows/container-smoke.yml'
+  workflow_dispatch:
+jobs:
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build deployment image
+        run: docker build --build-arg HC_BUILD_REVISION=${{ github.sha }} -t harmonic-composition:smoke .
+      - name: Start isolated test container
+        run: docker run -d --name hc-smoke -p 127.0.0.1:18080:3000 harmonic-composition:smoke
+      - name: Verify health, page and a full generation with score
+        run: |
+          for i in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/health | tee /tmp/health.json | grep '"status":"ok"'
+          grep '"lilypond":true' /tmp/health.json
+          curl --fail --silent http://127.0.0.1:18080/ | grep 'Harmonic Composition'
+          python3 - <<'EOF'
+          import json, urllib.request
+          base = 'http://127.0.0.1:18080'
+          def call(path, body=None):
+              req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(),
+                                           headers={'Content-Type': 'application/json'})
+              return json.load(urllib.request.urlopen(req, timeout=180))
+          text = call('/api/examples/night_transit')['yaml']
+          cfg = call('/api/script/parse', {'yaml': text})['config']
+          r = call('/api/generate', {'config': cfg, 'score': True})
+          assert r['files'].get('score_pdf') and r['pages'], r['files']
+          for name in (r['files']['score_pdf'], r['files']['midi_zip'], r['pages'][0]):
+              data = urllib.request.urlopen(f"{base}/runs/{r['run']}/{name}", timeout=30).read()
+              assert len(data) > 500, name
+          print('generated', r['bars'], 'bars,', len(r['pages']), 'score pages')
+          EOF
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs hc-smoke || true
+      - name: Stop isolated container
+        if: always()
+        run: docker rm -f hc-smoke || true
