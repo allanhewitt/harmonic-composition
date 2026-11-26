@@ -27,7 +27,23 @@ Sequencers are aimed at soft synths (Diva, Repro-1, Repro-5 and others); the Mod
 interdependence, coordinated or independent evolution, motif repetition by section) and then given pitch by a Markov
 interval chain or a step pattern advanced by notes. It evolves independently of the shared density plan.
 
-**Next:** the **drum family** (TR-808-style lanes and the Groove drummer, MIDI channel 10).
+**Plan agreed 26 November 2026:**
+
+1. **Drum family:** TR-808-style lanes and the Groove drummer, MIDI channel 10.
+2. **Listening sessions in Logic:** run the generator, audition the files with real instruments, and note what sounds
+   wrong, dull or promising. Most output so far has been checked by tests and scores, not by ear.
+3. **Gap review:** set the next priorities from the listening notes.
+
+Candidates already identified for after the gap review (to be weighed against the listening notes):
+
+- **Regenerate one part, keep the rest:** lock and new-seed controls per family or part in the app, using the
+  engine's existing staged acceptance and locks.
+- **Quick preview in the browser:** simple playback with per-part mute and a play position on the score; a first step
+  towards live mode.
+- **Per-section settings** (item 2 below).
+- **Run library:** past runs with a rating and a short note, so good results are easy to find again.
+- Held back for now: MIDI controller curves for sequencers (e.g. filter sweeps following the density plan), more pitch
+  engines and learned tables.
 
 
 1. **Line embellishments:** a harmonic-adherence setting per line; extensions, suspensions, passing and neighbour notes,
