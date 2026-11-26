@@ -138,7 +138,9 @@ async function generate() {
     const t0 = performance.now();
     const r = await api('/api/generate', { method: 'POST', body: JSON.stringify({ config, score: true }) });
     renderResults(r);
-    status(`Generated ${r.bars} bars in ${((performance.now() - t0) / 1000).toFixed(1)} s.`, 'ok');
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    if (r.export_error) status(`Generated ${r.bars} bars in ${secs} s. ${r.export_error}`, 'error');
+    else status(`Generated ${r.bars} bars in ${secs} s.` + (r.exported ? ` Copied to ${r.exported}.` : ''), 'ok');
   } catch (e) { status(e.message, 'error'); } finally { b.disabled = false; }
 }
 

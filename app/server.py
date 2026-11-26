@@ -11,7 +11,8 @@ Routes
   GET  /api/examples, GET /api/examples/{name}   example scripts from the repository
 Environment
   PORT (3000), HC_DATA_DIR (/data), HC_PIECES_DIR and HC_RUNS_DIR (override the pieces/ and runs/ folders
-  inside HC_DATA_DIR, e.g. to put them in Dropbox), HC_USERNAME and HC_PASSWORD (optional HTTP basic
+  inside HC_DATA_DIR), HC_EXPORT_DIR (optional: each finished run is also copied there, e.g. to Dropbox; a
+  failed copy is reported but does not fail the run), HC_USERNAME and HC_PASSWORD (optional HTTP basic
   authentication; /health stays open for the container health check).
 """
 import base64, copy, datetime as dt, json, os, re, secrets, shutil, subprocess, sys, tempfile, zipfile
@@ -36,6 +37,7 @@ VERSION = '0.1.0'
 DATA = Path(os.environ.get('HC_DATA_DIR', '/data'))
 RUNS = Path(os.environ.get('HC_RUNS_DIR') or DATA / 'runs')
 PIECES = Path(os.environ.get('HC_PIECES_DIR') or DATA / 'pieces')
+EXPORT = Path(os.environ['HC_EXPORT_DIR']) if os.environ.get('HC_EXPORT_DIR') else None   # optional copy of each run
 EXAMPLES = ROOT / 'pieces' / 'examples'
 STATIC = ROOT / 'app' / 'static'
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$')
@@ -167,8 +169,20 @@ def api_generate(body: dict):
                           kept=report.get(p['id'], {}).get('kept')))
     meta = dict(run=run_id, title=title, created=dt.datetime.now().isoformat(timespec='seconds'), files=files, pages=pages)
     (folder / 'run.json').write_text(json.dumps(meta, indent=2))
+    exported = export_error = None
+    if EXPORT is not None:                       # best effort: a failed copy never loses the generated piece
+        try:
+            dest = EXPORT / f'{run_id} {stem}'
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in folder.iterdir():
+                if f.is_file() and not f.name.startswith('page-'):
+                    shutil.copyfile(f, dest / f.name)
+            exported = str(dest)
+        except Exception as e:
+            export_error = f'The piece was generated, but copying it to {EXPORT} failed: {e}'
     return dict(meta, chart=H.chart_text(result), plan=plan_rows, parts=parts, bars=doc['end_tick'] // bt,
                 tempo=doc['tempo'], meter=doc['meter'], score_skipped=not want_score,
+                exported=exported, export_error=export_error,
                 resolved=(folder / files['resolved']).read_text())
 
 
@@ -184,7 +198,10 @@ def run_file(run_id: str, name: str):
 
 @app.get('/api/pieces')
 def list_pieces():
-    PIECES.mkdir(parents=True, exist_ok=True)
+    try:
+        PIECES.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []                                   # e.g. Dropbox not available: the app still starts
     return [dict(name=p.stem, modified=dt.datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec='seconds'))
             for p in sorted(PIECES.glob('*.yaml'), key=lambda p: -p.stat().st_mtime)]
 
@@ -205,8 +222,11 @@ def put_piece(name: str, body: dict):
         P.parse(text)
     except Exception as e:
         raise error(e)
-    PIECES.mkdir(parents=True, exist_ok=True)
-    (PIECES / f'{name}.yaml').write_text(text)
+    try:
+        PIECES.mkdir(parents=True, exist_ok=True)
+        (PIECES / f'{name}.yaml').write_text(text)
+    except OSError as e:
+        raise HTTPException(500, f'Could not save to {PIECES}: {e}. Use Download script instead.')
     return dict(saved=name)
 
 

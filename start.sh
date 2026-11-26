@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # Start the Harmonic Composition app on this Mac and open it in the browser.
 #
-#   ./start.sh              pieces and generated runs go to Music_Vault in Dropbox
+#   ./start.sh              scripts in Music_Vault; runs made locally and copied to Music_Vault
 #   PORT=3001 ./start.sh    another port
 #
 # First run: creates a private Python environment (.venv) and installs the libraries.
 # Later runs: reinstalls only if requirements.txt has changed.
-# Override the folders with HC_PIECES_DIR and HC_RUNS_DIR if needed.
+# Folders: HC_PIECES_DIR (scripts), HC_RUNS_DIR (local working runs), HC_EXPORT_DIR (copies; empty = off).
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Working files stay on this Mac; finished runs are copied to Music_Vault, and saved scripts live there.
+LOCAL="${HC_LOCAL_DIR:-$HOME/Library/Application Support/Harmonic Composition}"
 VAULT="${HC_VAULT_DIR:-$HOME/Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition}"
+export HC_DATA_DIR="${HC_DATA_DIR:-$LOCAL}"
+export HC_RUNS_DIR="${HC_RUNS_DIR:-$LOCAL/Runs}"
 export HC_PIECES_DIR="${HC_PIECES_DIR:-$VAULT/Pieces}"
-export HC_RUNS_DIR="${HC_RUNS_DIR:-$VAULT/Runs}"
-export HC_DATA_DIR="${HC_DATA_DIR:-$VAULT}"
+export HC_EXPORT_DIR="${HC_EXPORT_DIR-$VAULT/Runs}"     # set HC_EXPORT_DIR= (empty) to turn the copy off
 PORT="${PORT:-3000}"
-mkdir -p "$HC_PIECES_DIR" "$HC_RUNS_DIR"
+mkdir -p "$HC_RUNS_DIR"
+mkdir -p "$HC_PIECES_DIR" 2>/dev/null || echo "Note: cannot create $HC_PIECES_DIR (is Dropbox running?)"
 
 # LilyPond: use one on the PATH (e.g. Homebrew), or a downloaded copy in the home folder.
 if ! command -v lilypond >/dev/null 2>&1; then
@@ -49,8 +53,9 @@ fi
 command -v lilypond >/dev/null 2>&1 || echo "Note: LilyPond not found, so no scores will be engraved (MIDI still works). Install with: brew install lilypond"
 command -v pdftoppm >/dev/null 2>&1 || echo "Note: pdftoppm not found, so score pages won't show in the browser (the PDF still works). Install with: brew install poppler"
 
-echo "Pieces: $HC_PIECES_DIR"
-echo "Runs:   $HC_RUNS_DIR"
+echo "Scripts:      $HC_PIECES_DIR"
+echo "Working runs: $HC_RUNS_DIR"
+if [ -n "$HC_EXPORT_DIR" ]; then echo "Copies to:    $HC_EXPORT_DIR"; fi
 echo "Starting on http://localhost:$PORT  (Ctrl-C to stop)"
 ( for i in $(seq 1 30); do
     if curl --silent --fail "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then

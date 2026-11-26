@@ -38,9 +38,12 @@ Then, whenever you want to compose:
 The first run creates a private Python environment and installs the libraries; later runs start in a second or two.
 The app opens in the browser at http://localhost:3000. Stop it with Ctrl-C.
 
-Saved scripts go to `Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition/Pieces` and generated
-runs (score, MIDI zip, resolved script) to `…/Harmonic Composition/Runs`, so both Macs see the same pieces. To use other
-folders set `HC_PIECES_DIR` / `HC_RUNS_DIR`, or `HC_VAULT_DIR` for both.
+Generation happens in a local folder on each Mac (`~/Library/Application Support/Harmonic Composition/Runs`), so it never
+depends on Dropbox. Each finished run (score PDF, MIDI zip, resolved script) is then **copied** to
+`Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition/Runs`; if that copy fails the piece is still
+there and the app shows a warning. Saved scripts go to `…/Harmonic Composition/Pieces`, so both Macs see the same
+pieces. Folders can be changed with `HC_PIECES_DIR`, `HC_RUNS_DIR`, `HC_EXPORT_DIR` (empty turns the copy off) or
+`HC_VAULT_DIR`.
 
 To update a Mac to the latest version: `git pull` in the folder (or Pull in VS Code), then start as usual.
 

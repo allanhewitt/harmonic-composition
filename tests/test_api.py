@@ -118,3 +118,43 @@ def test_basic_auth(tmp_path, monkeypatch):
     assert c.get('/', headers={'Authorization': f'Basic {good}'}).status_code == 200
     assert c.get('/', headers={'Authorization': f'Basic {bad}'}).status_code == 401
     monkeypatch.delenv('HC_PASSWORD')
+
+
+def test_export_copy_and_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv('HC_DATA_DIR', str(tmp_path / 'local'))
+    monkeypatch.delenv('HC_PASSWORD', raising=False)
+    import server
+    for target, ok in ((tmp_path / 'vault' / 'Runs', True), (tmp_path / 'blocker', False)):
+        if not ok:
+            target.write_text('a file where a folder should be')
+        monkeypatch.setenv('HC_EXPORT_DIR', str(target))
+        importlib.reload(server)
+        c = TestClient(server.app)
+        cfg = c.get('/api/schema').json()['defaults']
+        cfg['lines']['enabled'] = False
+        r = c.post('/api/generate', json={'config': cfg, 'score': False})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert (tmp_path / 'local' / 'runs' / body['run'] / body['files']['midi_zip']).exists()
+        if ok:
+            assert body['exported'] and not body['export_error']
+            copied = list((tmp_path / 'vault' / 'Runs').iterdir())[0]
+            assert (copied / body['files']['midi_zip']).exists()
+        else:
+            assert body['export_error'] and not body['exported']
+    monkeypatch.delenv('HC_EXPORT_DIR')
+
+
+def test_pieces_folder_unavailable(tmp_path, monkeypatch):
+    blocker = tmp_path / 'blocked'
+    blocker.write_text('x')
+    monkeypatch.setenv('HC_DATA_DIR', str(tmp_path))
+    monkeypatch.setenv('HC_PIECES_DIR', str(blocker / 'Pieces'))
+    monkeypatch.delenv('HC_PASSWORD', raising=False)
+    import server
+    importlib.reload(server)
+    c = TestClient(server.app)
+    assert c.get('/api/pieces').json() == []
+    r = c.put('/api/pieces/x', json={'yaml': 'piece: {key: C major}\n'})
+    assert r.status_code == 500 and 'Download script' in r.json()['detail']
+    monkeypatch.delenv('HC_PIECES_DIR')
