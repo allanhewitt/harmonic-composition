@@ -20,23 +20,42 @@ per-section settings, live MIDI) is planned in [docs/roadmap.md](docs/roadmap.md
 A **piece script** (YAML) holds every setting. The web app builds the script from menus; the command line runs one directly.
 Each run writes `<stem>_resolved.yaml` with every default filled in, so any result can be rebuilt exactly.
 
-## Use
+## Use on a Mac (MacBook and Mac Studio)
 
-**Web app** (what Coolify runs):
-
-```sh
-pip install -r requirements.txt
-HC_DATA_DIR=./data PORT=3000 python app/server.py     # then open http://localhost:3000
-```
-
-**Command line:**
+One-time setup on each Mac:
 
 ```sh
-cd engine && python piece.py ../pieces/examples/night_transit.yaml
+brew install lilypond poppler          # score engraving and page images (optional, MIDI works without)
+git clone https://github.com/allanhewitt/harmonic-composition.git ~/Code/harmonic-composition
 ```
 
-Scores need [LilyPond](https://lilypond.org) on the path; page images in the browser also need `pdftoppm` (poppler).
-Without them the app still writes MIDI.
+Then, whenever you want to compose:
+
+```sh
+~/Code/harmonic-composition/start.sh
+```
+
+The first run creates a private Python environment and installs the libraries; later runs start in a second or two.
+The app opens in the browser at http://localhost:3000. Stop it with Ctrl-C.
+
+Saved scripts go to `Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition/Pieces` and generated
+runs (score, MIDI zip, resolved script) to `…/Harmonic Composition/Runs`, so both Macs see the same pieces. To use other
+folders set `HC_PIECES_DIR` / `HC_RUNS_DIR`, or `HC_VAULT_DIR` for both.
+
+To update a Mac to the latest version: `git pull` in the folder (or Pull in VS Code), then start as usual.
+
+**VS Code:** open the folder; the Run and Debug panel has *Harmonic Composition app* (restarts itself when code changes)
+and *Run piece script (current file)* for running an open `.yaml` script from the command line runner.
+Run `./start.sh` once first so the `.venv` environment exists.
+
+**Command line only:**
+
+```sh
+cd engine && ../.venv/bin/python piece.py ../pieces/examples/night_transit.yaml
+```
+
+Deploying to a server with Coolify is also possible ([docs/deployment-coolify.md](docs/deployment-coolify.md)) but not
+needed for single-user use.
 
 ## Repository
 
@@ -59,10 +78,6 @@ python -m pytest -q tests
 
 GitHub Actions runs the tests on every push and a container smoke test (build the image, start it, generate a piece with
 score and MIDI) when the image or code changes.
-
-## Deployment
-
-Coolify builds the `Dockerfile`. See [docs/deployment-coolify.md](docs/deployment-coolify.md).
 
 ## Evidence labels
 

@@ -10,8 +10,9 @@ Routes
   GET  /api/pieces, GET/PUT /api/pieces/{name}   scripts saved on the server
   GET  /api/examples, GET /api/examples/{name}   example scripts from the repository
 Environment
-  PORT (3000), HC_DATA_DIR (/data), HC_USERNAME and HC_PASSWORD (optional HTTP basic authentication;
-  /health stays open for the container health check).
+  PORT (3000), HC_DATA_DIR (/data), HC_PIECES_DIR and HC_RUNS_DIR (override the pieces/ and runs/ folders
+  inside HC_DATA_DIR, e.g. to put them in Dropbox), HC_USERNAME and HC_PASSWORD (optional HTTP basic
+  authentication; /health stays open for the container health check).
 """
 import base64, copy, datetime as dt, json, os, re, secrets, shutil, subprocess, sys, zipfile
 from fractions import Fraction
@@ -33,7 +34,8 @@ import schema as S                                                        # noqa
 
 VERSION = '0.1.0'
 DATA = Path(os.environ.get('HC_DATA_DIR', '/data'))
-RUNS, PIECES = DATA / 'runs', DATA / 'pieces'
+RUNS = Path(os.environ.get('HC_RUNS_DIR') or DATA / 'runs')
+PIECES = Path(os.environ.get('HC_PIECES_DIR') or DATA / 'pieces')
 EXAMPLES = ROOT / 'pieces' / 'examples'
 STATIC = ROOT / 'app' / 'static'
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$')

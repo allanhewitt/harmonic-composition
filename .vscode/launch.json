@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Harmonic Composition app",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["server:app", "--app-dir", "app", "--host", "127.0.0.1", "--port", "3000", "--reload",
+               "--reload-dir", "app", "--reload-dir", "engine"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "HC_DATA_DIR": "${env:HOME}/Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition",
+        "HC_PIECES_DIR": "${env:HOME}/Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition/Pieces",
+        "HC_RUNS_DIR": "${env:HOME}/Dropbox/Music_Vault/Composition/Generative Composition/Harmonic Composition/Runs"
+      },
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": true
+    },
+    {
+      "name": "Run piece script (current file)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/engine/piece.py",
+      "args": ["${file}"],
+      "cwd": "${fileDirname}",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    }
+  ]
+}
