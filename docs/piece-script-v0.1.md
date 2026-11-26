@@ -82,6 +82,25 @@ sequencers:     # one instance of each machine, each on unless enabled: false. E
   rene:    {path: cartesian}        # 4 x 4 grid read along a path: cartesian, snake, diagonal
   nodal:   {branching: 0.5}         # phrases joined by weighted links; 0 = strongest link, 1 = all equally likely
   # every machine also takes enabled, follow, low, high, profile, channel and seed (channels 6-8, 10-15 by default)
+rhythm:         # rhythmic counterpoint family: four voices, rhythm first then pitch (off by default)
+  enabled: false
+  follow: chords          # chords, or static (home key)
+  grid: '8'               # onset spacing: '4', '8', '16'
+  shortest: '16'          # shortest note
+  conventionality: 50     # 0-100
+  interdependence: 65     # 0-100
+  evolution: coordinated  # coordinated, independent, steady
+  window: 8               # bars between target changes
+  cycle: 64               # bars per coordinated cycle
+  repetition: 70          # 0-100
+  seed: 1
+  v1: {name: Voice 1, density: 45, density_change: 40, participation: 85, participation_change: 50,
+       engine: markov, table: smooth, adherence: 0.4, pattern: [0, 2, 1, 2, 0, 3, 1, 2],
+       low: 67, high: 84, velocity: 84, channel: 0, program: 73}
+  v2: {density: 25, density_change: 30, participation: 75, participation_change: 40, low: 60, high: 76, channel: 1}
+  v3: {density: 20, density_change: 50, participation: 80, participation_change: 60, low: 52, high: 69, channel: 3}
+  v4: {density: 25, density_change: 20, participation: 90, participation_change: 30, low: 40, high: 57, channel: 4}
+  # engine: markov or step; table: smooth, angular, narrow, wide, or a 9 x 9 list. See docs/rhythm-family-v0.1.md.
 density:        # final filter on pads, lines and sequencers (sequencers lose whole pattern steps)
   keep: 100               # 0-100
   mode: even              # even, flatten, contrast

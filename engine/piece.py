@@ -29,11 +29,13 @@ import bass960 as B
 import lines as LN
 import thinning as T
 import sequencers as SQ
+import counterpoint as CP
 import notation as N
 import midi_export as MX
 
 VERSION = '0.0.1'
-SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'sequencers', 'density', 'output')
+SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'sequencers', 'rhythm', 'density',
+            'output')
 
 
 def defaults():
@@ -46,6 +48,7 @@ def defaults():
         bass=dict(copy.deepcopy(B.DEFAULTS), enabled=True),
         lines=dict({k: {kk: vv for kk, vv in v.items() if kk != 'ladder'} for k, v in LN.LINES.items()}, seed=1, enabled=True),
         sequencers=SQ.defaults(),
+        rhythm=CP.defaults(),
         density=copy.deepcopy(T.DEFAULTS),
         output=dict(folder='piece_output', stem=None, score=True, midi=True))
 
@@ -84,8 +87,9 @@ def build(cfg):
     if cfg['bass'].get('enabled', True):
         extra.append(B.generate(doc, result, plan, {k: v for k, v in cfg['bass'].items() if k != 'enabled'}))
     seqs = SQ.generate(doc, result, plan, cfg.get('sequencers') or {})
+    voices = CP.generate(doc, result, plan, cfg.get('rhythm') or {})
     lines_first = [p for p in extra if p['kind'] == 'line'][::-1]
-    doc = dict(doc, parts=seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
+    doc = dict(doc, parts=voices + seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
     doc = T.apply(doc, result, cfg['density'])
     return ctx, result, doc, plan
 

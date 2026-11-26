@@ -91,6 +91,21 @@ SEQ_PANELS = [
 ]
 
 
+def rhythm_voice_fields(k, label):
+    p = f'rhythm.{k}'
+    return [num(f'{p}.density', 'Density (% of onset slots)', 1, 100),
+            num(f'{p}.density_change', 'Density change (swing over the piece)', 0, 100),
+            num(f'{p}.participation', 'Participation (% of time sounding)', 1, 100),
+            num(f'{p}.participation_change', 'Participation change', 0, 100),
+            sel(f'{p}.engine', 'Pitch engine', [('markov', 'Markov (interval table)'), ('step', 'Step pattern (advanced by notes)')]),
+            sel(f'{p}.table', 'Markov table', [('smooth', 'Smooth'), ('angular', 'Angular'), ('narrow', 'Narrow'), ('wide', 'Wide')],
+                help='A custom 9 x 9 table can be set in the script.'),
+            rng(f'{p}.adherence', 'Harmonic adherence', help='0 ignores the chords; 1 keeps strong notes on chord tones.'),
+            num(f'{p}.low', 'Lowest note (MIDI)', 12, 115), num(f'{p}.high', 'Highest note (MIDI)', 12, 120),
+            num(f'{p}.channel', 'MIDI channel (0-15; 9 is drums)', 0, 15),
+            txt(f'{p}.name', 'Name')]
+
+
 def schema():
     return [
         dict(id='piece', label='Piece', help='Step 1: the song parameters.', fields=[
@@ -161,5 +176,19 @@ def schema():
             num('density.parts.descant', 'Keep: descant (%)', 0, 100),
             rng('density.randomness', 'Randomness'),
             txt('density.seed', 'Seed')]),
-    ] + [dict(id=f'seq_{eid}', label=label, help=help + ' Follows the chords or stays static in the home key.',
+        dict(id='rhythm', label='Rhythmic counterpoint', help='Four voices composed rhythm first, then given pitch. '
+             'Evolves independently of the other families.', fields=[
+            flag('rhythm.enabled', 'Include'),
+            sel('rhythm.follow', 'Harmony', [('chords', 'Follow the chords'), ('static', 'Static (home key)')]),
+            sel('rhythm.grid', 'Onsets on', [('4', 'Crotchets'), ('8', 'Quavers'), ('16', 'Semiquavers')]),
+            sel('rhythm.shortest', 'Shortest note', [('4', 'Crotchet'), ('8', 'Quaver'), ('16', 'Semiquaver')]),
+            num('rhythm.conventionality', 'Conventionality', 0, 100, help='How strongly onsets favour strong beats.'),
+            num('rhythm.interdependence', 'Interdependence', 0, 100, help='Voices avoid each other; cycles offset.'),
+            sel('rhythm.evolution', 'Evolution', [('coordinated', 'Coordinated (one thins as another fills)'),
+                                                  ('independent', 'Independent drift'), ('steady', 'Steady')]),
+            num('rhythm.window', 'Bars between changes', 1, 32), num('rhythm.cycle', 'Bars per cycle', 2, 256),
+            num('rhythm.repetition', 'Repetition', 0, 100, help='How closely returning sections keep rhythm and intervals.'),
+            txt('rhythm.seed', 'Seed')]),
+    ] + [dict(id=f'rhythm_{k}', label=f'Rhythm voice {i + 1}', fields=rhythm_voice_fields(k, f'Voice {i + 1}'))
+         for i, k in enumerate(('v1', 'v2', 'v3', 'v4'))] + [dict(id=f'seq_{eid}', label=label, help=help + ' Follows the chords or stays static in the home key.',
               fields=seq_fields(eid, specific)) for eid, label, help, specific in SEQ_PANELS]

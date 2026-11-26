@@ -1,0 +1,53 @@
+# Rhythmic counterpoint: four voices and the 960 bass, everything else off.
+# Run:  python3 engine/piece.py pieces/examples/four_voices_and_bass.yaml
+
+piece:
+  title: Four Voices
+  key: D dorian
+  tempo: 96
+  meter: 4/4
+  length: 128
+  seed: 11
+
+structure:
+  model: evolving
+  phrase_length: 4..8
+
+harmony:
+  rates: [0.25, 0.5]
+
+pads:
+  pad2: {enabled: false}
+  pad3: {enabled: false}
+
+lines: {enabled: false}
+
+bass: {enabled: true}
+
+sequencers:
+  m960: {enabled: false}
+  euclid: {enabled: false}
+  poly: {enabled: false}
+  tb303: {enabled: false}
+  turing: {enabled: false}
+  metro: {enabled: false}
+  marbles: {enabled: false}
+  rene: {enabled: false}
+  nodal: {enabled: false}
+
+rhythm:
+  enabled: true
+  follow: chords          # chords, or static (stay in the home key)
+  grid: '8'               # onsets on quavers
+  shortest: '16'
+  conventionality: 50     # 0 free ... 100 strongly metrical
+  interdependence: 65     # voices avoid each other's onsets; how strictly their cycles are offset
+  evolution: coordinated  # coordinated, independent, steady
+  window: 8               # bars between changes of target
+  cycle: 64               # bars per coordinated cycle
+  repetition: 70          # how closely returning sections keep rhythm and intervals
+  seed: 4
+  v1: {density: 45, density_change: 40, participation: 85, participation_change: 50, engine: markov, table: smooth, adherence: 0.4, low: 67, high: 84}
+  v2: {density: 25, density_change: 30, participation: 75, participation_change: 40, engine: step, pattern: [0, 2, 1, 2, 0, 3, 1, 2], low: 60, high: 76}
+  v3: {density: 20, density_change: 50, participation: 80, participation_change: 60, engine: markov, table: angular, adherence: 0.3, low: 52, high: 69}
+  v4: {density: 25, density_change: 20, participation: 90, participation_change: 30, engine: markov, table: narrow, adherence: 0.6, low: 40, high: 57}

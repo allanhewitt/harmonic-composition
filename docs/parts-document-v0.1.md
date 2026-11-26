@@ -21,6 +21,8 @@ Rules every generator keeps:
   `step_priority` (the machine's pattern steps, most important first). Each sequencer note carries its `step` key,
   which the density filter uses to silence the same steps throughout. Engines may add their own record (`patterns`,
   `phrase`, `stages`, `grid`, `nodes` and `links`, `changes`).
+- Rhythm family parts (kind `voice`) also list `targets` (phrase start tick, density and participation targets)
+  and `warnings` (phrases whose participation target the onsets could not meet).
 - A part may add display hints for the score: `short` (staff name), `staccato` (sequencer steps), `annotations`.
 
 ## Step 5 conventions (from Experiments 30-32)
