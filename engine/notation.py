@@ -124,6 +124,10 @@ def staff_music(part, doc, result, chord_symbols):
         notes = [(snap(n['start']), snap(n['start']) + step, n['pitch']) for n in part['notes']]
     else:
         notes = [(snap(n['start']), snap(n['start'] + n['duration']), n['pitch']) for n in part['notes']]
+        if part.get('kind') in ('seq', 'bass', 'line'):      # single lines: a very short note is written as at
+            onsets = sorted({a for a, _, _ in notes})        # least a semiquaver, but never past the next note
+            nxt = {a: b for a, b in zip(onsets, onsets[1:] + [end])}
+            notes = [(a, min(max(b, a + grid), nxt[a]), p) for a, b, p in notes]
     attacks = {s for s, e, p in notes}
     notes = [n for n in notes if n[1] > n[0]]
     edges = {0, end} | {a for a, b, p in notes} | {b for a, b, p in notes} | set(range(0, end, bt)) \

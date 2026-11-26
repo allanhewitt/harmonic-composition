@@ -67,7 +67,7 @@ def test_generate_and_fetch_files(client):
     body = r.json()
     assert body['bars'] >= 48 and body['plan'] and body['chart'].strip()
     ids = {p['id'] for p in body['parts']}
-    assert ids == {'pad2', 'pad3', 'bass', 'tenor', 'alto', 'descant'}
+    assert ids == {'pad2', 'pad3', 'bass', 'tenor', 'alto', 'descant', 'm960'}
     z = client.get(f"/runs/{body['run']}/{body['files']['midi_zip']}")
     assert z.status_code == 200 and z.content[:2] == b'PK'
     res = client.get(f"/runs/{body['run']}/{body['files']['resolved']}")

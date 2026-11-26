@@ -14,6 +14,7 @@ Sections of the script (all optional except piece):
   orchestration  constant pad, density contour, randomness, seed   (shared density plan)
   bass           Moog 960 bass settings; enabled: false to leave it out
   lines          tenor / alto / descant settings and seed; enabled: false to leave them out
+  sequencers     one entry per sequencer engine (m960, ...), each on by default; enabled: false to leave it out
   density        keep (0-100), mode (even/flatten/contrast), per-part keep, randomness, seed
   output         folder, stem, score, midi
 """
@@ -27,11 +28,12 @@ import orchestration as O
 import bass960 as B
 import lines as LN
 import thinning as T
+import sequencers as SQ
 import notation as N
 import midi_export as MX
 
 VERSION = '0.0.1'
-SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'density', 'output')
+SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'sequencers', 'density', 'output')
 
 
 def defaults():
@@ -43,6 +45,7 @@ def defaults():
         orchestration=copy.deepcopy(O.DEFAULTS),
         bass=dict(copy.deepcopy(B.DEFAULTS), enabled=True),
         lines=dict({k: {kk: vv for kk, vv in v.items() if kk != 'ladder'} for k, v in LN.LINES.items()}, seed=1, enabled=True),
+        sequencers=SQ.defaults(),
         density=copy.deepcopy(T.DEFAULTS),
         output=dict(folder='piece_output', stem=None, score=True, midi=True))
 
@@ -80,8 +83,9 @@ def build(cfg):
         extra += LN.generate(doc, result, plan, dict(lset, seed=cfg['lines'].get('seed', 1)))
     if cfg['bass'].get('enabled', True):
         extra.append(B.generate(doc, result, plan, {k: v for k, v in cfg['bass'].items() if k != 'enabled'}))
+    seqs = SQ.generate(doc, result, plan, cfg.get('sequencers') or {})
     lines_first = [p for p in extra if p['kind'] == 'line'][::-1]
-    doc = dict(doc, parts=lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
+    doc = dict(doc, parts=seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
     doc = T.apply(doc, result, cfg['density'])
     return ctx, result, doc, plan
 

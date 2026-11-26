@@ -2,7 +2,7 @@
 
 **Status:** implemented (Stage 1). Checked by `tests/test_stage1_parts.py` and `tests/test_api.py`.
 
-A piece script is a YAML file with up to nine sections. Only `piece` is required; anything left out takes its default.
+A piece script is a YAML file with up to ten sections. Only `piece` is required; anything left out takes its default.
 Unknown sections are refused, so a typing mistake is reported rather than silently ignored. Unknown keys inside a section
 are kept and passed to that stage.
 
@@ -60,7 +60,29 @@ lines:
   tenor:   {low: 45, high: 62}
   alto:    {low: 57, high: 72}
   descant: {low: 72, high: 88}
-density:        # final filter on pads and lines
+sequencers:     # one instance of each sequencer engine; each is on unless enabled: false
+  m960:
+    enabled: true
+    harmonic: adapted       # adapted (fit each chord), transposed (keep shape, move with the root), independent
+    value_space: chord      # chord (root, 3rd, 5th, 7th ...) or scale (scale steps from the chord root)
+    grid: '16'              # '4', '8', '16', '32'
+    length: 8               # 2-16 steps
+    rows: {a: pitch, b: gate, c: time}   # each row controls pitch, gate, velocity (accent) or time (step length)
+    skip_rate: 0.08         # share of Skip steps (take no time)
+    stop_rate: 0.0          # chance of a Stop step (halts until the next restart)
+    time_rate: 0.2          # share of double-length steps when a row controls time
+    reset: section          # section, phrase, never
+    mutation: 0.25
+    low: 60
+    high: 84
+    anchor: 64              # the ladder's root is placed nearest this note
+    profile: mono_synth     # mono_synth, poly_synth, mono_hw_novel (no velocity)
+    velocity: 84
+    accent: 16
+    channel: 6              # 0-based; 9 (MIDI channel 10) is kept for drums
+    program: 81
+    seed: 1
+density:        # final filter on pads and lines (sequencers are not thinned)
   keep: 100               # 0-100
   mode: even              # even, flatten, contrast
   parts: {}               # per-part keep, e.g. {descant: 50}

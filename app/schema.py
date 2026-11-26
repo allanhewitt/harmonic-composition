@@ -10,6 +10,7 @@ import parts as PT
 import orchestration as O
 import bass960 as B
 import thinning as T
+import seqcore as SC
 
 KEYS = [f'{t} {m}' for m in C.MODES for t in C.TONICS]
 RATES = [('1/4', '4 bars'), ('1/3', '3 bars'), ('1/2', '2 bars'), ('2/3', '1½ bars'), ('1', '1 bar'),
@@ -50,6 +51,28 @@ def pad_fields(pid, two):
 
 def line_fields(lid, label):
     return [num(f'lines.{lid}.low', f'{label}: lowest (MIDI)', 24, 108), num(f'lines.{lid}.high', f'{label}: highest (MIDI)', 24, 108)]
+
+
+ROW_CHOICES = [('pitch', 'Pitch'), ('gate', 'Gate length'), ('velocity', 'Accent'), ('time', 'Step length')]
+
+
+def seq_fields(eid, label, specific):
+    p = f'sequencers.{eid}'
+    return ([dict(path=f'{p}.enabled', label=f'{label}: include', type='bool'),
+             sel(f'{p}.harmonic', 'Harmonic mode', [('adapted', 'Adapted (fit each chord)'), ('transposed', 'Transposed (keep shape)'),
+                                                   ('independent', 'Independent (ignore chords)')]),
+             sel(f'{p}.value_space', 'Values move through', [('chord', 'Chord tones'), ('scale', 'Scale steps')]),
+             sel(f'{p}.grid', 'Step', [('4', 'Crotchets'), ('8', 'Quavers'), ('16', 'Semiquavers'), ('32', 'Demisemiquavers')])]
+            + specific
+            + [sel(f'{p}.reset', 'Pattern restarts', [('section', 'At each section'), ('phrase', 'At each phrase'), ('never', 'Never')]),
+               rng(f'{p}.mutation', 'Gradual change'),
+               num(f'{p}.low', 'Lowest note (MIDI)', 12, 115), num(f'{p}.high', 'Highest note (MIDI)', 12, 120),
+               num(f'{p}.anchor', 'Root placed near (MIDI)', 12, 115),
+               sel(f'{p}.profile', 'Instrument', [('mono_synth', 'Mono synth (Diva, Repro-1…)'), ('poly_synth', 'Poly synth (Repro-5…)'),
+                                                  ('mono_hw_novel', 'Mono synth, no velocity')]),
+               num(f'{p}.velocity', 'Velocity', 1, 127), num(f'{p}.accent', 'Accent (+ velocity)', 0, 60),
+               num(f'{p}.channel', 'MIDI channel (0-15; 9 is drums)', 0, 15),
+               txt(f'{p}.seed', 'Seed')])
 
 
 def schema():
@@ -112,6 +135,16 @@ def schema():
         dict(id='lines', label='Lines', help='Tenor and alto guide-tone lines and a descant, written phrase by phrase.', fields=[
             flag('lines.enabled', 'Include'), txt('lines.seed', 'Seed')]
             + line_fields('tenor', 'Tenor') + line_fields('alto', 'Alto') + line_fields('descant', 'Descant')),
+        dict(id='sequencers', label='Sequencers', help='One instance of each sequencer, each on by default. Values follow the chords '
+             '(adapted), keep their shape and move with each chord root (transposed), or ignore the chords (independent).',
+             fields=seq_fields('m960', 'Seq 960', [
+                 num('sequencers.m960.length', 'Steps', 2, 16),
+                 sel('sequencers.m960.rows.a', 'Row A controls', ROW_CHOICES),
+                 sel('sequencers.m960.rows.b', 'Row B controls', ROW_CHOICES),
+                 sel('sequencers.m960.rows.c', 'Row C controls', ROW_CHOICES),
+                 rng('sequencers.m960.skip_rate', 'Skip steps', 0, 0.5, help='Skipped steps take no time.'),
+                 rng('sequencers.m960.stop_rate', 'Stop step', 0, 0.5, help='Chance of a Stop step: the pattern halts until its next restart.'),
+                 rng('sequencers.m960.time_rate', 'Double-length steps', 0, 0.6)])),
         dict(id='density', label='Density filter', help='Keep only a share of the notes in pads and lines (the constant pad is exempt).', fields=[
             num('density.keep', 'Keep (%)', 0, 100),
             sel('density.mode', 'Mode', [('even', 'Even'), ('flatten', 'Flatten (busiest thinned most)'),

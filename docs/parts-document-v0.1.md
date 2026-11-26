@@ -5,7 +5,7 @@
 ```text
 schema, version, ppq (480), tempo, meter, end_tick
 chords:   [{start, end, triad (root, 3rd, 5th pitch classes), symbol, roman, section_index}]
-parts:    [{id, name, kind (pad | bass | line), channel (0-15), program, settings,
+parts:    [{id, name, kind (pad | bass | line | seq), channel (0-15), program, settings,
             notes: [{start, duration, pitch, velocity}], stats, ...}]
 orchestration: {version, settings, plan: [{bar, section, first, level, target}], top}
 thinning: {version, settings, report: {part id: {kept, target}}}
@@ -17,6 +17,8 @@ Rules every generator keeps:
 - Monophonic parts (bass, lines) never overlap; no part repeats a pitch while it is already sounding on its channel.
 - Generators work forwards in time phrase by phrase with their own seeded state, and read the shared plan rather than
   deciding entries themselves. This keeps a later live (streaming) mode possible.
+- Sequencer parts also list `slides` (indices of notes that overlap the next note so a mono synth glides) and
+  `patterns` (the pattern used in each phrase).
 - A part may add display hints for the score: `short` (staff name), `staccato` (sequencer steps), `annotations`.
 
 ## Step 5 conventions (from Experiments 30-32)
