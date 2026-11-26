@@ -14,7 +14,7 @@ Environment
   inside HC_DATA_DIR, e.g. to put them in Dropbox), HC_USERNAME and HC_PASSWORD (optional HTTP basic
   authentication; /health stays open for the container health check).
 """
-import base64, copy, datetime as dt, json, os, re, secrets, shutil, subprocess, sys, zipfile
+import base64, copy, datetime as dt, json, os, re, secrets, shutil, subprocess, sys, tempfile, zipfile
 from fractions import Fraction
 from pathlib import Path
 
@@ -147,9 +147,13 @@ def api_generate(body: dict):
     if pdf.exists():
         files['score_pdf'] = pdf.name
         if shutil.which('pdftoppm'):
-            subprocess.run(['pdftoppm', '-r', '110', '-png', str(pdf), str(folder / 'page')], check=True,
-                           capture_output=True)
-            pages = sorted(p.name for p in folder.glob('page-*.png'))
+            with tempfile.TemporaryDirectory(prefix='hc-pages-') as tmp:       # local, then copied into the run
+                shutil.copyfile(pdf, Path(tmp) / 'score.pdf')
+                subprocess.run(['pdftoppm', '-r', '110', '-png', 'score.pdf', 'page'], cwd=tmp, check=True,
+                               capture_output=True)
+                for img in sorted(Path(tmp).glob('page-*.png')):
+                    shutil.copyfile(img, folder / img.name)
+                    pages.append(img.name)
     bt = H.bar_ticks(doc['meter'])
     secs = result['sections']
     plan_rows = [dict(bar=st['bar'] + 1, section=f"{secs[st['section']]['identity']} {secs[st['section']]['occurrence']}",

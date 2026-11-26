@@ -202,15 +202,28 @@ def lily_source(result, doc, title='Harmonic composition', subtitle=''):
 
 
 def write_score(result, doc, folder, stem, title='Harmonic composition', subtitle='', pdf=True):
-    """Write <stem>_score.ly and, if LilyPond is installed, <stem>_score.pdf. Returns the paths written."""
+    """Write <stem>_score.ly and, if LilyPond is installed, <stem>_score.pdf. Returns the paths written.
+
+    LilyPond runs in a private temporary folder (short path, no spaces, not synced by Dropbox) with relative
+    file names, and the finished files are copied into `folder`. Some LilyPond builds cannot change into
+    folders inside cloud-storage locations such as ~/Dropbox on macOS."""
+    import tempfile
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    source = lily_source(result, doc, title, subtitle)
     ly = folder / f'{stem}_score.ly'
-    ly.write_text(lily_source(result, doc, title, subtitle))
+    ly.write_text(source)
     paths = [ly]
-    if pdf and shutil.which('lilypond'):
-        run = subprocess.run(['lilypond', '-s', '-o', str(folder / f'{stem}_score'), str(ly)], capture_output=True, text=True)
-        if run.returncode != 0:
-            raise RuntimeError('LilyPond failed: ' + run.stderr[-800:])
-        paths.append(folder / f'{stem}_score.pdf')
+    exe = shutil.which('lilypond')
+    if pdf and exe:
+        with tempfile.TemporaryDirectory(prefix='hc-lily-') as tmp:
+            (Path(tmp) / 'score.ly').write_text(source)
+            run = subprocess.run([exe, '-s', '-o', 'score', 'score.ly'], cwd=tmp, capture_output=True, text=True)
+            made = Path(tmp) / 'score.pdf'
+            if run.returncode != 0 or not made.exists():
+                detail = (run.stderr or run.stdout or '').strip().splitlines()
+                raise RuntimeError('LilyPond failed: ' + ' | '.join(detail[-4:])[:800])
+            out = folder / f'{stem}_score.pdf'
+            shutil.copyfile(made, out)
+        paths.append(out)
     return paths
