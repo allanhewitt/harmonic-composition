@@ -1,4 +1,4 @@
-"""Density filter (prototype): keep only a share of the notes in pads and lines.
+"""Density filter (prototype): keep only a share of the notes in pads, lines and sequencers.
 
 Settings
   keep        0-100, the share of each part kept (100 = everything).
@@ -12,12 +12,15 @@ What counts: lines count notes; pads count sounding time (a held pad note can la
 Which notes go: weak-beat, short and inner notes first. Protected: the first and last note of every
 phrase, and in the inner lines the notes that arrive with a chord change. A removed note leaves a rest.
 Repeated sections with the same notes lose the same notes, so related repeats stay related.
+Sequencers are thinned by pattern step, not note by note: the same steps fall silent every time the pattern comes
+round, as if their gates had been switched off, so the pattern stays recognisable. Which steps go is the machine's
+own order (strong steps last). The mode does not apply to sequencers.
 DESIGN, not measured.
 """
 import copy, random
 import harmonic_engine as H
 
-VERSION = '0.0.1'
+VERSION = '0.0.2'
 DEFAULTS = dict(keep=100, parts={}, mode='even', randomness=0.3, exempt=['pad2'], seed=1)
 MODES = {'even': 0, 'flatten': 1, 'contrast': -1}
 
@@ -108,19 +111,33 @@ def thin_part(part, result, doc, keep, cfg):
     return out, dict(kept=round(kept_w / grand, 3) if grand else 1.0, target=keep / 100)
 
 
+def thin_seq(part, keep):
+    """Silence the lowest-priority pattern steps, the same steps throughout the piece."""
+    used = {repr(x['step']) for x in part['notes'] if 'step' in x}
+    priority = [k for k in part.get('step_priority') or [] if repr(k) in used]     # only steps that actually sound
+    if keep >= 100 or not part['notes'] or not priority:
+        return part, dict(kept=1.0)
+    n = len(priority)
+    kept_keys = set(map(repr, priority[:max(1, min(n, round(n * keep / 100)))]))
+    out = copy.deepcopy(part)
+    out['notes'] = [copy.deepcopy(x) for x in part['notes'] if 'step' not in x or repr(x['step']) in kept_keys]
+    return out, dict(kept=round(len(out['notes']) / len(part['notes']), 3), target=keep / 100,
+                     steps_kept=len(kept_keys), steps=n)
+
+
 def apply(doc, result, settings=None):
     cfg = dict(DEFAULTS, **(settings or {}))
     if cfg['mode'] not in MODES:
         raise ValueError(f"Thinning mode must be one of {', '.join(MODES)}.")
     report, parts = {}, []
     for p in doc['parts']:
-        if p['kind'] not in ('pad', 'line') or p['id'] in cfg['exempt']:
+        if p['kind'] not in ('pad', 'line', 'seq') or p['id'] in cfg['exempt']:
             parts.append(p)
             continue
         keep = float(cfg['parts'].get(p['id'], cfg['keep']))
         if not 0 <= keep <= 100:
             raise ValueError(f"Keep for {p['id']} must be 0-100.")
-        q, rep = thin_part(p, result, doc, keep, cfg)
+        q, rep = thin_seq(p, keep) if p['kind'] == 'seq' else thin_part(p, result, doc, keep, cfg)
         parts.append(q)
         report[p['id']] = rep
     return dict(doc, parts=parts, thinning=dict(version=VERSION, settings=cfg, report=report))

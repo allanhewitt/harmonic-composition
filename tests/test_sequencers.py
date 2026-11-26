@@ -209,3 +209,138 @@ def test_c_pattern_over_a_minor_uses_c_natural():
     bt = H.bar_ticks('4/4')
     bar2 = {n['pitch'] % 12 for n in p['notes'] if bt <= n['start'] < 2 * bt}
     assert 1 not in bar2 and bar2 <= {9, 0, 4}
+
+
+# ------------------------------------------------------------------ the eight further engines and sequencer thinning
+import seqengines as E
+import thinning as T
+
+NEW = [e.ID for e in E.ENGINES]
+ALL = [e.ID for e in SQ.ENGINES]
+SIGNATURE = dict(euclid=('cycle', [8, 12, 16]), poly=('loops', ['3-5-7', '7-9-11']), tb303=('slide', [0.0, 1.0]),
+                 turing=('change', [0.0, 1.0]), metro=('ratchet', [0.0, 1.0]), marbles=('spread', [0.0, 1.0]),
+                 rene=('path', ['cartesian', 'snake', 'diagonal']), nodal=('branching', [0.0, 1.0]))
+
+
+def part_of(eid, level=5, **cfg):
+    r, doc, plan = fixture(level=level)
+    return next(p for p in SQ.generate(doc, r, plan, {eid: dict(seed=3, **cfg)}) if p['id'] == eid), r
+
+
+def test_registry_order_and_distinct_channels():
+    assert ALL == ['m960', 'euclid', 'poly', 'tb303', 'turing', 'metro', 'marbles', 'rene', 'nodal']
+    chans = [e.DEFAULTS['channel'] for e in SQ.ENGINES]
+    assert len(set(chans)) == len(chans) and 9 not in chans
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_engine_register_kind_and_steps(eid):
+    p, _ = part_of(eid)
+    cfg = p['settings']
+    assert p['kind'] == 'seq' and p['notes'] and p['step_priority']
+    assert all(cfg['low'] <= n['pitch'] <= cfg['high'] for n in p['notes'])
+    assert all('step' in n for n in p['notes'])
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_engine_is_deterministic(eid):
+    a, _ = part_of(eid)
+    b, _ = part_of(eid)
+    assert a['notes'] == b['notes']
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_mono_profile_never_overlaps(eid):
+    p, _ = part_of(eid, profile='mono_synth')
+    assert mono(p['notes'], p['slides'])
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_poly_profile_never_repeats_a_sounding_pitch(eid):
+    p, _ = part_of(eid, profile='poly_synth')
+    by = {}
+    for n in sorted(p['notes'], key=lambda n: n['start']):
+        prev = by.get(n['pitch'])
+        assert prev is None or prev['start'] + prev['duration'] <= n['start']
+        by[n['pitch']] = n
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_static_stays_in_the_home_key(eid):
+    r, doc, plan = fixture(chords='C Ab Bb Eb', key='C major')
+    p = next(x for x in SQ.generate(doc, r, plan, {eid: dict(seed=3, follow='static')}) if x['id'] == eid)
+    assert {n['pitch'] % 12 for n in p['notes']} <= {0, 2, 4, 5, 7, 9, 11}
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_follow_uses_the_chord_or_scale(eid):
+    p, r = part_of(eid)
+    for n in p['notes']:
+        ev = chord_at(r, n['start'])
+        if n['start'] == ev['start_tick'] and p['settings']['value_space'] == 'chord':
+            assert (n['pitch'] - ev['root_pc']) % 12 in {i % 12 for i in S.chord_ladder(ev)}
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_density_levels_reduce_notes(eid):
+    counts = [len(part_of(eid, level=lvl)[0]['notes']) for lvl in (1, 3, 5)]
+    assert counts[0] < counts[2] and counts[0] <= counts[1] <= counts[2]
+
+
+@pytest.mark.parametrize('eid', NEW)
+def test_signature_controls_accepted_and_bad_values_rejected(eid):
+    key, values = SIGNATURE[eid]
+    for v in values:
+        assert part_of(eid, **{key: v})[0]['notes']
+    with pytest.raises(ValueError):
+        part_of(eid, **{key: 'nonsense' if isinstance(values[0], str) else 5})
+
+
+def test_euclidean_pulses_are_even():
+    hits = E.Euclidean.pattern(5, 16, 0)
+    gaps = [j - i for i, j in zip([k for k, h in enumerate(hits) if h], [k for k, h in enumerate(hits) if h][1:])]
+    assert sum(hits) == 5 and set(gaps) <= {3, 4}
+
+
+def test_turing_keeps_changing_only_with_change():
+    still, _ = part_of('turing', change=0.0)
+    assert still['changes'] == 0
+    moving, _ = part_of('turing', change=1.0)
+    assert moving['changes'] > 0
+
+
+def test_tb303_slides_follow_slide_amount():
+    assert part_of('tb303', slide=0.0)[0]['stats']['slides'] == 0
+    assert part_of('tb303', slide=1.0)[0]['stats']['slides'] > 0
+
+
+def test_metropolix_ratchets_follow_amount():
+    none, _ = part_of('metro', ratchet=0.0)
+    assert not any(s['gate'].startswith('ratchet') for s in none['stages'])
+
+
+def test_disabled_engines_are_left_out():
+    r, doc, plan = fixture()
+    parts = SQ.generate(doc, r, plan, {e: dict(enabled=False) for e in ALL})
+    assert parts == []
+
+
+def test_sequencer_thinning_silences_the_same_steps_throughout():
+    r, doc, plan = fixture(repeats=4)
+    parts = SQ.generate(doc, r, plan, {})
+    out = T.apply(dict(doc, parts=parts), r, dict(keep=50))
+    for full, thin in zip(parts, out['parts']):
+        keys_full = {repr(n['step']) for n in full['notes']}
+        keys_thin = {repr(n['step']) for n in thin['notes']}
+        assert keys_thin < keys_full or len(keys_full) == 1
+        assert all(repr(n['step']) in keys_thin for n in full['notes'] if n in thin['notes'])
+        # a kept step sounds every time its pattern comes round
+        assert all(n in thin['notes'] for n in full['notes'] if repr(n['step']) in keys_thin)
+
+
+def test_sequencer_thinning_per_part_override_and_full_keep():
+    r, doc, plan = fixture()
+    parts = SQ.generate(doc, r, plan, {})
+    out = T.apply(dict(doc, parts=parts), r, dict(keep=100, parts={'tb303': 25}))
+    rep = out['thinning']['report']
+    assert rep['m960']['kept'] == 1.0 and rep['tb303']['kept'] < 0.5

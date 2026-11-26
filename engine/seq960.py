@@ -86,7 +86,7 @@ def row(pat, cfg, target, k, default):
 
 
 def generate(ctx, settings=None):
-    cfg = dict(copy.deepcopy(DEFAULTS), **(settings or {}))
+    cfg = S.resolve(dict(copy.deepcopy(DEFAULTS), **(settings or {})))
     check(cfg)
     rng = random.Random(f"seq960-{cfg['seed']}")
     L, grid = int(cfg['length']), S.GRIDS[str(cfg['grid'])]
@@ -123,4 +123,4 @@ def generate(ctx, settings=None):
             idx = (idx + 1) % L
     patterns = [dict(start_bar=ph['start'] // ctx.bar + 1, level=ph['level'], values=p['values'], modes=p['modes'])
                 for ph, p in zip(ctx.phrases, pats)]
-    return S.realise(ctx, cfg, ID, cfg['name'], steps, extra=dict(patterns=patterns))
+    return S.realise(ctx, cfg, ID, cfg['name'], steps, extra=dict(patterns=patterns, step_priority=pats[0]['priority']))

@@ -1,13 +1,14 @@
 """Registry of sequencer engines: one instance of each machine, each switched on or off (on by default).
 
-Each engine module provides ID, NAME, DEFAULTS and generate(ctx, settings) -> part. New engines are added to
-ENGINES in the handoff's order as they are built.
+Each engine module provides ID, NAME, DEFAULTS and generate(ctx, settings) -> part. Engines are listed in the
+handoff's order; the TR-808 belongs to the drum family.
 """
 import copy
 import seqcore as S
 import seq960
+import seqengines as E
 
-ENGINES = [seq960]          # Euclidean, Polymetric, TB-303, Turing, Metropolix, Marbles, Rene, Nodal to follow
+ENGINES = [seq960] + E.ENGINES      # 960, Euclidean, Polymetric, TB-303, Turing, Metropolix, Marbles, René, Nodal
 
 
 def defaults():

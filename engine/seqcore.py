@@ -40,11 +40,42 @@ PROFILES = {
     'poly_synth':  dict(mono=False, velocity=True, slide_overlap=0),      # Repro-5 and other poly synths
     'mono_hw_novel': dict(mono=True, velocity=False, slide_overlap=40),   # hardware mono synth without velocity
 }
-COMMON_DEFAULTS = dict(enabled=True, harmonic='adapted', value_space='chord', low=60, high=84, anchor=64,
+COMMON_DEFAULTS = dict(enabled=True, follow='chords', harmonic='adapted', value_space='chord', low=60, high=84, anchor=64,
                        profile='mono_synth', velocity=84, accent=16, grid='16', reset='section', mutation=0.25, seed=1)
+FOLLOW = {'chords': 'adapted', 'static': 'independent'}
+# Share of a machine's steps that sound at each shared density level (machines with their own density rule differ).
+DENSITY = {1: 0.4, 2: 0.55, 3: 0.7, 4: 0.85, 5: 1.0}
+
+
+def resolve(cfg):
+    """The follow switch decides the harmonic mode: 'chords' fits each chord (adapted); 'static' keeps the same
+    pitches throughout, taken from the home key (independent). An explicit 'harmonic' in a script still works
+    when follow is left at its default."""
+    if cfg.get('follow', 'chords') not in FOLLOW:
+        raise ValueError(f"{cfg.get('name', 'Sequencer')}: follow must be 'chords' or 'static'.")
+    if cfg.get('follow') == 'static':
+        cfg['harmonic'] = 'independent'
+    return cfg
+
+
+def keep_count(n, share):
+    return max(1, min(n, round(n * share)))
+
+
+def mask_steps(ctx, steps, priority):
+    """Shared density: in each phrase keep the steps whose key is among the first share of `priority` for that
+    phrase's level, so a rise in density adds steps to the pattern you already hear."""
+    rank = {k: i for i, k in enumerate(priority)}
+    out = []
+    for s in steps:
+        level = ctx.level_at(s['t'])
+        if rank.get(s['step'], 0) < keep_count(len(priority), DENSITY[level]):
+            out.append(s)
+    return out
 
 
 def check_common(cfg, name):
+    resolve(cfg)
     if cfg['harmonic'] not in MODES:
         raise ValueError(f"{name}: harmonic mode must be one of {', '.join(MODES)}.")
     if cfg['value_space'] not in SPACES:
@@ -180,8 +211,14 @@ def realise(ctx, cfg, part_id, name, steps, extra=None):
         p = value_to_pitch(ctx, cfg, s['t'], s['value'], cs)
         vel = int(cfg['velocity']) + (int(cfg['accent']) if s.get('accent') else 0) if prof['velocity'] else int(cfg['velocity'])
         notes.append(dict(start=s['t'], duration=min(s['dur'], ctx.end - s['t']), pitch=p, velocity=max(1, min(127, vel)),
-                          slide=bool(s.get('slide'))))
+                          slide=bool(s.get('slide')), step=s.get('step')))
     if prof['mono']:
+        seen, single = set(), []
+        for n in notes:                                                         # one voice: where lanes coincide,
+            if n['start'] not in seen:                                          # the first lane plays
+                seen.add(n['start'])
+                single.append(n)
+        notes = single
         for a, b in zip(notes, notes[1:]):
             limit = b['start'] - a['start']
             if a['slide'] and prof['slide_overlap'] and a['pitch'] != b['pitch'] and b['start'] - (a['start'] + a['duration']) < ctx.ppq:
@@ -189,19 +226,26 @@ def realise(ctx, cfg, part_id, name, steps, extra=None):
             elif a['duration'] >= limit:
                 a['duration'] = max(1, limit - 10)                              # a small gap retriggers cleanly
     else:
-        open_ = {}
-        for n in notes:                                                         # same pitch: end the earlier note first
+        open_, merged = {}, []
+        for n in notes:
             prev = open_.get(n['pitch'])
-            if prev and prev['start'] + prev['duration'] > n['start']:
+            if prev and prev['start'] == n['start']:                            # two voices on one note: sound it once,
+                prev['duration'] = max(prev['duration'], n['duration'])         # keeping the longer length and accent
+                prev['velocity'] = max(prev['velocity'], n['velocity'])
+                continue
+            if prev and prev['start'] + prev['duration'] > n['start']:          # same pitch: end the earlier note first
                 prev['duration'] = max(1, n['start'] - prev['start'] - 10)
             open_[n['pitch']] = n
+            merged.append(n)
+        notes = merged
     notes = [n for n in notes if n['duration'] > 0]
     for n in notes:
         n['duration'] = min(n['duration'], ctx.end - n['start'])
     stats = dict(notes=len(notes), lowest=min((n['pitch'] for n in notes), default=None),
                  highest=max((n['pitch'] for n in notes), default=None), slides=sum(n['slide'] for n in notes))
     part = dict(id=part_id, name=name, kind='seq', channel=int(cfg['channel']), program=int(cfg.get('program', 81)),
-                settings=copy.deepcopy(cfg), notes=[{k: v for k, v in n.items() if k != 'slide'} for n in notes],
+                settings=copy.deepcopy(cfg),
+                notes=[{k: v for k, v in n.items() if k != 'slide' and not (k == 'step' and v is None)} for n in notes],
                 slides=[i for i, n in enumerate(notes) if n['slide']], stats=stats)
     part.update(extra or {})
     return part

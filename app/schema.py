@@ -53,26 +53,42 @@ def line_fields(lid, label):
     return [num(f'lines.{lid}.low', f'{label}: lowest (MIDI)', 24, 108), num(f'lines.{lid}.high', f'{label}: highest (MIDI)', 24, 108)]
 
 
-ROW_CHOICES = [('pitch', 'Pitch'), ('gate', 'Gate length'), ('velocity', 'Accent'), ('time', 'Step length')]
-
-
-def seq_fields(eid, label, specific):
+def seq_fields(eid, specific, help=''):
+    """Shared settings plus the machine's signature control(s); everything else is the machine's character
+    (still reachable from the script)."""
     p = f'sequencers.{eid}'
-    return ([dict(path=f'{p}.enabled', label=f'{label}: include', type='bool'),
-             sel(f'{p}.harmonic', 'Harmonic mode', [('adapted', 'Adapted (fit each chord)'), ('transposed', 'Transposed (keep shape)'),
-                                                   ('independent', 'Independent (ignore chords)')]),
-             sel(f'{p}.value_space', 'Values move through', [('chord', 'Chord tones'), ('scale', 'Scale steps')]),
-             sel(f'{p}.grid', 'Step', [('4', 'Crotchets'), ('8', 'Quavers'), ('16', 'Semiquavers'), ('32', 'Demisemiquavers')])]
+    return ([flag(f'{p}.enabled', 'Include'),
+             sel(f'{p}.follow', 'Harmony', [('chords', 'Follow the chords'), ('static', 'Static (home key)')])]
             + specific
-            + [sel(f'{p}.reset', 'Pattern restarts', [('section', 'At each section'), ('phrase', 'At each phrase'), ('never', 'Never')]),
-               rng(f'{p}.mutation', 'Gradual change'),
-               num(f'{p}.low', 'Lowest note (MIDI)', 12, 115), num(f'{p}.high', 'Highest note (MIDI)', 12, 120),
-               num(f'{p}.anchor', 'Root placed near (MIDI)', 12, 115),
+            + [num(f'{p}.low', 'Lowest note (MIDI)', 12, 115), num(f'{p}.high', 'Highest note (MIDI)', 12, 120),
                sel(f'{p}.profile', 'Instrument', [('mono_synth', 'Mono synth (Diva, Repro-1…)'), ('poly_synth', 'Poly synth (Repro-5…)'),
                                                   ('mono_hw_novel', 'Mono synth, no velocity')]),
-               num(f'{p}.velocity', 'Velocity', 1, 127), num(f'{p}.accent', 'Accent (+ velocity)', 0, 60),
                num(f'{p}.channel', 'MIDI channel (0-15; 9 is drums)', 0, 15),
+               num(f'density.parts.{eid}', 'Keep (%), overrides the density filter', 0, 100),
                txt(f'{p}.seed', 'Seed')])
+
+
+SEQ_PANELS = [
+    ('m960', 'Seq 960', 'Moog 960: a fixed 8-step pattern, fitted to each chord.',
+     [num('sequencers.m960.length', 'Steps', 2, 16)]),
+    ('euclid', 'Seq Euclidean', 'Three interlocking lanes, pulses spread as evenly as possible.',
+     [sel('sequencers.euclid.cycle', 'Cycle', [(8, '8 steps'), (12, '12 steps'), (16, '16 steps')])]),
+    ('poly', 'Seq Polymetric', 'Three short loops of different lengths drifting against the bar.',
+     [sel('sequencers.poly.loops', 'Loop lengths', [('3-5-7', '3, 5, 7'), ('5-6-7', '5, 6, 7'), ('5-7-8', '5, 7, 8'), ('7-9-11', '7, 9, 11')])]),
+    ('tb303', 'Seq TB-303', 'A 16-step phrase with rests, accents, octave jumps and slides.',
+     [rng('sequencers.tb303.slide', 'Slide amount')]),
+    ('turing', 'Seq Turing', 'A 16-step loop that slowly changes through the piece while keeping its identity.',
+     [rng('sequencers.turing.change', 'Change amount', help='Chance per pass of one step being rewritten.')]),
+    ('metro', 'Seq Metropolix', 'Eight stages of different lengths: holds, single hits and ratchets.',
+     [rng('sequencers.metro.ratchet', 'Ratchet amount')]),
+    ('marbles', 'Seq Marbles', 'Chance-driven notes near the last one, with deja vu memory.',
+     [rng('sequencers.marbles.spread', 'Spread', help='Largest move between notes.')]),
+    ('rene', 'Seq René', 'A 4 x 4 grid read along a path, so the order is not linear.',
+     [sel('sequencers.rene.path', 'Path', [('cartesian', 'Cartesian (X every step, Y every third)'), ('snake', 'Snake'),
+                                            ('diagonal', 'Diagonal')])]),
+    ('nodal', 'Seq Nodal', 'A network of short phrases joined by weighted links.',
+     [rng('sequencers.nodal.branching', 'Branching', help='0 = mostly the strongest link; 1 = links equally likely.')]),
+]
 
 
 def schema():
@@ -135,18 +151,7 @@ def schema():
         dict(id='lines', label='Lines', help='Tenor and alto guide-tone lines and a descant, written phrase by phrase.', fields=[
             flag('lines.enabled', 'Include'), txt('lines.seed', 'Seed')]
             + line_fields('tenor', 'Tenor') + line_fields('alto', 'Alto') + line_fields('descant', 'Descant')),
-        dict(id='sequencers', label='Sequencers', help='One instance of each sequencer, each on by default. Values follow the chords '
-             '(adapted), keep their shape and move with each chord root (transposed), or ignore the chords (independent).',
-             fields=seq_fields('m960', 'Seq 960', [
-                 num('sequencers.m960.length', 'Steps', 2, 16),
-                 sel('sequencers.m960.rows.a', 'Row A controls', ROW_CHOICES),
-                 sel('sequencers.m960.rows.b', 'Row B controls', ROW_CHOICES),
-                 sel('sequencers.m960.rows.c', 'Row C controls', ROW_CHOICES),
-                 rng('sequencers.m960.skip_rate', 'Skip steps', 0, 0.5, help='Skipped steps take no time.'),
-                 rng('sequencers.m960.stop_rate', 'Stop step', 0, 0.5, help='Chance of a Stop step: the pattern halts until its next restart.'),
-                 rng('sequencers.m960.time_rate', 'Double-length steps', 0, 0.6),
-                 flag('sequencers.m960.section_variants', 'Different pattern per section type')])),
-        dict(id='density', label='Density filter', help='Keep only a share of the notes in pads and lines (the constant pad is exempt).', fields=[
+        dict(id='density', label='Density filter', help='Keep only a share of the notes in pads, lines and sequencers (the constant pad is exempt). Sequencers lose whole pattern steps; the mode does not apply to them.', fields=[
             num('density.keep', 'Keep (%)', 0, 100),
             sel('density.mode', 'Mode', [('even', 'Even'), ('flatten', 'Flatten (busiest thinned most)'),
                                          ('contrast', 'Contrast (sparse thinned most)')]),
@@ -156,4 +161,5 @@ def schema():
             num('density.parts.descant', 'Keep: descant (%)', 0, 100),
             rng('density.randomness', 'Randomness'),
             txt('density.seed', 'Seed')]),
-    ]
+    ] + [dict(id=f'seq_{eid}', label=label, help=help + ' Follows the chords or stays static in the home key.',
+              fields=seq_fields(eid, specific)) for eid, label, help, specific in SEQ_PANELS]

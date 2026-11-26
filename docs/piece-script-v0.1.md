@@ -60,33 +60,32 @@ lines:
   tenor:   {low: 45, high: 62}
   alto:    {low: 57, high: 72}
   descant: {low: 72, high: 88}
-sequencers:     # one instance of each sequencer engine; each is on unless enabled: false
-  m960:
+sequencers:     # one instance of each machine, each on unless enabled: false. Each has a fixed character:
+                # the shared settings below, plus its signature control. Other keys are design defaults.
+  m960:                     # Moog 960: one fixed 8-step pattern, fitted to each chord
     enabled: true
-    harmonic: adapted       # adapted (fit each chord), transposed (keep shape, move with the root), independent
-    value_space: chord      # chord (root, 3rd, 5th, 7th ...) or scale (scale steps from the chord root)
-    grid: '16'              # '4', '8', '16', '32'
-    length: 8               # 2-16 steps
-    rows: {a: pitch, b: gate, c: time}   # each row controls pitch, gate, velocity (accent) or time (step length)
-    skip_rate: 0.0          # share of Skip steps (take no time; the loop drifts against the bar)
-    stop_rate: 0.0          # chance of a Stop step (halts until the next restart)
-    time_rate: 0.0          # share of double-length steps when a row controls time
-    reset: section          # section, phrase, never
-    mutation: 0.0           # chance of one step changing at a phrase start
-    section_variants: false # true: each section type gets its own variant of the pattern
+    follow: chords          # chords (fit each chord) or static (stay in the home key, ignore the chords)
+    length: 8               # signature: 2-16 steps
     low: 60
     high: 84
-    anchor: 64              # the ladder's root is placed nearest this note
     profile: mono_synth     # mono_synth, poly_synth, mono_hw_novel (no velocity)
-    velocity: 84
-    accent: 16
     channel: 6              # 0-based; 9 (MIDI channel 10) is kept for drums
-    program: 81
     seed: 1
-density:        # final filter on pads and lines (sequencers are not thinned)
+    # script-only: harmonic, value_space, grid, rows {a, b, c}, skip_rate, stop_rate, time_rate, reset, mutation,
+    # section_variants, anchor, velocity, accent, program
+  euclid:  {cycle: 16}              # three lanes of evenly spread pulses; cycle 8, 12 or 16 steps (poly synth)
+  poly:    {loops: 5-7-8}           # three loops drifting against the bar: 3-5-7, 5-6-7, 5-7-8, 7-9-11 (poly synth)
+  tb303:   {slide: 0.25}            # 16-step phrase with rests, accents, octave jumps; share of slides 0-1
+  turing:  {change: 0.3}            # 16-step loop; chance per pass of one step being rewritten 0-1
+  metro:   {ratchet: 0.35}          # eight stages: holds, single hits, ratchets; share of ratchets 0-1
+  marbles: {spread: 0.5}            # chance-driven notes near the last one, with deja vu; largest move 0-1
+  rene:    {path: cartesian}        # 4 x 4 grid read along a path: cartesian, snake, diagonal
+  nodal:   {branching: 0.5}         # phrases joined by weighted links; 0 = strongest link, 1 = all equally likely
+  # every machine also takes enabled, follow, low, high, profile, channel and seed (channels 6-8, 10-15 by default)
+density:        # final filter on pads, lines and sequencers (sequencers lose whole pattern steps)
   keep: 100               # 0-100
   mode: even              # even, flatten, contrast
-  parts: {}               # per-part keep, e.g. {descant: 50}
+  parts: {}               # per-part keep, e.g. {descant: 50, tb303: 60}; the mode does not apply to sequencers
   randomness: 0.3
   exempt: [pad2]
   seed: 1

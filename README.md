@@ -4,8 +4,8 @@ A generator that writes long harmonic structures and the parts that sit on them,
 and develop in Logic. The composer sets parameters; the machine makes every chord and note decision.
 
 **Status:** Stage 1 complete; Stage 2 under way. Song, structure, harmony, pads, a shared density plan, a Moog 960-style bass,
-three lines, a density filter, score engraving and MIDI files; the sequencer framework with its first engine (Seq 960).
-The other eight sequencers, rhythm-first composition, line embellishments, per-section settings, a drum family and live
+three lines, a density filter, score engraving and MIDI files; nine sequencers (960, Euclidean, Polymetric, TB-303,
+Turing, Metropolix, Marbles, René, Nodal), each following the chords or static. Rhythm-first composition, line embellishments, per-section settings, a drum family and live
 MIDI are planned in [docs/roadmap.md](docs/roadmap.md).
 
 ## Pipeline
@@ -15,7 +15,7 @@ MIDI are planned in [docs/roadmap.md](docs/roadmap.md).
 | 1 Song | Title, key (seven modes), tempo, meter, length target, seed | `composition_generator.py` |
 | 2 Structure | Sections and phrases from nine form models; repeats keep their shape | `gcl_structure.py` (GCL Version One v0.3) |
 | 3 Harmony | Chords from corpus-measured models (Billboard, Beatles, jazz); 0.5 settings reproduce measured behaviour | `harmonic_engine.py` |
-| 4 Parts | Pads, density plan, bass, lines, sequencers, density filter | `parts.py`, `orchestration.py`, `bass960.py`, `lines.py`, `seqcore.py` + `seq960.py` (via `sequencers.py`), `thinning.py` |
+| 4 Parts | Pads, density plan, bass, lines, sequencers, density filter | `parts.py`, `orchestration.py`, `bass960.py`, `lines.py`, `seqcore.py` + `seq960.py` + `seqengines.py` (via `sequencers.py`), `thinning.py` |
 | 5 Output | Score (LilyPond PDF), MIDI per part plus combined, resolved script | `notation.py`, `midi_export.py` |
 
 A **piece script** (YAML) holds every setting. The web app builds the script from menus; the command line runs one directly.

@@ -32,7 +32,7 @@ def test_schema_fields_point_into_defaults(client):
     optional = {'density.parts.pad3', 'density.parts.tenor', 'density.parts.alto', 'density.parts.descant'}
     for sec in s['sections']:
         for f in sec['fields']:
-            if f['path'] in optional:
+            if f['path'] in optional or (f['path'].startswith('density.parts.') and sec['id'].startswith('seq_')):
                 continue
             node = defaults
             for k in f['path'].split('.'):
@@ -67,7 +67,8 @@ def test_generate_and_fetch_files(client):
     body = r.json()
     assert body['bars'] >= 48 and body['plan'] and body['chart'].strip()
     ids = {p['id'] for p in body['parts']}
-    assert ids == {'pad2', 'pad3', 'bass', 'tenor', 'alto', 'descant', 'm960'}
+    assert ids == {'pad2', 'pad3', 'bass', 'tenor', 'alto', 'descant', 'm960', 'euclid', 'poly', 'tb303', 'turing', 'metro',
+                       'marbles', 'rene', 'nodal'}
     z = client.get(f"/runs/{body['run']}/{body['files']['midi_zip']}")
     assert z.status_code == 200 and z.content[:2] == b'PK'
     res = client.get(f"/runs/{body['run']}/{body['files']['resolved']}")

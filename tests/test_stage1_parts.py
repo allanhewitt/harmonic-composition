@@ -14,6 +14,7 @@ import bass960 as B
 import lines as LN
 import thinning as T
 import piece as P
+import sequencers as SQ
 
 SONGS = {}
 
@@ -298,4 +299,4 @@ def test_piece_runner_can_leave_out_bass_and_lines():
     cfg = P.merge(P.defaults(), dict(piece=dict(key='G mixolydian', length=64, seed=7),
                                      bass=dict(enabled=False), lines=dict(enabled=False)))
     ctx, r, doc, plan = P.build(cfg)
-    assert {p['id'] for p in doc['parts']} == {'pad2', 'pad3', 'm960'}
+    assert {p['id'] for p in doc['parts']} == {'pad2', 'pad3'} | {e.ID for e in SQ.ENGINES}

@@ -18,7 +18,9 @@ Rules every generator keeps:
 - Generators work forwards in time phrase by phrase with their own seeded state, and read the shared plan rather than
   deciding entries themselves. This keeps a later live (streaming) mode possible.
 - Sequencer parts also list `slides` (indices of notes that overlap the next note so a mono synth glides) and
-  `patterns` (the pattern used in each phrase).
+  `step_priority` (the machine's pattern steps, most important first). Each sequencer note carries its `step` key,
+  which the density filter uses to silence the same steps throughout. Engines may add their own record (`patterns`,
+  `phrase`, `stages`, `grid`, `nodes` and `links`, `changes`).
 - A part may add display hints for the score: `short` (staff name), `staccato` (sequencer steps), `annotations`.
 
 ## Step 5 conventions (from Experiments 30-32)
