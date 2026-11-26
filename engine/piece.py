@@ -30,11 +30,12 @@ import lines as LN
 import thinning as T
 import sequencers as SQ
 import counterpoint as CP
+import drums as DR
 import notation as N
 import midi_export as MX
 
 VERSION = '0.0.1'
-SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'sequencers', 'rhythm', 'density',
+SECTIONS = ('piece', 'structure', 'harmony', 'pads', 'orchestration', 'bass', 'lines', 'sequencers', 'rhythm', 'drums', 'density',
             'output')
 
 
@@ -49,6 +50,7 @@ def defaults():
         lines=dict({k: {kk: vv for kk, vv in v.items() if kk != 'ladder'} for k, v in LN.LINES.items()}, seed=1, enabled=True),
         sequencers=SQ.defaults(),
         rhythm=CP.defaults(),
+        drums=DR.defaults(),
         density=copy.deepcopy(T.DEFAULTS),
         output=dict(folder='piece_output', stem=None, score=True, midi=True))
 
@@ -88,8 +90,9 @@ def build(cfg):
         extra.append(B.generate(doc, result, plan, {k: v for k, v in cfg['bass'].items() if k != 'enabled'}))
     seqs = SQ.generate(doc, result, plan, cfg.get('sequencers') or {})
     voices = CP.generate(doc, result, plan, cfg.get('rhythm') or {})
+    kit = DR.generate(doc, result, plan, cfg.get('drums') or {})
     lines_first = [p for p in extra if p['kind'] == 'line'][::-1]
-    doc = dict(doc, parts=voices + seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
+    doc = dict(doc, parts=voices + seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'] + kit)
     doc = T.apply(doc, result, cfg['density'], constant=cfg['orchestration'].get('constant', 'pad2'))
     return ctx, result, doc, plan
 
@@ -128,10 +131,10 @@ def resolve(cfg, ctx, result):
 
 
 def provenance(result):
-    import counterpoint as CP_, seqcore as SC_
+    import counterpoint as CP_, seqcore as SC_, drums as DR_
     return (f"Resolved script: every setting used for this result. Reloading it rebuilds the same piece with these "
             f"versions: piece runner {VERSION}, generator {C.VERSION}, harmonic engine {result.get('engine')}, "
-            f"parts {PT.VERSION}, sequencers {SC_.VERSION}, rhythm family {CP_.VERSION}, density filter {T.VERSION}.")
+            f"parts {PT.VERSION}, sequencers {SC_.VERSION}, rhythm family {CP_.VERSION}, drums {DR_.VERSION}, density filter {T.VERSION}.")
 
 
 def dump(cfg, header=None):

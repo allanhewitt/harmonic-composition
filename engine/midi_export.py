@@ -76,8 +76,9 @@ def part_track(part, end_tick):
     ch = part['channel']
     if not 0 <= ch <= 15:
         raise ValueError(f"{part['name']}: channel must be 0-15.")
-    ev = [(0, 0, meta_text(0x03, part['name'])), (0, 1, bytes([0xC0 | ch, part['program'] & 127])),
-          (0, 2, bytes([0xB0 | ch, 11, 127]))]
+    ev = [(0, 0, meta_text(0x03, part['name'])), (0, 2, bytes([0xB0 | ch, 11, 127]))]
+    if part.get('kind') != 'drums':                                # drums: channel 10, no program change
+        ev.insert(1, (0, 1, bytes([0xC0 | ch, part['program'] & 127])))
     active = {}
     for n in sorted(part['notes'], key=lambda n: (n['start'], n['pitch'])):
         on, off, p = n['start'], n['start'] + n['duration'], n['pitch']

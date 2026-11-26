@@ -23,6 +23,8 @@ Rules every generator keeps:
   `phrase`, `stages`, `grid`, `nodes` and `links`, `changes`).
 - Rhythm family parts (kind `voice`) also list `targets` (phrase start tick, density and participation targets)
   and `warnings` (phrases whose participation target the onsets could not meet).
+- Drum parts (kind `drums`, channel 9 = MIDI channel 10) keep each note's instrument name (`inst`) and grid step
+  (`step`); the score writes them on a drum staff.
 - A part may add display hints for the score: `short` (staff name), `staccato` (sequencer steps), `annotations`.
 
 ## Step 5 conventions (from Experiments 30-32)

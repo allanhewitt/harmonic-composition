@@ -200,6 +200,63 @@ def clef_for(part):
     return 'treble' if sum(pitches) / len(pitches) >= 55 else 'bass'
 
 
+DRUM_NAMES = dict(kick='bd', side='ss', snare='sn', clap='hc', rim='sn', tomlf='tomfl', hatc='hh', tomhf='tomfh',
+                  hatp='hhp', toml='toml', hato='hho', tomlm='tomml', tomhm='tommh', crash='cymc', tomh='tomh',
+                  ride='cymr', bell='rb', tamb='tamb', cow='cb', crash2='cymca', conga_h='cghm', conga_l='cgl',
+                  shaker='mar', clave='cl', wood='wbh', tri='trio', cabasa='cab')
+DRUM_FEET = {'kick', 'hatp'}
+STEP_DUR = {1: '16', 2: '8', 3: '8.', 4: '4', 6: '4.', 8: '2', 12: '2.', 16: '1'}
+
+
+def step_values(n):
+    """Split n semiquaver steps into notatable values, longest first."""
+    out = []
+    for v in (16, 12, 8, 6, 4, 3, 2, 1):
+        while n >= v:
+            out.append(STEP_DUR[v])
+            n -= v
+    return out
+
+
+def drum_voice(part, doc, feet):
+    """One drum voice (hands or feet), one beat at a time on the semiquaver step grid. Ghost notes (quiet snare
+    hits) are bracketed. The Drummer's timing offsets are in the MIDI only."""
+    bar_steps = H.bar_ticks(doc['meter']) // 120
+    spb = max(1, int(round(tempo_beat(doc['meter'])[1] * 4)))
+    bars = doc['end_tick'] // H.bar_ticks(doc['meter'])
+    by = {}
+    for n in part['notes']:
+        if (n.get('inst') in DRUM_FEET) == feet:
+            name = DRUM_NAMES.get(n.get('inst'), 'sn')
+            if n.get('inst') == 'snare' and n['velocity'] < 45:
+                name = '\\parenthesize ' + name
+            by.setdefault(n['step'], []).append(name)
+    num, den = doc['meter'].split('/')
+    toks = []
+    for bar in range(bars):
+        b0 = bar * bar_steps
+        if bar:
+            toks.append('|')
+        if not any(b0 <= st < b0 + bar_steps for st in by):
+            toks.append(('s' if feet else 'r') + f'1*{num}/{den}')
+            continue
+        for beat0 in range(b0, b0 + bar_steps, spb):
+            end = min(beat0 + spb, b0 + bar_steps)
+            hits = [st for st in range(beat0, end) if st in by]
+            if not hits:
+                toks += ['r' + d for d in step_values(end - beat0)]
+                continue
+            if hits[0] > beat0:
+                toks += ['r' + d for d in step_values(hits[0] - beat0)]
+            for j, st in enumerate(hits):
+                length = (hits[j + 1] if j + 1 < len(hits) else end) - st
+                vals = step_values(length)
+                chord = ' '.join(dict.fromkeys(sorted(by[st])))
+                toks.append(f'<{chord}>{vals[0]}')
+                toks += ['r' + d for d in vals[1:]]
+    return ' '.join(toks)
+
+
 def reduction_note(names):
     if not names:
         return ''
@@ -214,11 +271,17 @@ def lily_source(result, doc, title='Harmonic composition', subtitle=''):
     beat = tempo_beat(doc['meter'])[0]
     staves, rounded = [], []
     for k, p in enumerate(doc['parts']):
+        tempo = f'\\tempo {beat} = {round(float(doc["tempo"]))}' if k == 0 else ''
+        short = p.get('short') or p['name'].split(' (')[0].replace(' line', '')
+        if p.get('kind') == 'drums':                    # drum staff: written on the step grid (feel offsets: MIDI only)
+            staves.append(f'''  \\new DrumStaff \\with {{ instrumentName = "{esc(p['name'])}" shortInstrumentName = "{esc(short)}" }} <<
+    \\new DrumVoice \\drummode {{ \\voiceOne \\time {doc['meter']} {tempo} {drum_voice(p, doc, False)} \\bar "|." }}
+    \\new DrumVoice \\drummode {{ \\voiceTwo {drum_voice(p, doc, True)} }}
+  >>''')
+            continue
         if not notation_grid(p, doc['ppq'])[1]:
             rounded.append(p['name'])
         music = staff_music(p, doc, result, chord_symbols=(k == 0))
-        tempo = f'\\tempo {beat} = {round(float(doc["tempo"]))}' if k == 0 else ''
-        short = p.get('short') or p['name'].split(' (')[0].replace(' line', '')
         staves.append(f'''  \\new Staff \\with {{ instrumentName = "{esc(p['name'])}" shortInstrumentName = "{esc(short)}" }} {{
     \\clef "{clef_for(p)}" \\time {doc['meter']} {tempo}
   {music}

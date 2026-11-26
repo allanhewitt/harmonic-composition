@@ -29,7 +29,8 @@ interval chain or a step pattern advanced by notes. It evolves independently of 
 
 **Plan agreed 26 November 2026:**
 
-1. **Drum family:** TR-808-style lanes and the Groove drummer, MIDI channel 10.
+1. **Drum family:** done 26 November 2026 (`drums.py`, design in `docs/drum-family-v0.1.md`): Drum Machine, Drummer
+   (for Superior Drummer) and Percussion, with conclusiveness from conclusive to ambient.
 2. **Listening sessions in Logic:** run the generator, audition the files with real instruments, and note what sounds
    wrong, dull or promising. Most output so far has been checked by tests and scores, not by ear.
 3. **Gap review:** set the next priorities from the listening notes.

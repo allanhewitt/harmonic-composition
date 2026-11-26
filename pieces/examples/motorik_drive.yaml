@@ -1,0 +1,31 @@
+# Motorik drive: the Drummer (for Superior Drummer), the 960 bass, pads and two sequencers.
+# Run:  python3 engine/piece.py pieces/examples/motorik_drive.yaml
+
+piece:
+  title: Motorik Drive
+  key: E minor
+  tempo: 112
+  meter: 4/4
+  length: 96
+  seed: 21
+
+structure:
+  model: evolving
+  phrase_length: 4..8
+
+lines: {enabled: false}
+
+sequencers:
+  euclid: {enabled: false}
+  poly: {enabled: false}
+  tb303: {enabled: false}
+  metro: {enabled: false}
+  marbles: {enabled: false}
+  rene: {enabled: false}
+  nodal: {enabled: false}
+
+drums:
+  drummer: {enabled: true, style: motorik, feel: 0.4, conclusiveness: 75}
+  percussion: {enabled: true, lanes: shakers_rims, conclusiveness: 30}
+  # machine: {enabled: true, style: berlin, conclusiveness: 70}
+  # map: {hatc: 42, ...}   # General MIDI by default; change notes here for another kit layout

@@ -189,6 +189,33 @@ def schema():
             num('rhythm.window', 'Bars between changes', 1, 32), num('rhythm.cycle', 'Bars per cycle', 2, 256),
             num('rhythm.repetition', 'Repetition', 0, 100, help='How closely returning sections keep rhythm and intervals.'),
             txt('rhythm.seed', 'Seed')]),
+        dict(id='drum_machine', label='Drum Machine', help='Exact grid, a style bank, machine fills. Channel 10, '
+             'General MIDI drum map (editable in the script).', fields=[
+            flag('drums.machine.enabled', 'Include'),
+            sel('drums.machine.style', 'Style', [('berlin', 'Berlin (semiquaver hats)'), ('synthpop', 'Synth-pop'),
+                                                 ('motorik', 'Motorik'), ('four', 'Four on the floor'),
+                                                 ('halftime', 'Half-time'), ('pulse', 'Pulse (hats and rim only)')]),
+            num('drums.machine.conclusiveness', 'Conclusiveness', 0, 100,
+                help='High: downbeat, backbeat, crashes, fills, final hit. Low: ambient, unresolved.'),
+            txt('drums.machine.seed', 'Seed')]),
+        dict(id='drummer', label='Drummer', help='The same patterns played: timing feel, dynamics that build, ghost '
+             'notes, fills. For Superior Drummer (core kit on the General MIDI map).', fields=[
+            flag('drums.drummer.enabled', 'Include'),
+            sel('drums.drummer.style', 'Style', [('motorik', 'Motorik'), ('berlin', 'Berlin'), ('synthpop', 'Synth-pop'),
+                                                 ('four', 'Four on the floor'), ('halftime', 'Half-time'),
+                                                 ('pulse', 'Pulse')]),
+            rng('drums.drummer.feel', 'Feel', help='0 tight; 1 laid back (snare behind the beat).'),
+            num('drums.drummer.conclusiveness', 'Conclusiveness', 0, 100),
+            txt('drums.drummer.seed', 'Seed')]),
+        dict(id='percussion', label='Percussion', help='Interlocking lanes (Euclidean, polymetric, chance); slow swells.',
+             fields=[
+            flag('drums.percussion.enabled', 'Include'),
+            sel('drums.percussion.lanes', 'Lanes', [('shakers_rims', 'Shakers and rims'), ('metals', 'Metals'),
+                                                     ('toms_hands', 'Toms and hand drums')]),
+            num('drums.percussion.conclusiveness', 'Conclusiveness', 0, 100),
+            sel('drums.percussion.evolution', 'Density', [('plan', 'Follow the density plan'),
+                                                           ('independent', 'Evolve independently')]),
+            txt('drums.percussion.seed', 'Seed')]),
     ] + [dict(id=f'rhythm_{k}', label=f'Rhythm voice {i + 1}', fields=rhythm_voice_fields(k, f'Voice {i + 1}'))
          for i, k in enumerate(('v1', 'v2', 'v3', 'v4'))] + [dict(id=f'seq_{eid}', label=label, help=help + ' Follows the chords or stays static in the home key.',
               fields=seq_fields(eid, specific)) for eid, label, help, specific in SEQ_PANELS]

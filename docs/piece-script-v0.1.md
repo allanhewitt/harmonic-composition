@@ -103,6 +103,13 @@ rhythm:         # rhythmic counterpoint family: four voices, rhythm first then p
   v3: {density: 20, density_change: 50, participation: 80, participation_change: 60, low: 52, high: 69, channel: 3}
   v4: {density: 25, density_change: 20, participation: 90, participation_change: 30, low: 40, high: 57, channel: 4}
   # engine: markov or step; table: smooth, angular, narrow, wide, or a 9 x 9 list. See docs/rhythm-family-v0.1.md.
+drums:          # drum family on MIDI channel 10, General MIDI map (off by default). See docs/drum-family-v0.1.md.
+  machine: {enabled: false, name: Drum Machine, style: berlin, conclusiveness: 70, velocity: 96, seed: 1}
+  drummer: {enabled: false, name: Drummer, style: motorik, feel: 0.4, conclusiveness: 75, velocity: 92, seed: 1}
+  percussion: {enabled: false, name: Percussion, lanes: shakers_rims, conclusiveness: 30, evolution: plan,
+               velocity: 80, seed: 1}
+  # style: berlin, synthpop, motorik, four, halftime, pulse; lanes: shakers_rims, metals, toms_hands
+  # map: {kick: 36, snare: 38, hatc: 42, ...}   change any note for another kit layout
 density:        # final filter on pads, lines and sequencers (sequencers lose whole pattern steps)
   keep: 100               # 0-100
   mode: even              # even, flatten, contrast
