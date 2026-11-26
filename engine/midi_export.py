@@ -1,7 +1,8 @@
 """Step 5 of the Harmonic Composition Generator: write the parts document to MIDI.
 
 Conventions carried over from Experiments 30-32 (checked against their source):
-  * Type 1 files at 480 ticks per quarter note, with a conductor track first: tempo, meter, key
+  * Type 1 files at 480 ticks per quarter note, with a conductor track first: tempo (the piece's tempo counts
+    the notated beat, e.g. the dotted crotchet in 6/8, converted to crotchets for MIDI), meter, key
     signatures and a marker at every section ("verse 1 | C major").
   * One channel per part, with a track name and program change.
   * CC11 = 127 at tick 0 and a centred pitch wheel at the final tick of every part, so a part that
@@ -13,6 +14,7 @@ Outputs: one whole-song file per part, one combined multitrack file, and a JSON 
 import json, math, struct, zipfile
 from pathlib import Path
 import harmonic_engine as H
+import notation as N
 
 VERSION = '0.1.0'
 
@@ -53,7 +55,8 @@ SHARPS_FLATS = {0: 0, 7: 1, 2: 2, 9: 3, 4: 4, 11: 5, 6: -6, 1: -5, 8: -4, 3: -3,
 def conductor(result, end_tick, title):
     s = result['settings']
     num, den = map(int, s['meter'].split('/'))
-    tempo = round(60_000_000 / float(s['tempo']))
+    quarter_bpm = float(s['tempo']) * N.tempo_beat(s['meter'])[1]      # the piece's tempo counts the notated beat
+    tempo = round(60_000_000 / quarter_bpm)
     ev = [(0, 0, meta_text(0x03, title)), (0, 1, b'\xff\x51\x03' + tempo.to_bytes(3, 'big')),
           (0, 1, b'\xff\x58\x04' + bytes([num, int(math.log2(den)), 24, 8]))]
     bt = H.bar_ticks(s['meter'])

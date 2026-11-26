@@ -10,10 +10,12 @@ are kept and passed to that stage.
 piece:          # step 1
   title: Night Transit
   key: A minor            # tonic + mode (major, minor, dorian, phrygian, lydian, mixolydian, locrian)
-  tempo: 112
+  tempo: 112              # beats per minute of the notated beat: dotted crotchet in 6/8 and 12/8, minim in 2/2;
+                          # score and MIDI agree (MIDI is written in crotchets)
   meter: 4/4              # 4/4, 3/4, 6/8, 12/8, 2/4
   length: 64              # target in bars, or a range 64..96 (the form uses the nearest length it can fill)
-  seed: 5
+  seed: 5                 # or auto; the resolved script saved with each run records the seed (and key, tempo,
+                          # length) actually drawn, plus every effective harmony setting, so it rebuilds the piece
 structure:      # step 2 (GCL Version One v0.3 form models)
   model: verse_chorus     # verse_chorus, aaba, cyclic, through_composed, evolving, arch, modular, auto, explicit
   sections: 5..9
@@ -106,7 +108,7 @@ density:        # final filter on pads, lines and sequencers (sequencers lose wh
   mode: even              # even, flatten, contrast
   parts: {}               # per-part keep, e.g. {descant: 50, tb303: 60}; the mode does not apply to sequencers
   randomness: 0.3
-  exempt: [pad2]
+  exempt: [constant]      # never thinned; 'constant' = the pad named in orchestration.constant
   seed: 1
 output:         # command line only; the web app manages its own folders
   folder: piece_output

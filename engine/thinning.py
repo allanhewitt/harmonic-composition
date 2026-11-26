@@ -7,7 +7,7 @@ Settings
               'flatten'  more removed where a part is busiest, so clutter goes first
               'contrast' more removed where a part is already sparse, so the busy passages stand out
   randomness  0-1: how far chance, rather than importance, decides which notes go (seeded).
-  exempt      parts never thinned (the constant pad by default).
+  exempt      parts never thinned. 'constant' stands for whichever pad orchestration.constant names (the default).
 What counts: lines count notes; pads count sounding time (a held pad note can last several bars).
 Which notes go: weak-beat, short and inner notes first. Protected: the first and last note of every
 phrase, and in the inner lines the notes that arrive with a chord change. A removed note leaves a rest.
@@ -21,7 +21,7 @@ import copy, random
 import harmonic_engine as H
 
 VERSION = '0.0.2'
-DEFAULTS = dict(keep=100, parts={}, mode='even', randomness=0.3, exempt=['pad2'], seed=1)
+DEFAULTS = dict(keep=100, parts={}, mode='even', randomness=0.3, exempt=['constant'], seed=1)
 MODES = {'even': 0, 'flatten': 1, 'contrast': -1}
 
 
@@ -125,8 +125,10 @@ def thin_seq(part, keep):
                      steps_kept=len(kept_keys), steps=n)
 
 
-def apply(doc, result, settings=None):
+def apply(doc, result, settings=None, constant='pad2'):
+    """`constant` is the constant pad's id (orchestration.constant); it replaces 'constant' in the exempt list."""
     cfg = dict(DEFAULTS, **(settings or {}))
+    cfg['exempt'] = [constant if e == 'constant' else e for e in cfg['exempt']]
     if cfg['mode'] not in MODES:
         raise ValueError(f"Thinning mode must be one of {', '.join(MODES)}.")
     report, parts = {}, []

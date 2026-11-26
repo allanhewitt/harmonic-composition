@@ -18,7 +18,24 @@ NATURAL = {'c': 0, 'd': 2, 'e': 4, 'f': 5, 'g': 7, 'a': 9, 'b': 11}
 LILY_MODE = {'major': 'major', 'minor': 'minor', 'dorian': 'dorian', 'phrygian': 'phrygian', 'lydian': 'lydian',
              'mixolydian': 'mixolydian', 'locrian': 'locrian'}
 # durations in quarter-note units for LilyPond (largest first)
-DURATIONS = [(6, '1.'), (4, '1'), (3, '2.'), (2, '2'), (1.5, '4.'), (1, '4'), (0.75, '8.'), (0.5, '8'), (0.25, '16')]
+DURATIONS = [(6, '1.'), (4, '1'), (3, '2.'), (2, '2'), (1.5, '4.'), (1, '4'), (0.75, '8.'), (0.5, '8'), (0.375, '16.'),
+             (0.25, '16'), (0.125, '32')]
+
+
+def esc(text):
+    """Text for a LilyPond string literal: backslashes and quotes escaped, control characters removed, so user text
+    (titles, part names, section names, annotations) can never end the string or reach LilyPond or Scheme code."""
+    clean = ''.join(c if c.isprintable() else ' ' for c in str(text))
+    return clean.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def tempo_beat(meter):
+    """The beat the piece's tempo counts, as (LilyPond duration, length in crotchets): the dotted crotchet in compound
+    meters (6/8, 9/8, 12/8), otherwise the denominator (minim in 2/2, quaver in 3/8). Score and MIDI both use this."""
+    num, den = (int(x) for x in str(meter).split('/'))
+    if den == 8 and num % 3 == 0 and num > 3:
+        return '4.', 1.5
+    return {1: ('1', 4.0), 2: ('2', 2.0), 4: ('4', 1.0), 8: ('8', 0.5), 16: ('16', 0.25)}[den]
 
 
 def letter_step(iv):
@@ -109,12 +126,24 @@ def section_starts(result):
     return {sec['start'] * bt: (sec, key) for sec, key in zip(result['sections'], result['keys'])}
 
 
+def notation_grid(part, ppq):
+    """The finest grid a part needs: semiquavers, or demisemiquavers if any attack falls between semiquavers.
+    Returns (grid, exact): exact is False when some attack (e.g. a triplet ratchet) is still off the grid and is
+    rounded in the score. Note lengths (gate times) are rounded to the grid as usual. MIDI files are always exact."""
+    edges = [n['start'] for n in part['notes']]              # attacks decide; note lengths are rounded as usual
+    for grid in (ppq // 4, ppq // 8):
+        if all(e % grid == 0 for e in edges):
+            return grid, True
+    return ppq // 8, False
+
+
 def staff_music(part, doc, result, chord_symbols):
     """LilyPond music for one part, from its notes: chords, ties and rests, split at barlines,
-    chord changes and section starts. Note edges are snapped to a semiquaver grid for notation."""
+    chord changes and section starts. Note edges are written on a semiquaver grid, or a demisemiquaver grid when the
+    part needs it; anything finer is rounded (see notation_grid)."""
     bt = H.bar_ticks(doc['meter'])
     ppq = doc['ppq']
-    grid = ppq // 4
+    grid, _ = notation_grid(part, ppq)
     snap = lambda t: int(round(t / grid)) * grid
     starts = section_starts(result)
     spans = doc['chords']
@@ -146,15 +175,15 @@ def staff_music(part, doc, result, chord_symbols):
                 out.append(key_command(key))
                 last_key = key
             if chord_symbols:
-                out.append(f'\\mark \\markup \\box "{sec["identity"]} {sec["occurrence"]}"')
+                out.append(f'\\mark \\markup \\box "{esc(sec["identity"])} {sec["occurrence"]}"')
         sounding = sorted(p for s, e, p in notes if s <= a < e)
         cont = {p for s, e, p in notes if s <= a < e and e > b}
         vals = split_duration(b - a, ppq)
         for k, d in enumerate(vals):
             last = k == len(vals) - 1
-            text = f'^\\markup \\bold "{sp["symbol"]}"' if chord_symbols and a == sp['start'] and k == 0 else ''
+            text = f'^\\markup \\bold "{esc(sp["symbol"])}"' if chord_symbols and a == sp['start'] and k == 0 else ''
             if k == 0 and a in part.get('annotations', {}):
-                text += f'_\\markup \\italic "{part["annotations"][a]}"'
+                text += f'_\\markup \\italic "{esc(part["annotations"][a])}"'
             if sounding:
                 names = chord_spelling(sp, sounding)
                 body = ' '.join(n + ('~' if (not last or p in cont) else '') for n, p in zip(names, sounding))
@@ -171,24 +200,34 @@ def clef_for(part):
     return 'treble' if sum(pitches) / len(pitches) >= 55 else 'bass'
 
 
+def reduction_note(names):
+    if not names:
+        return ''
+    text = ('Score reduction: some very fast notes in ' + ', '.join(names) +
+            ' (such as triplet ratchets) are rounded to the nearest 1/32. The MIDI files are exact.')
+    return f'\\markup \\italic \\small "{esc(text)}"\n'
+
+
 def lily_source(result, doc, title='Harmonic composition', subtitle=''):
     if not doc['parts']:
         raise ValueError('No parts to engrave: switch on at least one part in step 4.')
-    num, den = doc['meter'].split('/')
-    beat = {'4': '4', '2': '2', '8': '4.' if int(num) % 3 == 0 and int(num) > 3 else '8'}[den]
-    staves = []
+    beat = tempo_beat(doc['meter'])[0]
+    staves, rounded = [], []
     for k, p in enumerate(doc['parts']):
+        if not notation_grid(p, doc['ppq'])[1]:
+            rounded.append(p['name'])
         music = staff_music(p, doc, result, chord_symbols=(k == 0))
         tempo = f'\\tempo {beat} = {round(float(doc["tempo"]))}' if k == 0 else ''
-        staves.append(f'''  \\new Staff \\with {{ instrumentName = "{p['name']}" shortInstrumentName = "{p.get('short') or p['name'].split(' (')[0].replace(' line', '')}" }} {{
+        short = p.get('short') or p['name'].split(' (')[0].replace(' line', '')
+        staves.append(f'''  \\new Staff \\with {{ instrumentName = "{esc(p['name'])}" shortInstrumentName = "{esc(short)}" }} {{
     \\clef "{clef_for(p)}" \\time {doc['meter']} {tempo}
   {music}
     \\bar "|."
   }}''')
     return f'''\\version "2.24.0"
 \\header {{
-  title = "{title}"
-  subtitle = "{subtitle}"
+  title = "{esc(title)}"
+  subtitle = "{esc(subtitle)}"
   tagline = ##f
 }}
 \\paper {{ #(set-paper-size "a4") indent = 32\\mm short-indent = 18\\mm }}
@@ -202,7 +241,10 @@ def lily_source(result, doc, title='Harmonic composition', subtitle=''):
   >>
   \\layout {{ }}
 }}
-'''
+{reduction_note(rounded)}'''
+
+
+LILYPOND_TIMEOUT = 300
 
 
 def write_score(result, doc, folder, stem, title='Harmonic composition', subtitle='', pdf=True):
@@ -222,7 +264,11 @@ def write_score(result, doc, folder, stem, title='Harmonic composition', subtitl
     if pdf and exe:
         with tempfile.TemporaryDirectory(prefix='hc-lily-') as tmp:
             (Path(tmp) / 'score.ly').write_text(source)
-            run = subprocess.run([exe, '-s', '-o', 'score', 'score.ly'], cwd=tmp, capture_output=True, text=True)
+            try:
+                run = subprocess.run([exe, '-s', '-o', 'score', 'score.ly'], cwd=tmp, capture_output=True, text=True,
+                                     timeout=LILYPOND_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f'LilyPond took longer than {LILYPOND_TIMEOUT} seconds and was stopped.')
             made = Path(tmp) / 'score.pdf'
             if run.returncode != 0 or not made.exists():
                 detail = (run.stderr or run.stdout or '').strip().splitlines()

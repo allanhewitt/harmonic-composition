@@ -90,7 +90,7 @@ def build(cfg):
     voices = CP.generate(doc, result, plan, cfg.get('rhythm') or {})
     lines_first = [p for p in extra if p['kind'] == 'line'][::-1]
     doc = dict(doc, parts=voices + seqs + lines_first + doc['parts'] + [p for p in extra if p['kind'] == 'bass'])
-    doc = T.apply(doc, result, cfg['density'])
+    doc = T.apply(doc, result, cfg['density'], constant=cfg['orchestration'].get('constant', 'pad2'))
     return ctx, result, doc, plan
 
 
@@ -109,9 +109,29 @@ def render(cfg, folder, stem, score=True, midi=True):
     if midi:
         written += MX.write(result, doc, folder / f'{stem}_midi', stem, title=str(pc['title']))
     resolved = folder / f'{stem}_resolved.yaml'
-    resolved.write_text(dump(cfg, header=f'Resolved script: every setting used for this result (piece runner {VERSION}).'))
+    resolved.write_text(dump(resolve(cfg, ctx, result), header=provenance(result)))
     written.append(resolved)
     return dict(context=ctx, result=result, doc=doc, plan=plan, files=written)
+
+
+def resolve(cfg, ctx, result):
+    """The script as actually used: drawn values (an automatic seed, key, tempo or length range) replaced by the
+    values chosen, and the harmony section filled with every effective setting, so reloading it rebuilds the same
+    piece even if defaults change later."""
+    out = copy.deepcopy(cfg)
+    g = (ctx or {}).get('global_parameters', {})
+    for k in ('key', 'tempo', 'meter', 'length', 'seed'):
+        if k in g:
+            out['piece'][k] = g[k]
+    out['harmony'] = {k: v for k, v in result['settings'].items() if k not in ('key', 'tempo', 'meter', 'seed')}
+    return out
+
+
+def provenance(result):
+    import counterpoint as CP_, seqcore as SC_
+    return (f"Resolved script: every setting used for this result. Reloading it rebuilds the same piece with these "
+            f"versions: piece runner {VERSION}, generator {C.VERSION}, harmonic engine {result.get('engine')}, "
+            f"parts {PT.VERSION}, sequencers {SC_.VERSION}, rhythm family {CP_.VERSION}, density filter {T.VERSION}.")
 
 
 def dump(cfg, header=None):
