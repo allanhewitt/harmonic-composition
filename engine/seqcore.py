@@ -201,6 +201,10 @@ def variant_bank(ctx, rng, make, mutate, mutation, section_variants=True):
 
 def realise(ctx, cfg, part_id, name, steps, extra=None):
     """Turn engine steps into a part. Each step: t, dur, value, accent, slide (and optional chord_start).
+    Two more optional keys serve engines whose steps do not all follow the chord at their own time:
+      chord_t  read the ladder from the chord sounding at this tick instead of at t (Seq Drift: a step still on the
+               previous chord)
+      reg      (low, high, anchor) for this step in place of the part's register (Seq Drift's lanes)
     Monophonic profiles never overlap except a short overlap into the next note after a slide."""
     prof = PROFILES[cfg['profile']]
     notes = []
@@ -208,7 +212,8 @@ def realise(ctx, cfg, part_id, name, steps, extra=None):
         if s['t'] >= ctx.end or s['dur'] <= 0:
             continue
         cs = s.get('chord_start', s['t'] in set(ctx.starts))
-        p = value_to_pitch(ctx, cfg, s['t'], s['value'], cs)
+        pcfg = dict(cfg, low=s['reg'][0], high=s['reg'][1], anchor=s['reg'][2]) if s.get('reg') else cfg
+        p = value_to_pitch(ctx, pcfg, s.get('chord_t', s['t']), s['value'], cs)
         vel = int(cfg['velocity']) + (int(cfg['accent']) if s.get('accent') else 0) if prof['velocity'] else int(cfg['velocity'])
         notes.append(dict(start=s['t'], duration=min(s['dur'], ctx.end - s['t']), pitch=p, velocity=max(1, min(127, vel)),
                           slide=bool(s.get('slide')), step=s.get('step')))

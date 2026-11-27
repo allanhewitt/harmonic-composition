@@ -4,8 +4,8 @@ A generator that writes long harmonic structures and the parts that sit on them,
 and develop in Logic. The composer sets parameters; the machine makes every chord and note decision.
 
 **Status:** Stage 1 complete; Stage 2 under way. Song, structure, harmony, pads, a shared density plan, a Moog 960-style bass,
-three lines, a density filter, score engraving and MIDI files; nine sequencers (960, Euclidean, Polymetric, TB-303,
-Turing, Metropolix, Marbles, René, Nodal), each following the chords or static; and a rhythmic counterpoint family
+three lines, a density filter, score engraving and MIDI files; ten sequencers (960, Euclidean, Polymetric, TB-303,
+Turing, Metropolix, Marbles, René, Nodal, and Drift for slow harmony, off by default), each following the chords or static (Drift always follows them); and a rhythmic counterpoint family
 (four voices, rhythm first, then Markov or step-pattern pitch); and a drum family (Drum Machine, Drummer for
 Superior Drummer, Percussion). Line embellishments, per-section settings and live MIDI are planned in [docs/roadmap.md](docs/roadmap.md).
 
@@ -16,7 +16,7 @@ Superior Drummer, Percussion). Line embellishments, per-section settings and liv
 | 1 Song | Title, key (seven modes), tempo, meter, length target, seed | `composition_generator.py` |
 | 2 Structure | Sections and phrases from nine form models; repeats keep their shape | `gcl_structure.py` (GCL Version One v0.3) |
 | 3 Harmony | Chords from corpus-measured models (Billboard, Beatles, jazz); 0.5 settings reproduce measured behaviour | `harmonic_engine.py` |
-| 4 Parts | Pads, density plan, bass, lines, sequencers, density filter | `parts.py`, `orchestration.py`, `bass960.py`, `lines.py`, `seqcore.py` + `seq960.py` + `seqengines.py` (via `sequencers.py`), `counterpoint.py`, `drums.py`, `thinning.py` |
+| 4 Parts | Pads, density plan, bass, lines, sequencers, density filter | `parts.py`, `orchestration.py`, `bass960.py`, `lines.py`, `seqcore.py` + `seq960.py` + `seqengines.py` + `seqdrift.py` (via `sequencers.py`), `counterpoint.py`, `drums.py`, `thinning.py` |
 | 5 Output | Score (LilyPond PDF), MIDI per part plus combined, resolved script | `notation.py`, `midi_export.py` |
 
 A **piece script** (YAML) holds every setting. The web app builds the script from menus; the command line runs one directly.

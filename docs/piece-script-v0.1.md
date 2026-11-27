@@ -83,6 +83,14 @@ sequencers:     # one instance of each machine, each on unless enabled: false. E
   marbles: {spread: 0.5}            # chance-driven notes near the last one, with deja vu; largest move 0-1
   rene:    {path: cartesian}        # 4 x 4 grid read along a path: cartesian, snake, diagonal
   nodal:   {branching: 0.5}         # phrases joined by weighted links; 0 = strongest link, 1 = all equally likely
+  drift:                            # four lanes that arrive at each new chord step by step; OFF unless enabled: true
+    enabled: false
+    arrival: 0.6            # signature: share of each chord's length over which the pattern crosses to it (0.05-1)
+    lag: 0.75               # bass pedal lag: the bass holds the old root until this share of upper steps has arrived
+    min_chord_bars: 2       # sounds only over chords at least this long (0 = every chord); slowest written today is 4
+    # script-only: density 0.45 (lane density target at level 3), flip 0.08 (gate change per loop), move 0.15 (pitch
+    # move per loop), drift true (wandering pace: still stretches, then movement), low/high/anchor, velocity, accent.
+    # Follows the chords by definition: follow: static or another harmonic mode is refused. Channel 15 (shared with Nodal).
   # every machine also takes enabled, follow, low, high, profile, channel and seed (channels 6-8, 10-15 by default)
 rhythm:         # rhythmic counterpoint family: four voices, rhythm first then pitch (off by default)
   enabled: false

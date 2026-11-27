@@ -228,9 +228,11 @@ def part_of(eid, level=5, **cfg):
 
 
 def test_registry_order_and_distinct_channels():
-    assert ALL == ['m960', 'euclid', 'poly', 'tb303', 'turing', 'metro', 'marbles', 'rene', 'nodal']
-    chans = [e.DEFAULTS['channel'] for e in SQ.ENGINES]
-    assert len(set(chans)) == len(chans) and 9 not in chans
+    assert ALL == ['m960', 'euclid', 'poly', 'tb303', 'turing', 'metro', 'marbles', 'rene', 'nodal', 'drift']
+    on = [e for e in SQ.ENGINES if e.DEFAULTS.get('enabled', True)]           # Drift is off by default and shares a channel
+    chans = [e.DEFAULTS['channel'] for e in on]
+    assert [e.ID for e in on] == ALL[:9] and len(set(chans)) == len(chans)
+    assert 9 not in [e.DEFAULTS['channel'] for e in SQ.ENGINES]
 
 
 @pytest.mark.parametrize('eid', NEW)

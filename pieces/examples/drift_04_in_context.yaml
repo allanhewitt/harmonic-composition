@@ -1,0 +1,77 @@
+# Audition 4: Drift alongside the 960, the Turing Machine, three lines and the drum machine.
+# Run:  cd engine && python3 piece.py ../pieces/examples/drift_04_in_context.yaml
+# Seq Drift sounds only over chords of min_chord_bars or longer, so the harmony is set to four-bar chords.
+
+piece:
+  title: "Drift 4: in context (G mixolydian)"
+  key: G mixolydian
+  tempo: 100
+  meter: 4/4
+  length: 40
+  seed: 5
+
+structure:
+  model: through_composed
+  section_length: 8..16
+  phrase_length: 4..8
+  intro: false
+  bridge: false
+  outro: false
+
+harmony:
+  rates: [0.25]           # four-bar chords, the slowest the harmony engine writes
+
+pads:
+  pad2: {tones: 1-3, voicing: smooth, articulation: hold, low: 55, high: 76}
+  pad3: {voicing: smooth, articulation: hold, low: 55, high: 76}
+
+orchestration:
+  constant: pad2
+  contour: role
+  randomness: 0.5
+  seed: 3
+
+bass:
+  length: 8
+  grid: '8'
+  transpose: fitted
+  reset: section
+  mutation: 0.3
+  low: 28
+  high: 52
+  seed: 2
+
+lines:
+  enabled: true
+  seed: 4
+
+sequencers:
+  euclid: {enabled: false}
+  poly: {enabled: false}
+  tb303: {enabled: false}
+  metro: {enabled: false}
+  marbles: {enabled: false}
+  rene: {enabled: false}
+  nodal: {enabled: false}
+  m960: {enabled: true, seed: 3}
+  turing: {enabled: true, seed: 3}
+  drift:
+    enabled: true
+    arrival: 0.6
+    lag: 0.75
+    min_chord_bars: 4
+    seed: 4
+drums:
+  machine: {enabled: true, style: berlin, conclusiveness: 70, seed: 1}
+
+density:
+  keep: 100
+  mode: even
+  parts: {}
+  randomness: 0.3
+  seed: 1
+
+output:
+  folder: drift_04_in_context
+  score: false
+  midi: true

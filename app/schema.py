@@ -88,6 +88,11 @@ SEQ_PANELS = [
                                             ('diagonal', 'Diagonal')])]),
     ('nodal', 'Seq Nodal', 'A network of short phrases joined by weighted links.',
      [rng('sequencers.nodal.branching', 'Branching', help='0 = mostly the strongest link; 1 = links equally likely.')]),
+    ('drift', 'Seq Drift', 'Four lanes that arrive at each new chord one step at a time. Slow harmony only; off unless switched on.',
+     [rng('sequencers.drift.arrival', 'Arrival', 0.05, 1.0, help='Share of the chord\'s length over which the pattern crosses to the new chord.'),
+      rng('sequencers.drift.lag', 'Bass pedal lag', help='The bass holds the old root until this share of the upper steps has arrived.'),
+      num('sequencers.drift.min_chord_bars', 'Slowest chord to sound over (bars)', 0, 32,
+          help='Drift rests over chords shorter than this; 0 = every chord. The harmony engine\'s slowest chord is 4 bars.')]),
 ]
 
 

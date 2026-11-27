@@ -19,6 +19,12 @@ Polymetric, TB-303, Turing Machine, Metropolix, Marbles, René, Nodal**, each wi
 signature control. Every sequencer can follow the chords or stay static in the home key, and the density filter
 thins sequencers by pattern step, so the same steps fall silent throughout.
 
+**Done (27 November 2026):** **Seq Drift** (`seqdrift.py`, a tenth sequencer, off by default), ported from the browser Drift
+sequencer: four lanes over a one-bar loop that cross to each new Stage 2 chord one step at a time (arrival rate scaled to
+the chord's length), a bass pedal lag, a wandering pace, and rests over chords shorter than `min_chord_bars`. The harmony
+engine's slowest chord is four bars, so the eight-bar case from the browser notes is not reachable yet. `seqcore.realise`
+gained two optional step keys (`chord_t`, `reg`) for it.
+
 **Decided:** the TR-808 becomes a separate **drum family** (with the Groove drummer), not one of the sequencers.
 Sequencers are aimed at soft synths (Diva, Repro-1, Repro-5 and others); the Model D bass stays its own family.
 
